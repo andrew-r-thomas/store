@@ -6,14 +6,14 @@
 	- if we do, do we want to support it at the file level, or have one file per schema, and have a nice interface in the library for registering files and selecting where you want to read/write data
 - page ids start at 1 (so that 0 can indicate a null pointer)
 
-|**header**--|--------|--------|--------|
+|HEADER--|--------|--------|--------|
 |   S    |   t    |   O    |   r    |
 |   E    |  vNum  | page size (u16) |
 | root pid (u16)  |                 |
 |                                   |
 |  schema info and reserved (todo)  |
 |                                   |
-|**pages**---|--------|--------|--------|
+|PAGES---|--------|--------|--------|
 |                                   |
 |    three page types:              |
 |     - guidepost                   |
@@ -22,22 +22,23 @@
 |                                   |
 |--------|--------|--------|--------|
 
-|**guidepost page**---|--------|--------|
+|GUIDEPOST PAGE---|--------|--------|
 |                                   |
-|                                   |
-|                                   |
-|--------|--------|--------|--------|
-
-|**leaf page**--------|--------|--------|
 |                                   |
 |                                   |
 |                                   |
 |--------|--------|--------|--------|
 
-|**overflow page**----|--------|--------|
+|LEAF PAGE--------|--------|--------|
 |                                   |
-|      i have a feeling this one    |
-|      is going to be a pain in     |
-|      the ass with rust.           |
+|                                   |
+|                                   |
+|                                   |
+|--------|--------|--------|--------|
+
+|OVERFLOW PAGE----|--------|--------|
+|                                   |
+|                                   |
+|                                   |
 |                                   |
 |--------|--------|--------|--------|
