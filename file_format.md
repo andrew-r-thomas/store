@@ -11,8 +11,9 @@
 ```
 |HEADER--|--------|--------|--------|
 |   S    |   t    |   O    |   r    |
-|   E    |  vNum  | page size (u16) |
-| root pid (u16)  |                 |
+|   E    |  vNum  | - - page size   |
+| (u32) - -       | - - root pid    |
+| (u32) - -       |                 |
 |                                   |
 |  schema info and reserved (todo)  |
 |                                   |
