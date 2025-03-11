@@ -10,16 +10,6 @@ const HEADER_OFFSET: u64 = 16;
 pub const KB: u32 = 1024;
 pub const MB: u32 = 1024 * KB;
 
-pub trait IO: Sized {
-    type StoreKey;
-    fn open(_: Self::StoreKey) -> Result<Self, IOError>;
-    fn create(_: Self::StoreKey, page_size: u32) -> Result<Self, IOError>;
-    fn read_page(&mut self, page_id: u32, buf: &mut [u8]);
-    fn write_page(&mut self, page_id: u32, page: &[u8]);
-    fn create_page(&mut self, empty_buf: &[u8]) -> u32;
-    fn update_root(&mut self, page_id: u32);
-}
-
 #[derive(Debug)]
 pub enum IOError {
     IO(io::Error),
@@ -33,9 +23,8 @@ pub struct FileIO {
     pub page_size: u32,
     next_page: u32,
 }
-impl IO for FileIO {
-    type StoreKey = PathBuf;
-    fn open(path: Self::StoreKey) -> Result<Self, IOError> {
+impl FileIO {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IOError> {
         // open file
         let mut file = match File::open(path) {
             Ok(f) => f,
@@ -75,7 +64,7 @@ impl IO for FileIO {
             v_num,
         })
     }
-    fn create(path: Self::StoreKey, page_size: u32) -> Result<Self, IOError> {
+    pub fn create<P: AsRef<Path>>(path: P, page_size: u32) -> Result<Self, IOError> {
         let mut file = match File::create(path) {
             Ok(f) => f,
             Err(e) => return Err(IOError::IO(e)),
@@ -111,7 +100,7 @@ impl IO for FileIO {
             v_num: CURRENT_VERSION,
         })
     }
-    fn read_page(&mut self, page_id: u32, buf: &mut [u8]) {
+    pub fn read_page(&mut self, page_id: u32, buf: &mut [u8]) {
         self.file
             .seek(io::SeekFrom::Start(
                 HEADER_OFFSET + ((page_id - 1) * self.page_size) as u64,
@@ -119,7 +108,7 @@ impl IO for FileIO {
             .unwrap();
         self.file.read_exact(buf).unwrap();
     }
-    fn write_page(&mut self, page_id: u32, page: &[u8]) {
+    pub fn write_page(&mut self, page_id: u32, page: &[u8]) {
         self.file
             .seek(io::SeekFrom::Start(
                 HEADER_OFFSET + ((page_id - 1) * self.page_size) as u64,
@@ -127,14 +116,14 @@ impl IO for FileIO {
             .unwrap();
         self.file.write_all(page).unwrap();
     }
-    fn create_page(&mut self, empty_buf: &[u8]) -> u32 {
+    pub fn create_page(&mut self, empty_buf: &[u8]) -> u32 {
         let out = self.next_page;
         self.file.seek(io::SeekFrom::End(0)).unwrap();
         self.file.write_all(empty_buf).unwrap();
         self.next_page += 1;
         out
     }
-    fn update_root(&mut self, page_id: u32) {
+    pub fn update_root(&mut self, page_id: u32) {
         self.root_id = page_id;
         self.file.seek(io::SeekFrom::Start(10)).unwrap();
         self.file.write_all(&page_id.to_be_bytes()).unwrap();
