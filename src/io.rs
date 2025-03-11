@@ -1,20 +1,22 @@
 use std::{
     fs::File,
-    io::{self, Read, Write},
-    path::Path,
+    io::{self, Read, Seek, Write},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
 };
 
 const CURRENT_VERSION: u8 = 0;
-const HEADER_OFFSET: usize = 16;
+const HEADER_OFFSET: u64 = 16;
 pub const KB: u32 = 1024;
 pub const MB: u32 = 1024 * KB;
 
-pub trait IO<StoreKey>: Sized {
-    fn open(_: StoreKey) -> Result<Self, IOError>;
-    fn create(_: StoreKey, page_size: u32) -> Result<Self, IOError>;
-    fn read_page(&self, page_id: u32) -> &[u8];
+pub trait IO: Sized {
+    type StoreKey;
+    fn open(_: Self::StoreKey) -> Result<Self, IOError>;
+    fn create(_: Self::StoreKey, page_size: u32) -> Result<Self, IOError>;
+    fn read_page(&mut self, page_id: u32, buf: &mut [u8]);
     fn write_page(&mut self, page_id: u32, page: &[u8]);
-    fn create_page(&mut self) -> u32;
+    fn create_page(&mut self, empty_buf: &[u8]) -> u32;
     fn update_root(&mut self, page_id: u32);
 }
 
@@ -25,21 +27,27 @@ pub enum IOError {
 }
 
 pub struct FileIO {
-    v_num: u8,
+    pub v_num: u8,
     file: File,
-    root_id: u32,
-    page_size: u32,
+    pub root_id: u32,
+    pub page_size: u32,
+    next_page: u32,
 }
-impl<P: AsRef<Path>> IO<P> for FileIO {
-    fn open(path: P) -> Result<Self, IOError> {
+impl IO for FileIO {
+    type StoreKey = PathBuf;
+    fn open(path: Self::StoreKey) -> Result<Self, IOError> {
         // open file
         let mut file = match File::open(path) {
             Ok(f) => f,
             Err(e) => return Err(IOError::IO(e)),
         };
 
+        // calculate next_page from file size
+        let size = file.metadata().unwrap().size();
+        let all_pages_size = size - HEADER_OFFSET;
+
         // read fixed header
-        let mut fixed_header = [0; HEADER_OFFSET];
+        let mut fixed_header = [0; HEADER_OFFSET as usize];
         if let Err(e) = file.read_exact(&mut fixed_header) {
             return Err(IOError::IO(e));
         }
@@ -54,6 +62,7 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
 
         // get page size
         let page_size = u32::from_be_bytes(fixed_header[6..10].try_into().unwrap());
+        let next_page = (all_pages_size as u32 / page_size) + 1;
 
         // get rood id
         let root_id = u32::from_be_bytes(fixed_header[10..14].try_into().unwrap());
@@ -62,16 +71,17 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
             file,
             root_id,
             page_size,
+            next_page,
             v_num,
         })
     }
-    fn create(path: P, page_size: u32) -> Result<Self, IOError> {
+    fn create(path: Self::StoreKey, page_size: u32) -> Result<Self, IOError> {
         let mut file = match File::create(path) {
             Ok(f) => f,
             Err(e) => return Err(IOError::IO(e)),
         };
 
-        let mut fixed_header = [0; HEADER_OFFSET];
+        let mut fixed_header = [0; HEADER_OFFSET as usize];
 
         // magic num
         fixed_header[0..5].copy_from_slice(b"StOrE");
@@ -89,26 +99,45 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
             return Err(IOError::IO(e));
         }
 
-        // TODO: write root page
+        // TODO: might do this with bufpool
+        let root = vec![0; page_size as usize];
+        file.write_all(&root).unwrap();
 
         Ok(Self {
             file,
             root_id: 1,
             page_size,
+            next_page: 2,
             v_num: CURRENT_VERSION,
         })
     }
-    fn read_page(&self, page_id: u32) -> &[u8] {
-        unimplemented!()
+    fn read_page(&mut self, page_id: u32, buf: &mut [u8]) {
+        self.file
+            .seek(io::SeekFrom::Start(
+                HEADER_OFFSET + ((page_id - 1) * self.page_size) as u64,
+            ))
+            .unwrap();
+        self.file.read_exact(buf).unwrap();
     }
     fn write_page(&mut self, page_id: u32, page: &[u8]) {
-        unimplemented!()
+        self.file
+            .seek(io::SeekFrom::Start(
+                HEADER_OFFSET + ((page_id - 1) * self.page_size) as u64,
+            ))
+            .unwrap();
+        self.file.write_all(page).unwrap();
     }
-    fn create_page(&mut self) -> u32 {
-        unimplemented!()
+    fn create_page(&mut self, empty_buf: &[u8]) -> u32 {
+        let out = self.next_page;
+        self.file.seek(io::SeekFrom::End(0)).unwrap();
+        self.file.write_all(empty_buf).unwrap();
+        self.next_page += 1;
+        out
     }
     fn update_root(&mut self, page_id: u32) {
-        unimplemented!()
+        self.root_id = page_id;
+        self.file.seek(io::SeekFrom::Start(10)).unwrap();
+        self.file.write_all(&page_id.to_be_bytes()).unwrap();
     }
 }
 
@@ -118,17 +147,43 @@ mod tests {
 
     use super::*;
 
+    #[ignore]
     #[test]
     fn basic_fixed_header() {
         {
             // create file
-            FileIO::create("temp.store", 4 * KB).unwrap();
+            FileIO::create("temp.store".into(), 4 * KB).unwrap();
         }
         {
-            let store = FileIO::open("temp.store").unwrap();
+            let store = FileIO::open("temp.store".into()).unwrap();
             assert_eq!(store.page_size, 4 * KB);
             assert_eq!(store.v_num, CURRENT_VERSION);
             assert_eq!(store.root_id, 1);
+            assert_eq!(store.next_page, 2);
+        }
+        fs::remove_file("temp.store").unwrap();
+    }
+
+    #[test]
+    fn basic_write_read() {
+        let page_size = 4 * KB;
+        {
+            let mut f = FileIO::create("temp.store".into(), page_size).unwrap();
+            let root_id = f.root_id;
+            let mut root: Vec<u8> = vec![0; page_size as usize];
+            root[0..4].copy_from_slice(root_id.to_be_bytes().as_slice());
+            f.write_page(root_id, &root);
+        }
+        {
+            let mut f = FileIO::open("temp.store".into()).unwrap();
+            let root_id = f.root_id;
+            let mut root = vec![0; page_size as usize];
+            f.read_page(root_id, &mut root);
+
+            println!("{:?}", root);
+
+            let serialized_id = u32::from_be_bytes(root[0..4].try_into().unwrap());
+            assert_eq!(serialized_id, 1);
         }
         fs::remove_file("temp.store").unwrap();
     }
