@@ -5,6 +5,7 @@ use std::{
 };
 
 const CURRENT_VERSION: u8 = 0;
+const HEADER_OFFSET: usize = 16;
 pub const KB: u32 = 1024;
 pub const MB: u32 = 1024 * KB;
 
@@ -38,7 +39,7 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
         };
 
         // read fixed header
-        let mut fixed_header = [0; 14];
+        let mut fixed_header = [0; HEADER_OFFSET];
         if let Err(e) = file.read_exact(&mut fixed_header) {
             return Err(IOError::IO(e));
         }
@@ -55,7 +56,7 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
         let page_size = u32::from_be_bytes(fixed_header[6..10].try_into().unwrap());
 
         // get rood id
-        let root_id = u32::from_be_bytes(fixed_header[10..].try_into().unwrap());
+        let root_id = u32::from_be_bytes(fixed_header[10..14].try_into().unwrap());
 
         Ok(Self {
             file,
@@ -70,7 +71,7 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
             Err(e) => return Err(IOError::IO(e)),
         };
 
-        let mut fixed_header = [0; 14];
+        let mut fixed_header = [0; HEADER_OFFSET];
 
         // magic num
         fixed_header[0..5].copy_from_slice(b"StOrE");
@@ -82,11 +83,13 @@ impl<P: AsRef<Path>> IO<P> for FileIO {
         fixed_header[6..10].copy_from_slice(&page_size.to_be_bytes());
 
         // root number (page nums start at 1)
-        fixed_header[10..].copy_from_slice(&1_u32.to_be_bytes());
+        fixed_header[10..14].copy_from_slice(&1_u32.to_be_bytes());
 
         if let Err(e) = file.write_all(&fixed_header) {
             return Err(IOError::IO(e));
         }
+
+        // TODO: write root page
 
         Ok(Self {
             file,
