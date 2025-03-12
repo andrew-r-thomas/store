@@ -2,7 +2,7 @@ use std::{
     fs::File,
     io::{self, Read, Seek, Write},
     os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 const CURRENT_VERSION: u8 = 0;
@@ -136,15 +136,14 @@ mod tests {
 
     use super::*;
 
-    #[ignore]
     #[test]
     fn basic_fixed_header() {
         {
             // create file
-            FileIO::create("temp.store".into(), 4 * KB).unwrap();
+            FileIO::create("temp.store", 4 * KB).unwrap();
         }
         {
-            let store = FileIO::open("temp.store".into()).unwrap();
+            let store = FileIO::open("temp.store").unwrap();
             assert_eq!(store.page_size, 4 * KB);
             assert_eq!(store.v_num, CURRENT_VERSION);
             assert_eq!(store.root_id, 1);
@@ -157,14 +156,14 @@ mod tests {
     fn basic_write_read() {
         let page_size = 4 * KB;
         {
-            let mut f = FileIO::create("temp.store".into(), page_size).unwrap();
+            let mut f = FileIO::create("temp.store", page_size).unwrap();
             let root_id = f.root_id;
             let mut root: Vec<u8> = vec![0; page_size as usize];
             root[0..4].copy_from_slice(root_id.to_be_bytes().as_slice());
             f.write_page(root_id, &root);
         }
         {
-            let mut f = FileIO::open("temp.store".into()).unwrap();
+            let mut f = FileIO::open("temp.store").unwrap();
             let root_id = f.root_id;
             let mut root = vec![0; page_size as usize];
             f.read_page(root_id, &mut root);
