@@ -1,42 +1,56 @@
-use std::marker::PhantomData;
+use crate::pager::{Cell, Page, Pager};
 
-use crate::pager::{Page, Pager};
-
-pub struct BTree<K>
-where
-    K: for<'k> PartialOrd<&'k [u8]> + for<'k> AsRef<&'k [u8]>,
-{
-    _ph: PhantomData<K>,
+pub struct BTree {
     pager: Pager,
     root_page_id: u32,
     page_stack: Vec<u32>,
 }
-impl<K> BTree<K>
-where
-    K: for<'k> PartialOrd<&'k [u8]> + for<'k> AsRef<&'k [u8]>,
-{
+impl BTree {
     pub fn new(pager: Pager, root_page_id: u32) -> Self {
         Self {
-            _ph: PhantomData,
             pager,
             root_page_id,
             page_stack: Vec::new(),
         }
     }
-    pub fn get(&mut self, key: &K) -> Option<&[u8]> {
+    pub fn get(&mut self, key: &[u8]) -> Option<&[u8]> {
         self.find_leaf(key);
-
         let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
         Self::search_leaf_page(key, leaf_page)
     }
-    pub fn set(&mut self, key: &K, val: &[u8]) {
+    pub fn set(&mut self, key: &[u8], val: &[u8]) {
         self.find_leaf(key);
+        let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
+        let new_cell = Cell::LeafCell { key, val };
+        for (cell, slot) in leaf_page.iter_cells().zip(0..) {
+            if let Cell::LeafCell { key: k, val: _ } = cell {
+                if key < k {
+                    if let Err(_) = leaf_page.insert_cell(slot, new_cell) {
+                        todo!("split");
+                    }
+                    return;
+                } else if key == k {
+                    if let Err(_) = leaf_page.update_cell(slot, val) {
+                        todo!("split");
+                    }
+                    return;
+                }
+            }
+        }
+        // new val goes at the end, and is an insert
+        if let Err(_) = leaf_page.push_cell(new_cell) {
+            todo!("split");
+        }
     }
     pub fn delete(&mut self) {
+        // NOTE: for now i think we'll just do compaction on deletion, to keep
+        // things simple, but will probably want to switch to an sqlite style
+        // "freeblock" situation, and compact on insert if it gives us enough
+        // space
         unimplemented!()
     }
 
-    fn find_leaf(&mut self, key: &K) {
+    fn find_leaf(&mut self, key: &[u8]) {
         self.page_stack.clear();
 
         let mut current_page_id = self.root_page_id;
@@ -46,43 +60,27 @@ where
             if current_page.level() == 0 {
                 break;
             }
-            match Self::search_inner_page(key, current_page) {
-                Some(slot_num) => {
-                    let slot = current_page.get_slot(slot_num);
-                    let key_len = u32::from_be_bytes(slot[0..4].try_into().unwrap()) as usize;
-                    let page_id =
-                        u32::from_be_bytes(slot[4 + key_len..4 + key_len + 4].try_into().unwrap());
-                    current_page_id = page_id;
-                }
-                None => {
-                    // go right
-                    current_page_id = current_page.right_ptr();
-                }
-            }
+            current_page_id = Self::search_inner_page(key, current_page);
         }
     }
 
-    // TODO: two different functions for finding pointer vs finding value
-    fn search_inner_page(target: &K, page: &Page) -> Option<usize> {
-        for (slot, slot_num) in page.iter_slots().zip(0..) {
-            let key_len = u32::from_be_bytes(slot[0..4].try_into().unwrap()) as usize;
-            let key = &slot[4..4 + key_len];
-            if target < &key {
-                return Some(slot_num);
+    fn search_inner_page(target: &[u8], page: &Page) -> u32 {
+        for cell in page.iter_cells() {
+            if let Cell::InnerCell { key, left_ptr } = cell {
+                if target < key {
+                    return left_ptr;
+                }
             }
         }
-        None
+        page.right_ptr()
     }
 
-    fn search_leaf_page<'s>(target: &K, page: &'s Page) -> Option<&'s [u8]> {
-        for slot in page.iter_slots() {
-            let key_len = u32::from_be_bytes(slot[0..4].try_into().unwrap()) as usize;
-            let key = &slot[4..4 + key_len];
-            if target == &key {
-                let val_len =
-                    u32::from_be_bytes(slot[4 + key_len..8 + key_len].try_into().unwrap()) as usize;
-                let val = &slot[8 + key_len..8 + key_len + val_len];
-                return Some(val);
+    fn search_leaf_page<'s>(target: &[u8], page: &'s Page) -> Option<&'s [u8]> {
+        for cell in page.iter_cells() {
+            if let Cell::LeafCell { key, val } = cell {
+                if key == target {
+                    return Some(val);
+                }
             }
         }
         None
@@ -97,11 +95,20 @@ mod tests {
 
     #[test]
     fn basic_set_get() {
-        let io = FileIO::create("temp.store", 1024 * 1024).unwrap();
-        let pager = Pager::new(10, 1024 * 1024, io);
-        let btree = BTree::<usize>::new(pager, 1);
+        let io = FileIO::create("temp.store", 4 * 1024).unwrap();
+        let pager = Pager::new(10, 4 * 1024, io);
+        let mut btree = BTree::new(pager, 1);
+        btree.set("one".as_bytes(), &1_u32.to_be_bytes());
+        btree.set("two".as_bytes(), &2_u32.to_be_bytes());
+        btree.set("three".as_bytes(), &3_u32.to_be_bytes());
+
+        assert_eq!(
+            btree.get("three".as_bytes()),
+            Some(&3_u32.to_be_bytes()[..])
+        );
+        assert_eq!(btree.get("two".as_bytes()), Some(&2_u32.to_be_bytes()[..]));
+        assert_eq!(btree.get("one".as_bytes()), Some(&1_u32.to_be_bytes()[..]));
+
+        std::fs::remove_file("temp.store").unwrap();
     }
 }
-
-impl AsRef<&[u8]> for usize {}
-impl PartialOrd<&[u8]> for usize {}

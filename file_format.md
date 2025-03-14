@@ -20,13 +20,13 @@ encoded as follows
 ```
 |HEADER--|--------|--------|--------|
 |   S    |   t    |   O    |   r    |
-|   E    |  vNum  | - - page size   |
-| (u32) - -       | - - root pid    |
-| (u32) - -       |    reserved     |
+|   E    |    3 byte semver         |
+|           page size (u32)         |
+|           root pid (u32)          |
 |PAGES---|--------|--------|--------|
 |                                   |
 |    three page types:              |
-|     - guidepost                   |
+|     - inner                       |
 |     - leaf                        |
 |     - overflow                    |
 |                                   |
@@ -34,8 +34,8 @@ encoded as follows
 ```
 
 ```
-|GUIDEPOST PAGE---|--------|--------|
-|    1   |                          |
+|INNER PAGE-------|--------|--------|
+|lvl (i8)|                          |
 |                                   |
 |                                   |
 |                                   |
@@ -43,17 +43,17 @@ encoded as follows
 ```
 
 ```
-|LEAF PAGE--------|--------|--------|
-|    0   |  left sibling (u32), 0   |
-|for null| right sibling (u32), 0   |
-|for null|                          |
-|                                   |
-|--------|--------|--------|--------|
+|LEAF PAGE--------|--------|--------|--------|--------|
+|HEADER--|--------|--------|--------|--------|--------|
+|    0   |  left sibling (u32), 0 for null   |
+|for null| right sibling (u32), 0 - |
+|for null| num slots (u16) | slot - |
+|content |
 ```
 
 ```
 |OVERFLOW PAGE----|--------|--------|
-|    2   |                          |
+|   -1   |                          |
 |                                   |
 |                                   |
 |                                   |
