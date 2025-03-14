@@ -1,46 +1,35 @@
-/*
+use std::path::Path;
 
-    TODO:
-    - direct io
-    - async interface
+use crate::{
+    btree::BTree,
+    io::{FileIO, IOError},
+    pager::Pager,
+};
 
-*/
+pub struct Store {
+    pub btree: BTree,
+}
 
-// use std::{fs::File, io, path::Path};
-//
-// pub struct Store<K, V> {
-//     file: File,
-// }
-//
-// pub enum Error {
-//     IoError(io::Error),
-//     TypeError,
-// }
-//
-// impl<K, V> Store<K, V> {
-//     pub fn open(path: &Path) -> Result<Self, Error> {
-//         let f = File::open(path);
-//         match f {
-//             Ok(file) => Ok(Self { file }),
-//             Err(e) => Err(Error::IoError(e)),
-//         }
-//         // TODO: check the types in the file against the generics
-//     }
-//     pub fn create(path: &Path) {}
-//
-//     pub fn get(&self, key: K) -> Option<V> {
-//         None
-//     }
-//     pub fn set(&self, key: K, val: V) -> Result<(), Error> {
-//         Ok(())
-//     }
-//     pub fn delete(&self, key: K) -> Result<(), Error> {
-//         Ok(())
-//     }
-// }
-//
-// impl<K, V> Drop for Store<K, V> {
-//     fn drop(&mut self) {
-//         todo!()
-//     }
-// }
+const DEFAULT_PAGE_SIZE: u32 = 1024 * 4;
+const DEFAULT_POOL_CAP: usize = 1024;
+
+impl Store {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IOError> {
+        let io = FileIO::open(path)?;
+        let root_id = io.root_id;
+        let page_size = io.page_size;
+        let pager = Pager::new(DEFAULT_POOL_CAP, page_size as usize, io);
+        let btree = BTree::new(pager, root_id);
+
+        Ok(Self { btree })
+    }
+    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self, IOError> {
+        let io = FileIO::create(path, DEFAULT_PAGE_SIZE)?;
+        let root_id = io.root_id;
+        let pager = Pager::new(DEFAULT_POOL_CAP, DEFAULT_PAGE_SIZE as usize, io);
+        let btree = BTree::new(pager, root_id);
+
+        Ok(Self { btree })
+    }
+}
+
