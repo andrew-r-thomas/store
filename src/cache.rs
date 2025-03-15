@@ -18,17 +18,20 @@ impl LRUKCache {
     /// called whenever a page is accessed, records a "cache hit"
     pub fn hit(&mut self, page_id: u32) {
         self.ts += 1;
-        if let Some(hits) = self.map.get_mut(&page_id) {
-            hits[1] = hits[0];
-            hits[0] = self.ts;
-            return;
+        match self.map.get_mut(&page_id) {
+            Some(hits) => {
+                hits[1] = hits[0];
+                hits[0] = self.ts;
+            }
+            None => {
+                self.map.insert(page_id, [self.ts, 0]);
+            }
         }
-        self.map.insert(page_id, [self.ts, 0]);
     }
 
     /// called when the pager has determined it needs to evict something
     /// from the buffer pool, returns an iterator over pages ids from best
-    /// eviction option to worst, so that pager can discard pages it doesn't
+    /// eviction option to worst, so that pager can ignore pages it doesn't
     /// want to evict for some reason
     pub fn evict(&mut self) -> Evict {
         self.scratch_heap.clear();
@@ -43,8 +46,11 @@ impl LRUKCache {
         }
     }
 
-    // TODO: some way to remove stuff so that we don't get a page that we don't
-    // have when we ask what to evict, might want a "ghost" page list as well
+    /// remove an item from the cache, this means it will not show up when
+    /// iterating over the evict options
+    pub fn remove(&mut self, page_id: u32) {
+        self.map.remove(&page_id);
+    }
 }
 
 pub struct Evict<'e> {

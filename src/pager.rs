@@ -39,19 +39,9 @@ impl Pager {
             return Ok(&mut self.pool[free_frame]);
         }
 
-        // TODO: lol
-        let mut evict_iter = self.cache_tracker.evict();
-        while let Some(to_evict) = evict_iter.next() {
-            let page_idx = *self.page_map.get(&to_evict).unwrap();
-            if !self.pool[page_idx].dirty {
-                // evict the page
-                self.page_map.remove(&to_evict);
-                self.io.read_page(page_id, &mut self.pool[page_idx].buf);
-                self.pool[page_idx].dirty = false;
-                self.page_map.insert(page_id, page_idx);
-                return Ok(&mut self.pool[page_idx]);
-            }
-        }
+        // if we reach this point, we need to evict something
+        // we probably want a separate list of dirty pages instead of storing
+        // the info in the page type itself
 
         Err(PagerError::HotCache)
     }

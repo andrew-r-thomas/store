@@ -1,63 +1,107 @@
+> THIS IS A DRAFT, AND DOES NOT REPRESENT THE CURRENT STATE OF THE LIBRARY
+
 # Store file format
 
-> OK ACTUALLY WE'RE GONNA JUST DO BYTE STRINGS FOR KEYS & VALUES, NO SCHEMA
+store keeps keys and values in a single file, each file has a schema
 
-**notes**
-- may want to consider having root page always be first
-- page ids start at 1 (so that 0 can indicate a null pointer)
-- no schemas, keys and values are arbitrary byte strings, keys and values are
-encoded as follows
-
-```
-|KEYorVAl|--------|--------|--------|
-|              length               |
-:                                   :
-:            some bytes             :
-:                                   :
-|--------|--------|--------|--------|
-```
-
+a store file starts with a 16 byte fixed header
 ```
 |HEADER--|--------|--------|--------|
-|   S    |   t    |   O    |   r    |
-|   E    |    3 byte semver         |
-|           page size (u32)         |
-|           root pid (u32)          |
-|PAGES---|--------|--------|--------|
-|                                   |
-|    three page types:              |
-|     - inner                       |
-|     - leaf                        |
-|     - overflow                    |
-|                                   |
+|   'S'  |   'T'  |   'O'  |   'R'  |
+|   'E'  | 3 byte semantic version  |
+|       page size in bytes (u32)    |
+|       root page id (u32)          |
 |--------|--------|--------|--------|
 ```
 
+after the header, there is a variable sized header containing information
+about the schema of the keys and values stored in the file, the first schema
+block is for the keys, and the second is for the values
 ```
-|INNER PAGE-------|--------|--------|
-|lvl (i8)|                          |
-|                                   |
-|                                   |
+|SCHEMA HEADER----|--------|--------|
+:                                   :
+:          key schema block         :--------|
+:                                   :        |
+:...................................:        |
+:                                   :        |
+:          val schema block         :--------|
+:                                   :        |
+|--------|--------|--------|--------|        |
+                                             |
+|SCHEMA BLOCK-----|--------|--------|        |
+|                                   |        |
+|               TODO                |<-------|
 |                                   |
 |--------|--------|--------|--------|
 ```
+when you register a file to a store instance, it will check the schema
+in the file against the key and value types you pass to store, and will return
+an error if they are not compatable.
+> NOTE this does not check that the `Ord` implementation is the same, support
+> for this may be added in the future.
+
+after the schema header, a store file is made up entirely of fixed sized pages.
+there are three types of pages:
+- btree leaf pages
+- btree inner pages
+- overflow pages
+
+## Btree pages
+the header of a btree page is 13 bytes for a leaf page, and 17 bytes for inner
+pages. the first byte is an i8 indicating the level of the tree node, a level
+of 0 means the page is a leaf node. the next 8 bytes are two u32 page id's for
+the left and right sibling of the node respectively. followed by a 2 byte u16
+indicating the number of occupied slots in the page, and then another 2 byte u16
+indicating the byte offset for the start of the cell content. for inner pages,
+the last 4 bytes of the header indicates the right most pointer page id.
+```
+|BTREE PAGE HEADER|--------|--------|--------|
+|  lvl   |          left sib ptr             |
+|--------|--------|--------|--------|--------|
+|         right sib ptr             |
+|--------|--------|--------|--------|
+|    num slots    |   cells start   |
+|--------|--------|--------|--------|
+: right most ptr (only inner pages) :
+:........:........:........:........:
+```
+
+%%TODO: explain btree page%%
 
 ```
-|LEAF PAGE--------|--------|--------|--------|--------|
-|HEADER--|--------|--------|--------|--------|--------|
-|    0   |  left sibling (u32), 0 for null   |
-|for null| right sibling (u32), 0 - |
-|for null| num slots (u16) | slot - |
-|content |
+|BTREE PAGE-------|--------|--------|
+|     slot 1      |     slot 2      |
+|     slot 3      |     slot 4      |
+:                                   :
+|      ...        |     slot n      |
+:                                   :
+:    some amount of free space      :
+:                                   :
+|--------|--------|--------|--------|
+|                                   |
+|              cell 4               |
+|                                   |
+|--------|--------|--------|--------|
+|              cell 3               |
+|--------|--------|--------|--------|
+|          cell 1          |        |
+|--------|--------|--------|        |
+|                cell 2             |
+|                                   |
+|--------|--------|--------|--------|
+:                                   :
+:                ...                :
+:                                   :
+|--------|--------|--------|--------|
+|              cell n               |
+|--------|--------|--------|--------|
 ```
 
 ```
 |OVERFLOW PAGE----|--------|--------|
-|   -1   |                          |
+|                                   |
 |                                   |
 |                                   |
 |                                   |
 |--------|--------|--------|--------|
 ```
-
-
