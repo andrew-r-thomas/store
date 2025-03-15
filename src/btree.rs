@@ -1,5 +1,8 @@
 use crate::pager::{Cell, Page, Pager};
 
+/// NOTE:
+/// so there's a trade off here between splitting nodes, and opting to insert
+/// a key as an overflow page kinda thing, this should be profiled
 pub struct BTree {
     pager: Pager,
     root_page_id: u32,
@@ -26,7 +29,8 @@ impl BTree {
             if let Cell::LeafCell { key: k, val: _ } = cell {
                 if key < k {
                     if let Err(_) = leaf_page.insert_cell(slot, new_cell) {
-                        todo!("split");
+                        let (new_page_id, new_page) = self.pager.create_page();
+                        leaf_page.split_into(new_page);
                     }
                     return;
                 } else if key == k {
@@ -84,6 +88,11 @@ impl BTree {
             }
         }
         None
+    }
+
+    /// assumes the caller will add the new key
+    fn split(&mut self, page_id: u32) {
+        self.pager.split(page_id);
     }
 }
 

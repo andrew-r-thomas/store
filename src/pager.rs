@@ -42,8 +42,29 @@ impl Pager {
         // if we reach this point, we need to evict something
         // we probably want a separate list of dirty pages instead of storing
         // the info in the page type itself
+        todo!("evict")
+    }
 
-        Err(PagerError::HotCache)
+    pub fn create_page(&mut self) -> u32 {
+        if let Some(free_frame) = self.free_list.pop() {
+            let page = &mut self.pool[free_frame];
+            let page_id = self.io.create_page(&page.buf);
+            self.page_map.insert(page_id, free_frame);
+            self.cache_tracker.hit(page_id);
+            return page_id;
+        }
+
+        // evict something
+        todo!("evict")
+    }
+
+    pub fn split(&mut self, page_id: u32) {
+        let page_idx = *self.page_map.get(&page_id).unwrap();
+        let to_split = &mut self.pool[page_idx];
+        let new_page_id = self.create_page();
+        let new_page_idx = *self.page_map.get(&new_page_id).unwrap();
+        let new_page = &mut self.pool[new_page_idx];
+        to_split.split_into(new_page);
     }
 }
 
@@ -83,10 +104,10 @@ impl Page {
     pub fn right_ptr(&self) -> u32 {
         u32::from_be_bytes(self.buf[RIGHT_PTR].try_into().unwrap())
     }
-
     pub fn free_space(&self) -> usize {
         self.cells_start() as usize - HEADER_OFFSET - (self.slots() as usize * 2)
     }
+
     pub fn set_dirty(&mut self) {
         self.dirty = true;
     }
@@ -219,6 +240,10 @@ impl Page {
             self.dirty = true;
             Ok(())
         }
+    }
+
+    pub fn split_into(&mut self, other: &mut Self) {
+        unimplemented!()
     }
 }
 
