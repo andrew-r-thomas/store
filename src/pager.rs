@@ -11,14 +11,15 @@ pub struct Pager {
 }
 impl Pager {
     pub fn new(capacity: usize, page_size: usize, io: FileIO) -> Self {
+        let mut pool = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            pool.push(Page {
+                buf: vec![0; page_size],
+                dirty: false,
+            });
+        }
         Self {
-            pool: vec![
-                Page {
-                    buf: vec![0; page_size],
-                    dirty: false,
-                };
-                capacity
-            ],
+            pool,
             free_list: Vec::from_iter(0..capacity),
             page_map: HashMap::with_capacity(capacity),
             cache_tracker: LRUKCache::new(),
@@ -29,14 +30,16 @@ impl Pager {
     pub fn get(&mut self, page_id: u32) -> Result<&mut Page, PagerError> {
         if let Some(i) = self.page_map.get(&page_id) {
             self.cache_tracker.hit(page_id);
+            // TODO: might want to return a guard here or something instead
             return Ok(&mut self.pool[*i]);
         }
 
         if let Some(free_frame) = self.free_list.pop() {
-            self.io.read_page(page_id, &mut self.pool[free_frame].buf);
+            let page = &mut self.pool[free_frame];
+            self.io.read_page(page_id, &mut page.buf);
             self.cache_tracker.hit(page_id);
             self.page_map.insert(page_id, free_frame);
-            return Ok(&mut self.pool[free_frame]);
+            return Ok(page);
         }
 
         // if we reach this point, we need to evict something
@@ -47,7 +50,7 @@ impl Pager {
 
     pub fn create_page(&mut self) -> u32 {
         if let Some(free_frame) = self.free_list.pop() {
-            let page = &mut self.pool[free_frame];
+            let page = &self.pool[free_frame];
             let page_id = self.io.create_page(&page.buf);
             self.page_map.insert(page_id, free_frame);
             self.cache_tracker.hit(page_id);
@@ -56,15 +59,6 @@ impl Pager {
 
         // evict something
         todo!("evict")
-    }
-
-    pub fn split(&mut self, page_id: u32) {
-        let page_idx = *self.page_map.get(&page_id).unwrap();
-        let to_split = &mut self.pool[page_idx];
-        let new_page_id = self.create_page();
-        let new_page_idx = *self.page_map.get(&new_page_id).unwrap();
-        let new_page = &mut self.pool[new_page_idx];
-        to_split.split_into(new_page);
     }
 }
 
@@ -148,9 +142,9 @@ impl Page {
             current_slot: 0,
         }
     }
-    pub fn insert_cell(&mut self, slot: usize, cell: Cell<'_>) -> Result<(), ()> {
+    pub fn insert_cell<'ic>(&mut self, slot: usize, cell: Cell<'ic>) -> Result<(), Cell<'ic>> {
         if self.free_space() < cell.len() + 2 {
-            return Err(());
+            return Err(cell);
         }
 
         let cell_end = self.cells_start() as usize;
@@ -173,9 +167,9 @@ impl Page {
 
         Ok(())
     }
-    pub fn push_cell(&mut self, cell: Cell<'_>) -> Result<(), ()> {
+    pub fn push_cell<'pc>(&mut self, cell: Cell<'pc>) -> Result<(), Cell<'pc>> {
         if self.free_space() < cell.len() + 2 {
-            return Err(());
+            return Err(cell);
         }
 
         let cell_end = self.cells_start() as usize;
@@ -247,6 +241,7 @@ impl Page {
     }
 }
 
+#[derive(Debug)]
 pub enum Cell<'c> {
     InnerCell { key: &'c [u8], left_ptr: u32 },
     LeafCell { key: &'c [u8], val: &'c [u8] },

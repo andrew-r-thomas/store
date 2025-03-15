@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::pager::{Cell, Page, Pager};
 
 /// NOTE:
@@ -7,6 +9,7 @@ pub struct BTree {
     pager: Pager,
     root_page_id: u32,
     page_stack: Vec<u32>,
+    val_buf: Vec<u8>,
 }
 impl BTree {
     pub fn new(pager: Pager, root_page_id: u32) -> Self {
@@ -14,12 +17,25 @@ impl BTree {
             pager,
             root_page_id,
             page_stack: Vec::new(),
+            val_buf: Vec::new(),
         }
     }
+    /// the buf passed to this function should be empty, and will be filled with
+    /// the target value if it is found
     pub fn get(&mut self, key: &[u8]) -> Option<&[u8]> {
         self.find_leaf(key);
         let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
-        Self::search_leaf_page(key, leaf_page)
+        match Self::search_leaf_page(key, &leaf_page) {
+            Some(val) => {
+                self.val_buf.clear();
+                // PERF: here, there, everywhere
+                for v in val {
+                    self.val_buf.push(*v);
+                }
+                return Some(&self.val_buf);
+            }
+            None => return None,
+        }
     }
     pub fn set(&mut self, key: &[u8], val: &[u8]) {
         self.find_leaf(key);
@@ -28,22 +44,27 @@ impl BTree {
         for (cell, slot) in leaf_page.iter_cells().zip(0..) {
             if let Cell::LeafCell { key: k, val: _ } = cell {
                 if key < k {
-                    if let Err(_) = leaf_page.insert_cell(slot, new_cell) {
-                        let (new_page_id, new_page) = self.pager.create_page();
-                        leaf_page.split_into(new_page);
+                    if let Err(bad_cell) = leaf_page.insert_cell(slot, new_cell) {
+                        let new_page_id = self.pager.create_page();
+                        self.split(new_page_id);
+                        leaf_page.insert_cell(slot, bad_cell).unwrap();
                     }
                     return;
                 } else if key == k {
                     if let Err(_) = leaf_page.update_cell(slot, val) {
-                        todo!("split");
+                        let new_page_id = self.pager.create_page();
+                        self.split(new_page_id);
+                        leaf_page.update_cell(slot, val).unwrap();
                     }
                     return;
                 }
             }
         }
         // new val goes at the end, and is an insert
-        if let Err(_) = leaf_page.push_cell(new_cell) {
-            todo!("split");
+        if let Err(bad_cell) = leaf_page.push_cell(new_cell) {
+            let new_page_id = self.pager.create_page();
+            self.split(new_page_id);
+            leaf_page.push_cell(bad_cell).unwrap();
         }
     }
     pub fn delete(&mut self) {
@@ -64,7 +85,7 @@ impl BTree {
             if current_page.level() == 0 {
                 break;
             }
-            current_page_id = Self::search_inner_page(key, current_page);
+            current_page_id = Self::search_inner_page(key, &current_page);
         }
     }
 
@@ -92,7 +113,20 @@ impl BTree {
 
     /// assumes the caller will add the new key
     fn split(&mut self, page_id: u32) {
-        self.pager.split(page_id);
+        match self.page_stack.pop() {
+            Some(from_page_id) => {
+                // split the pages
+                let from_page = self.pager.get(from_page_id).unwrap();
+                let to_page = self.pager.get(page_id).unwrap();
+                from_page.split_into(to_page);
+
+                // check if parent need a split
+            }
+            None => {
+                // we split the root, and need to create a new one
+            }
+        }
+        unimplemented!()
     }
 }
 

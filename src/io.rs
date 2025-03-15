@@ -107,6 +107,7 @@ impl FileIO {
             v_num: CURRENT_VERSION,
         })
     }
+    // lol this won't go terribly at all
     pub fn read_page(&mut self, page_id: u32, buf: &mut [u8]) {
         self.file
             .seek(io::SeekFrom::Start(
