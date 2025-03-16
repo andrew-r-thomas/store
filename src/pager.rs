@@ -1,22 +1,23 @@
-use std::{collections::HashMap, ops::Range};
+use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
 use crate::{cache::LRUKCache, io::FileIO};
 
 pub struct Pager {
     page_map: HashMap<u32, usize>,
-    pool: Vec<Page>,
+    pool: Vec<Rc<RefCell<Page>>>,
     free_list: Vec<usize>,
     cache_tracker: LRUKCache,
     io: FileIO,
+    pub page_size: usize,
 }
 impl Pager {
     pub fn new(capacity: usize, page_size: usize, io: FileIO) -> Self {
         let mut pool = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            pool.push(Page {
+            pool.push(Rc::new(RefCell::new(Page {
                 buf: vec![0; page_size],
                 dirty: false,
-            });
+            })));
         }
         Self {
             pool,
@@ -24,22 +25,25 @@ impl Pager {
             page_map: HashMap::with_capacity(capacity),
             cache_tracker: LRUKCache::new(),
             io,
+            page_size,
         }
     }
 
-    pub fn get(&mut self, page_id: u32) -> Result<&mut Page, PagerError> {
+    pub fn get(&mut self, page_id: u32) -> Result<Rc<RefCell<Page>>, PagerError> {
         if let Some(i) = self.page_map.get(&page_id) {
             self.cache_tracker.hit(page_id);
             // TODO: might want to return a guard here or something instead
-            return Ok(&mut self.pool[*i]);
+            return Ok(self.pool[*i].clone());
         }
 
         if let Some(free_frame) = self.free_list.pop() {
-            let page = &mut self.pool[free_frame];
-            self.io.read_page(page_id, &mut page.buf);
-            self.cache_tracker.hit(page_id);
-            self.page_map.insert(page_id, free_frame);
-            return Ok(page);
+            {
+                let page = &mut self.pool[free_frame].borrow_mut();
+                self.io.read_page(page_id, &mut page.buf);
+                self.cache_tracker.hit(page_id);
+                self.page_map.insert(page_id, free_frame);
+            }
+            return Ok(self.pool[free_frame].clone());
         }
 
         // if we reach this point, we need to evict something
@@ -47,10 +51,18 @@ impl Pager {
         // the info in the page type itself
         todo!("evict")
     }
+    pub fn get_scratch(&mut self) -> Rc<RefCell<Page>> {
+        let idx = self.free_list.pop().unwrap();
+        let page = self.pool[idx].clone();
+        let mut guard = page.borrow_mut();
+        guard.set_cells_start(self.page_size as u16);
+        drop(guard);
+        page
+    }
 
     pub fn create_page(&mut self) -> u32 {
         if let Some(free_frame) = self.free_list.pop() {
-            let page = &self.pool[free_frame];
+            let page = &self.pool[free_frame].borrow();
             let page_id = self.io.create_page(&page.buf);
             self.page_map.insert(page_id, free_frame);
             self.cache_tracker.hit(page_id);
@@ -67,6 +79,12 @@ pub enum PagerError {
     HotCache,
 }
 
+// pub enum Page_ {
+//     Overflow(OverflowPage),
+//     Leaf(LeafPage),
+//     Inner(InnerPage),
+// }
+
 #[derive(Clone)] // don't like this
 pub struct Page {
     buf: Vec<u8>,
@@ -80,8 +98,8 @@ const CELLS_START: Range<usize> = 12..14;
 const RIGHT_PTR: Range<usize> = 14..18;
 const HEADER_OFFSET: usize = 18;
 impl Page {
-    pub fn level(&self) -> u8 {
-        self.buf[LEVEL]
+    pub fn level(&self) -> i8 {
+        i8::from_be_bytes([self.buf[LEVEL]])
     }
     pub fn left_sib(&self) -> u32 {
         u32::from_be_bytes(self.buf[LEFT_SIB].try_into().unwrap())
@@ -104,6 +122,18 @@ impl Page {
 
     pub fn set_dirty(&mut self) {
         self.dirty = true;
+    }
+    pub fn set_level(&mut self, level: i8) {
+        self.buf[LEVEL] = level.to_be_bytes()[0];
+    }
+    pub fn set_right_ptr(&mut self, ptr: u32) {
+        self.buf[RIGHT_PTR].copy_from_slice(&ptr.to_be_bytes());
+    }
+    pub fn set_slots(&mut self, slots: u16) {
+        self.buf[SLOTS].copy_from_slice(&slots.to_be_bytes());
+    }
+    pub fn set_cells_start(&mut self, cells_start: u16) {
+        self.buf[CELLS_START].copy_from_slice(&cells_start.to_be_bytes());
     }
 
     pub fn get_cell(&self, slot: usize) -> Cell<'_> {
@@ -187,6 +217,8 @@ impl Page {
         self.buf[CELLS_START]
             .copy_from_slice(&(current_cells_start - cell.len() as u16).to_be_bytes());
 
+        // FIX: need to update right most ptr for inner pages
+
         self.dirty = true;
 
         Ok(())
@@ -235,9 +267,77 @@ impl Page {
             Ok(())
         }
     }
+    pub fn delete_cell(&mut self, slot: usize) {
+        let slot_start = HEADER_OFFSET + (2 * slot);
+        let slot_end = slot_start + 2;
+        let cell_offset =
+            u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap()) as usize;
+        let cell_len = {
+            if self.level() > 0 {
+                // inner node
+                u16::from_be_bytes(self.buf[cell_offset..cell_offset + 2].try_into().unwrap())
+                    as usize
+                    + 6
+            } else {
+                // leaf node
+                (u16::from_be_bytes(self.buf[cell_offset..cell_offset + 2].try_into().unwrap())
+                    + u16::from_be_bytes(
+                        self.buf[cell_offset + 2..cell_offset + 4]
+                            .try_into()
+                            .unwrap(),
+                    )) as usize
+                    + 4
+            }
+        };
 
-    pub fn split_into(&mut self, other: &mut Self) {
-        unimplemented!()
+        // erase cell
+        self.buf[cell_offset..cell_offset + cell_len].fill(0);
+
+        // move everything after the slot over left by one
+        let slots_end = HEADER_OFFSET + (2 * self.slots() as usize);
+        self.buf.copy_within(slot_end..slots_end, slot_start);
+
+        self.set_slots(self.slots() - 1);
+
+        // ok we need to fix setting the cell offset, which seems trickier than
+        // i thought
+        todo!()
+    }
+
+    pub fn split_into(&mut self, other: &mut Self, scratch: &mut Self) {
+        other.set_level(self.level());
+        other.set_cells_start(self.buf.len() as u16);
+        let middle_slot = (self.slots() / 2) as usize;
+        for slot in middle_slot..self.slots() as usize {
+            let cell = self.get_cell(slot);
+            other.push_cell(cell).unwrap();
+        }
+        for _ in middle_slot..self.slots() as usize {
+            self.delete_cell(middle_slot);
+        }
+        if self.level() > 0 {
+            // need to do right ptr things
+            other.set_right_ptr(self.right_ptr());
+            // need to set self right ptr
+            let first = other.get_cell(0);
+            if let Cell::InnerCell { key: _, left_ptr } = first {
+                self.set_right_ptr(left_ptr);
+            }
+        }
+        self.compact(scratch);
+    }
+
+    // PERF: this hurts but i just need to wrap my head around things
+    pub fn compact(&mut self, scratch: &mut Self) {
+        let slots = self.slots();
+        for _ in 0..slots {
+            scratch.push_cell(self.get_cell(0)).unwrap();
+            self.delete_cell(0);
+        }
+        for _ in 0..slots {
+            self.push_cell(scratch.get_cell(0)).unwrap();
+            scratch.delete_cell(0);
+        }
     }
 }
 

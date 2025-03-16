@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::pager::{Cell, Page, Pager};
 
 /// NOTE:
@@ -10,6 +8,11 @@ pub struct BTree {
     root_page_id: u32,
     page_stack: Vec<u32>,
     val_buf: Vec<u8>,
+}
+enum SetOption {
+    Insert(usize),
+    Push,
+    Update(usize),
 }
 impl BTree {
     pub fn new(pager: Pager, root_page_id: u32) -> Self {
@@ -25,7 +28,7 @@ impl BTree {
     pub fn get(&mut self, key: &[u8]) -> Option<&[u8]> {
         self.find_leaf(key);
         let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
-        match Self::search_leaf_page(key, &leaf_page) {
+        match Self::search_leaf_page(key, &leaf_page.borrow()) {
             Some(val) => {
                 self.val_buf.clear();
                 // PERF: here, there, everywhere
@@ -39,32 +42,48 @@ impl BTree {
     }
     pub fn set(&mut self, key: &[u8], val: &[u8]) {
         self.find_leaf(key);
-        let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
         let new_cell = Cell::LeafCell { key, val };
-        for (cell, slot) in leaf_page.iter_cells().zip(0..) {
-            if let Cell::LeafCell { key: k, val: _ } = cell {
-                if key < k {
-                    if let Err(bad_cell) = leaf_page.insert_cell(slot, new_cell) {
-                        let new_page_id = self.pager.create_page();
-                        self.split(new_page_id);
-                        leaf_page.insert_cell(slot, bad_cell).unwrap();
+        let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
+        let opt = {
+            let mut out = SetOption::Push;
+            for (cell, slot) in leaf_page.borrow().iter_cells().zip(0..) {
+                if let Cell::LeafCell { key: k, val: _ } = cell {
+                    if key < k {
+                        out = SetOption::Insert(slot);
+                        break;
+                    } else if key == k {
+                        out = SetOption::Update(slot);
+                        break;
                     }
-                    return;
-                } else if key == k {
-                    if let Err(_) = leaf_page.update_cell(slot, val) {
-                        let new_page_id = self.pager.create_page();
-                        self.split(new_page_id);
-                        leaf_page.update_cell(slot, val).unwrap();
-                    }
-                    return;
                 }
             }
-        }
-        // new val goes at the end, and is an insert
-        if let Err(bad_cell) = leaf_page.push_cell(new_cell) {
-            let new_page_id = self.pager.create_page();
-            self.split(new_page_id);
-            leaf_page.push_cell(bad_cell).unwrap();
+            out
+        };
+        match opt {
+            SetOption::Insert(slot) => {
+                let res = { leaf_page.borrow_mut().insert_cell(slot, new_cell) };
+                if let Err(new_cell) = res {
+                    let new_page_id = self.pager.create_page();
+                    self.split(new_page_id);
+                    leaf_page.borrow_mut().insert_cell(slot, new_cell).unwrap();
+                }
+            }
+            SetOption::Update(slot) => {
+                let res = { leaf_page.borrow_mut().update_cell(slot, val) };
+                if let Err(_) = res {
+                    let new_page_id = self.pager.create_page();
+                    self.split(new_page_id);
+                    leaf_page.borrow_mut().update_cell(slot, val).unwrap();
+                }
+            }
+            SetOption::Push => {
+                let res = { leaf_page.borrow_mut().push_cell(new_cell) };
+                if let Err(new_cell) = res {
+                    let new_page_id = self.pager.create_page();
+                    self.split(new_page_id);
+                    leaf_page.borrow_mut().push_cell(new_cell).unwrap();
+                }
+            }
         }
     }
     pub fn delete(&mut self) {
@@ -82,10 +101,10 @@ impl BTree {
         loop {
             self.page_stack.push(current_page_id);
             let current_page = self.pager.get(current_page_id).unwrap();
-            if current_page.level() == 0 {
+            if current_page.borrow().level() == 0 {
                 break;
             }
-            current_page_id = Self::search_inner_page(key, &current_page);
+            current_page_id = Self::search_inner_page(key, &current_page.borrow());
         }
     }
 
@@ -111,23 +130,96 @@ impl BTree {
         None
     }
 
-    /// assumes the caller will add the new key
-    fn split(&mut self, page_id: u32) {
-        match self.page_stack.pop() {
-            Some(from_page_id) => {
-                // split the pages
-                let from_page = self.pager.get(from_page_id).unwrap();
-                let to_page = self.pager.get(page_id).unwrap();
-                from_page.split_into(to_page);
-
-                // check if parent need a split
-            }
-            None => {
-                // we split the root, and need to create a new one
+    fn find_slot(page: &Page, key: &[u8]) -> TargetSlot {
+        // PERF: gotta rework these cell types, can't be matching all the time
+        for (cell, slot) in page.iter_cells().zip(0..) {
+            let k = match cell {
+                Cell::InnerCell { key, left_ptr: _ } => key,
+                Cell::LeafCell { key, val: _ } => key,
+            };
+            if key < k {
+                return TargetSlot::Lt(slot);
+            } else if key == k {
+                return TargetSlot::Eq(slot);
             }
         }
-        unimplemented!()
+
+        TargetSlot::Gt
     }
+
+    /// assumes the caller will add the new key
+    fn split(&mut self, page_id: u32) {
+        let from_page_id = self.page_stack.pop().unwrap();
+        // split the pages
+        let from_page = self.pager.get(from_page_id).unwrap();
+        let to_page = self.pager.get(page_id).unwrap();
+        from_page.borrow_mut().split_into(
+            &mut to_page.borrow_mut(),
+            &mut self.pager.get_scratch().borrow_mut(),
+        );
+
+        // check if parent need a split
+        match self.page_stack.last() {
+            Some(parent_id) => {
+                let parent = self.pager.get(*parent_id).unwrap();
+                let to_borrow = to_page.borrow();
+                let cell = to_borrow.get_cell(0);
+
+                // find right slot
+                if let Cell::InnerCell { key, left_ptr: _ } = cell {
+                    let target_slot = Self::find_slot(&parent.borrow(), key);
+                    let res = match target_slot {
+                        TargetSlot::Lt(slot) | TargetSlot::Eq(slot) => {
+                            parent.borrow_mut().insert_cell(slot, cell)
+                        }
+                        TargetSlot::Gt => parent.borrow_mut().push_cell(cell),
+                    };
+                    if let Err(cell) = res {
+                        // we need to split some more
+                        self.split(*parent_id);
+                        match target_slot {
+                            TargetSlot::Lt(slot) | TargetSlot::Eq(slot) => {
+                                parent.borrow_mut().insert_cell(slot, cell).unwrap();
+                            }
+                            TargetSlot::Gt => parent.borrow_mut().push_cell(cell).unwrap(),
+                        }
+                    }
+                }
+            }
+            None => {
+                // we split the root
+                let new_root_id = self.pager.create_page();
+                let new_root = self.pager.get(new_root_id).unwrap();
+                let mut new_root_mut = new_root.borrow_mut();
+                new_root_mut.set_level(from_page.borrow().level());
+                new_root_mut.set_right_ptr(page_id);
+                new_root_mut.set_cells_start(self.pager.page_size as u16);
+                let from_page_borrow = from_page.borrow();
+                match from_page_borrow.get_cell(from_page_borrow.slots() as usize) {
+                    Cell::InnerCell { key, left_ptr: _ } => new_root_mut
+                        .push_cell(Cell::InnerCell {
+                            key,
+                            left_ptr: from_page_id,
+                        })
+                        .unwrap(),
+                    Cell::LeafCell { key, val: _ } => new_root_mut
+                        .push_cell(Cell::InnerCell {
+                            key,
+                            left_ptr: from_page_id,
+                        })
+                        .unwrap(),
+                }
+                self.root_page_id = new_root_id;
+                // TODO: gotta make sure this update gets to disk manager
+            }
+        }
+    }
+}
+
+enum TargetSlot {
+    Lt(usize),
+    Eq(usize),
+    Gt,
 }
 
 #[cfg(test)]
