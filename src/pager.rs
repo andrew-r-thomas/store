@@ -136,6 +136,13 @@ impl Page {
         self.buf[CELLS_START].copy_from_slice(&cells_start.to_be_bytes());
     }
 
+    pub fn inc_slot(&mut self, slot: usize, by: u16) {
+        let slot_start = HEADER_OFFSET + (2 * slot);
+        let slot_end = slot_start + 2;
+        let slot_val = u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap());
+        self.buf[slot_start..slot_end].copy_from_slice(&(slot_val + by).to_be_bytes());
+    }
+
     pub fn get_cell(&self, slot: usize) -> Cell<'_> {
         let slot_start = HEADER_OFFSET + (2 * slot);
         let slot_end = slot_start + 2;
@@ -290,18 +297,26 @@ impl Page {
             }
         };
 
-        // erase cell
+        // erase cell, and shift stuff
         self.buf[cell_offset..cell_offset + cell_len].fill(0);
+        if cell_offset != self.cells_start() as usize {
+            // ok we will just compact on delete actually, makes life more simple
+            // and since we are doing that, we know the slots go in order
+            for s in slot + 1..self.slots() as usize {
+                self.inc_slot(s, cell_len as u16);
+            }
+            // copy cells over
+            let cells_start = self.cells_start() as usize;
+            self.buf
+                .copy_within(cells_start..cell_offset, cells_start + cell_len);
+        }
+        self.set_cells_start(self.cells_start() + cell_len as u16);
 
         // move everything after the slot over left by one
         let slots_end = HEADER_OFFSET + (2 * self.slots() as usize);
         self.buf.copy_within(slot_end..slots_end, slot_start);
 
         self.set_slots(self.slots() - 1);
-
-        // ok we need to fix setting the cell offset, which seems trickier than
-        // i thought
-        todo!()
     }
 
     pub fn split_into(&mut self, other: &mut Self, scratch: &mut Self) {
@@ -323,20 +338,6 @@ impl Page {
             if let Cell::InnerCell { key: _, left_ptr } = first {
                 self.set_right_ptr(left_ptr);
             }
-        }
-        self.compact(scratch);
-    }
-
-    // PERF: this hurts but i just need to wrap my head around things
-    pub fn compact(&mut self, scratch: &mut Self) {
-        let slots = self.slots();
-        for _ in 0..slots {
-            scratch.push_cell(self.get_cell(0)).unwrap();
-            self.delete_cell(0);
-        }
-        for _ in 0..slots {
-            self.push_cell(scratch.get_cell(0)).unwrap();
-            scratch.delete_cell(0);
         }
     }
 }

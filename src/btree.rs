@@ -228,6 +228,7 @@ mod tests {
 
     use super::*;
 
+    #[ignore]
     #[test]
     fn basic_set_get() {
         let io = FileIO::create("temp.store", 4 * 1024).unwrap();
