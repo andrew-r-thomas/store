@@ -11,7 +11,7 @@ pub struct Store {
 }
 
 const DEFAULT_PAGE_SIZE: u32 = 1024 * 4;
-const DEFAULT_POOL_CAP: usize = 1024 * 1024;
+const DEFAULT_POOL_CAP: usize = 1024;
 
 impl Store {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, IOError> {

@@ -1,13 +1,7 @@
-use std::{
-    cell::{Ref, RefCell},
-    rc::Rc,
-};
+use crate::pager::{Cell, Page, Pager};
 
-use crate::pager::{Cell, CellsIter, Page, Pager};
+use std::{cell::RefCell, rc::Rc};
 
-/// NOTE:
-/// so there's a trade off here between splitting nodes, and opting to insert
-/// a key as an overflow page kinda thing, this should be profiled
 pub struct BTree {
     pager: Pager,
     root_page_id: u32,
@@ -29,8 +23,11 @@ impl BTree {
         let leaf_page = self.pager.get(self.page_stack.pop().unwrap()).unwrap();
         match leaf_page.borrow().get(key) {
             Some(cell) => match cell {
-                Cell::InnerCell { key, left_ptr } => {
-                    let t = left_ptr;
+                Cell::InnerCell {
+                    key: _,
+                    left_ptr: _,
+                } => {
+                    println!("ahhh!!! inner cell in leaf node");
                     None
                 }
                 Cell::LeafCell { key: k, val } => {
@@ -38,9 +35,11 @@ impl BTree {
                         for v in val {
                             buf.push(*v);
                         }
-                        return Some(());
+                        Some(())
+                    } else {
+                        println!("got wrong val");
+                        None
                     }
-                    None
                 }
             },
             None => None,
@@ -93,6 +92,7 @@ impl BTree {
                     }
                 }
                 None => {
+                    println!("going right");
                     current_page_id = current_page.borrow().right_ptr();
                 }
             }
