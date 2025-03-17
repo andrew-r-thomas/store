@@ -26,7 +26,7 @@ fn benchmark(c: &mut Criterion) {
             |(key, val)| {
                 store.btree.set(key, val);
             },
-            criterion::BatchSize::LargeInput,
+            criterion::BatchSize::SmallInput,
         )
     });
 }

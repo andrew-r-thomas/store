@@ -96,7 +96,7 @@ impl FileIO {
         // TODO: might do this with bufpool
         let mut root = vec![0; page_size as usize];
         // lmao this is so janky
-        root[12..14].copy_from_slice(&(page_size as u16).to_be_bytes());
+        root[11..13].copy_from_slice(&(page_size as u16).to_be_bytes());
         file.write_all(&root).unwrap();
 
         Ok(Self {

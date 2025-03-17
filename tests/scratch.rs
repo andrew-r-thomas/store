@@ -1,13 +1,14 @@
 use std::fs;
 
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use store::store::Store;
 
 #[test]
 fn scratch() {
     let mut store = Store::create("test.store").unwrap();
     let mut rng = rand::rng();
-    for _ in 0..10 {
+    for _ in 0..100 {
         let key_size = rng.random_range(128..256);
         let mut key: Vec<u8> = vec![0; key_size];
         rng.fill(&mut key[..]);

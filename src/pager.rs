@@ -10,6 +10,7 @@ pub struct Pager {
     io: FileIO,
     pub page_size: usize,
 }
+
 impl Pager {
     pub fn new(capacity: usize, page_size: usize, io: FileIO) -> Self {
         let mut pool = Vec::with_capacity(capacity);
@@ -85,19 +86,26 @@ pub enum PagerError {
 //     Inner(InnerPage),
 // }
 
+enum SetOption {
+    Gt,
+    Lt(usize),
+    Eq(usize),
+}
+
 #[derive(Clone)] // don't like this
 pub struct Page {
     buf: Vec<u8>,
-    dirty: bool,
+    pub dirty: bool,
 }
 const LEVEL: usize = 0;
 const LEFT_SIB: Range<usize> = 1..5;
 const RIGHT_SIB: Range<usize> = 5..9;
-const SLOTS: Range<usize> = 10..12;
-const CELLS_START: Range<usize> = 12..14;
-const RIGHT_PTR: Range<usize> = 14..18;
-const HEADER_OFFSET: usize = 18;
+const SLOTS: Range<usize> = 9..11;
+const CELLS_START: Range<usize> = 11..13;
+const RIGHT_PTR: Range<usize> = 13..17;
+const HEADER_OFFSET: usize = 17;
 impl Page {
+    // methods for reading the header
     pub fn level(&self) -> i8 {
         i8::from_be_bytes([self.buf[LEVEL]])
     }
@@ -111,43 +119,172 @@ impl Page {
         u16::from_be_bytes(self.buf[SLOTS].try_into().unwrap())
     }
     pub fn cells_start(&self) -> u16 {
-        u16::from_be_bytes(self.buf[CELLS_START].try_into().unwrap())
+        match u16::from_be_bytes(self.buf[CELLS_START].try_into().unwrap()) {
+            0 => self.buf.len() as u16,
+            n => n,
+        }
     }
     pub fn right_ptr(&self) -> u32 {
         u32::from_be_bytes(self.buf[RIGHT_PTR].try_into().unwrap())
     }
-    pub fn free_space(&self) -> usize {
-        self.cells_start() as usize - HEADER_OFFSET - (self.slots() as usize * 2)
-    }
 
-    pub fn set_dirty(&mut self) {
-        self.dirty = true;
-    }
+    // methods for updating the header
     pub fn set_level(&mut self, level: i8) {
         self.buf[LEVEL] = level.to_be_bytes()[0];
+        self.dirty = true;
+    }
+    pub fn set_left_sib(&mut self, left_sib: u32) {
+        self.buf[LEFT_SIB].copy_from_slice(&left_sib.to_be_bytes());
+        self.dirty = true;
+    }
+    pub fn set_right_sib(&mut self, right_sib: u32) {
+        self.buf[RIGHT_SIB].copy_from_slice(&right_sib.to_be_bytes());
+        self.dirty = true;
     }
     pub fn set_right_ptr(&mut self, ptr: u32) {
         self.buf[RIGHT_PTR].copy_from_slice(&ptr.to_be_bytes());
+        self.dirty = true;
     }
     pub fn set_slots(&mut self, slots: u16) {
         self.buf[SLOTS].copy_from_slice(&slots.to_be_bytes());
+        self.dirty = true;
     }
     pub fn set_cells_start(&mut self, cells_start: u16) {
         self.buf[CELLS_START].copy_from_slice(&cells_start.to_be_bytes());
+        self.dirty = true;
     }
 
+    pub fn set<'s>(&mut self, cell: Cell<'s>) -> Result<(), Cell<'s>> {
+        let key = cell.key();
+        let set_option = {
+            let mut out = SetOption::Gt;
+            for (cell, slot) in self.iter_cells().zip(0..) {
+                let k = cell.key();
+                if key < k {
+                    out = SetOption::Lt(slot);
+                    break;
+                } else if key == k {
+                    out = SetOption::Eq(slot);
+                    break;
+                }
+            }
+            out
+        };
+
+        match set_option {
+            SetOption::Lt(slot) => {
+                // insert
+                if self.free_space() < cell.len() + 2 {
+                    return Err(cell);
+                }
+                // push the cell in
+                let cell_end = self.cells_start() as usize;
+                let cell_start = cell_end - cell.len();
+                cell.copy_to_buf(&mut self.buf[cell_start..cell_end]);
+                self.set_cells_start(cell_start as u16);
+
+                // adjust slots
+                let slot_start = HEADER_OFFSET + (slot * 2);
+                let slots_end = HEADER_OFFSET + (self.slots() as usize * 2);
+                self.buf.copy_within(slot_start..slots_end, slot_start + 2);
+                self.buf[slot_start..slot_start + 2]
+                    .copy_from_slice(&(cell_start as u16).to_be_bytes());
+                self.set_slots(self.slots() + 1);
+
+                Ok(())
+            }
+            SetOption::Eq(slot) => {
+                // update
+                let cell_start = self.get_slot(slot) as usize;
+                match cell {
+                    Cell::InnerCell { key, left_ptr } => {
+                        self.buf[cell_start + key.len()..cell_start + key.len() + 4]
+                            .copy_from_slice(&left_ptr.to_be_bytes());
+                        Ok(())
+                    }
+                    Cell::LeafCell { key: _, val } => {
+                        let val_len = u16::from_be_bytes(
+                            self.buf[cell_start + 2..cell_start + 4].try_into().unwrap(),
+                        ) as usize;
+                        if val.len() > val_len {
+                            Err(cell)
+                        } else {
+                            cell.copy_to_buf(&mut self.buf[cell_start..cell_start + cell.len()]);
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            SetOption::Gt => {
+                // push
+                if self.free_space() < cell.len() + 2 {
+                    return Err(cell);
+                }
+                // push the cell on
+                let cell_end = self.cells_start() as usize;
+                let cell_start = cell_end - cell.len();
+                cell.copy_to_buf(&mut self.buf[cell_start..cell_end]);
+                self.set_cells_start(cell_start as u16);
+
+                // push the slot on
+                let slot_start = HEADER_OFFSET + (self.slots() as usize * 2);
+                let slot_end = slot_start + 2;
+                self.buf[slot_start..slot_end].copy_from_slice(&(cell_start as u16).to_be_bytes());
+                self.set_slots(self.slots() + 1);
+
+                Ok(())
+            }
+        }
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<Cell<'_>> {
+        for cell in self.iter_cells() {
+            if key <= cell.key() {
+                return Some(cell);
+            }
+        }
+        None
+    }
+
+    // utilities
+    pub fn free_space(&self) -> usize {
+        let cells_start = self.cells_start() as usize;
+        let slots = self.slots() as usize;
+        cells_start - (HEADER_OFFSET + (slots * 2))
+    }
+
+    // slot methods
     pub fn inc_slot(&mut self, slot: usize, by: u16) {
         let slot_start = HEADER_OFFSET + (2 * slot);
         let slot_end = slot_start + 2;
         let slot_val = u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap());
         self.buf[slot_start..slot_end].copy_from_slice(&(slot_val + by).to_be_bytes());
     }
-
-    pub fn get_cell(&self, slot: usize) -> Cell<'_> {
+    pub fn get_slot(&self, slot: usize) -> u16 {
         let slot_start = HEADER_OFFSET + (2 * slot);
         let slot_end = slot_start + 2;
-        let cell_offset =
-            u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap()) as usize;
+        u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap())
+    }
+    pub fn delete_slot(&mut self, slot: usize) {
+        let slot_start = HEADER_OFFSET + (2 * slot);
+        let slot_end = slot_start + 2;
+        let slots_end = HEADER_OFFSET + (2 * self.slots() as usize);
+        self.buf.copy_within(slot_end..slots_end, slot_start);
+        self.set_slots(self.slots() - 1);
+        self.dirty = true;
+    }
+    // FIX:
+    pub fn iter_slots_sorted(&self) -> Vec<u16> {
+        let mut out = (0..self.slots())
+            .into_iter()
+            .map(|slot| self.get_slot(slot as usize))
+            .collect::<Vec<u16>>();
+        out.sort();
+        out
+    }
+
+    pub fn get_cell(&self, slot: usize) -> Cell<'_> {
+        let cell_offset = self.get_slot(slot) as usize;
         if self.level() > 0 {
             let key_len =
                 u16::from_be_bytes(self.buf[cell_offset..cell_offset + 2].try_into().unwrap())
@@ -179,106 +316,11 @@ impl Page {
             current_slot: 0,
         }
     }
-    pub fn insert_cell<'ic>(&mut self, slot: usize, cell: Cell<'ic>) -> Result<(), Cell<'ic>> {
-        if self.free_space() < cell.len() + 2 {
-            return Err(cell);
-        }
 
-        let cell_end = self.cells_start() as usize;
-        let cell_start = cell_end - cell.len();
-        cell.copy_to_buf(&mut self.buf[cell_start..cell_end]);
-
-        let slots = self.slots();
-        let slots_start = HEADER_OFFSET + (2 * slot);
-        let slots_end = slots_start + (2 * (slots as usize - slot));
-        self.buf
-            .copy_within(slots_start..slots_end, slots_start + 2);
-        self.buf[slots_start..slots_start + 2].copy_from_slice(&(cell_start as u16).to_be_bytes());
-
-        self.buf[SLOTS].copy_from_slice(&(slots + 1).to_be_bytes());
-        let current_cells_start = self.cells_start();
-        self.buf[CELLS_START]
-            .copy_from_slice(&(current_cells_start - cell.len() as u16).to_be_bytes());
-
-        self.dirty = true;
-
-        Ok(())
-    }
-    pub fn push_cell<'pc>(&mut self, cell: Cell<'pc>) -> Result<(), Cell<'pc>> {
-        if self.free_space() < cell.len() + 2 {
-            return Err(cell);
-        }
-
-        let cell_end = self.cells_start() as usize;
-        let cell_start = cell_end - cell.len();
-        cell.copy_to_buf(&mut self.buf[cell_start..cell_end]);
-
-        let slots = self.slots();
-        let slot_start = HEADER_OFFSET + (2 * slots as usize);
-        let slot_end = slot_start + 2;
-        self.buf[slot_start..slot_end].copy_from_slice(&(cell_start as u16).to_be_bytes());
-
-        // update cell start and num slots
-        self.buf[SLOTS].copy_from_slice(&(slots + 1).to_be_bytes());
-        let current_cells_start = self.cells_start();
-        self.buf[CELLS_START]
-            .copy_from_slice(&(current_cells_start - cell.len() as u16).to_be_bytes());
-
-        // FIX: need to update right most ptr for inner pages
-
-        self.dirty = true;
-
-        Ok(())
-    }
-    pub fn update_cell(&mut self, slot: usize, val: &[u8]) -> Result<(), ()> {
-        let slot_start = HEADER_OFFSET + (2 * slot);
-        let slot_end = slot_start + 2;
-        let cell_offset =
-            u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap()) as usize;
-        let key_len =
-            u16::from_be_bytes(self.buf[cell_offset..cell_offset + 2].try_into().unwrap()) as usize;
-        if self.level() > 0 {
-            // inner page
-            self.buf[cell_offset + 2 + key_len..cell_offset + 2 + key_len + 4].copy_from_slice(val);
-            self.dirty = true;
-            Ok(())
-        } else {
-            // leaf page
-            let val_len = u16::from_be_bytes(
-                self.buf[cell_offset + 2..cell_offset + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            if val_len >= val.len() {
-                // we can just overwrite
-                self.buf[cell_offset + 4 + key_len..cell_offset + 4 + key_len + val.len()]
-                    .copy_from_slice(val);
-                // TODO: figure out what we wanna do if we swap a really large value for a really
-                // small one
-                self.buf
-                    [cell_offset + 4 + key_len + val.len()..cell_offset + 4 + key_len + val_len]
-                    .fill(0); // for posterity, or whatever
-            } else {
-                // FIX: so right now this is not the best option, this error
-                // will trigger the btree to do a split, but we might still
-                // have some room to just push the new cell on top, and set
-                // the current one to 0s, or something, this will be figured
-                // out via the compaction policy.
-                // in general i think it makes sense to be aggresive about
-                // compaction, especially if we already have what we need in
-                // memory, but this will have to get figured out, i'll probably
-                // wait until we've added overflow pages
-                return Err(());
-            }
-            self.dirty = true;
-            Ok(())
-        }
-    }
+    // TODO: so we can't do trick where we push everything down, bc cells are
+    // not necessarily same order as slots
     pub fn delete_cell(&mut self, slot: usize) {
-        let slot_start = HEADER_OFFSET + (2 * slot);
-        let slot_end = slot_start + 2;
-        let cell_offset =
-            u16::from_be_bytes(self.buf[slot_start..slot_end].try_into().unwrap()) as usize;
+        let cell_offset = self.get_slot(slot) as usize;
         let cell_len = {
             if self.level() > 0 {
                 // inner node
@@ -299,46 +341,54 @@ impl Page {
 
         // erase cell, and shift stuff
         self.buf[cell_offset..cell_offset + cell_len].fill(0);
-        if cell_offset != self.cells_start() as usize {
-            // ok we will just compact on delete actually, makes life more simple
-            // and since we are doing that, we know the slots go in order
-            for s in slot + 1..self.slots() as usize {
-                self.inc_slot(s, cell_len as u16);
-            }
-            // copy cells over
-            let cells_start = self.cells_start() as usize;
-            self.buf
-                .copy_within(cells_start..cell_offset, cells_start + cell_len);
+        if cell_offset == self.cells_start() as usize {
+            // we need to find the correct amount to shift this by
+            let new_cells_start = *self
+                .iter_slots_sorted()
+                .get(1)
+                .unwrap_or(&(self.buf.len() as u16));
+            self.set_cells_start(new_cells_start);
         }
-        self.set_cells_start(self.cells_start() + cell_len as u16);
 
-        // move everything after the slot over left by one
-        let slots_end = HEADER_OFFSET + (2 * self.slots() as usize);
-        self.buf.copy_within(slot_end..slots_end, slot_start);
-
-        self.set_slots(self.slots() - 1);
+        self.delete_slot(slot);
+        self.dirty = true;
     }
 
+    /// this function splits left
     pub fn split_into(&mut self, other: &mut Self, scratch: &mut Self) {
-        other.set_level(self.level());
+        let lvl = self.level();
+        other.set_level(lvl);
         other.set_cells_start(self.buf.len() as u16);
+        scratch.set_level(lvl);
         let middle_slot = (self.slots() / 2) as usize;
-        for slot in middle_slot..self.slots() as usize {
-            let cell = self.get_cell(slot);
-            other.push_cell(cell).unwrap();
+        for slot in 0..middle_slot {
+            other.set(self.get_cell(slot)).unwrap();
         }
-        for _ in middle_slot..self.slots() as usize {
-            self.delete_cell(middle_slot);
+        for _ in 0..middle_slot {
+            self.delete_cell(0);
         }
-        if self.level() > 0 {
-            // need to do right ptr things
-            other.set_right_ptr(self.right_ptr());
-            // need to set self right ptr
-            let first = other.get_cell(0);
-            if let Cell::InnerCell { key: _, left_ptr } = first {
-                self.set_right_ptr(left_ptr);
-            }
+        if let Cell::InnerCell { key: _, left_ptr } = self.get_cell(0) {
+            other.set_right_ptr(left_ptr);
         }
+        self.compact(scratch);
+    }
+
+    pub fn compact(&mut self, scratch: &mut Self) {
+        // something got fucked here
+        for cell in self.iter_cells() {
+            scratch.set(cell).unwrap();
+        }
+        for _ in 0..self.slots() as usize {
+            self.delete_cell(0);
+        }
+        for cell in scratch.iter_cells() {
+            self.set(cell).unwrap();
+        }
+        scratch.clear();
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.fill(0);
     }
 }
 
@@ -367,6 +417,12 @@ impl Cell<'_> {
                 buf[4..4 + key.len()].copy_from_slice(key);
                 buf[4 + key.len()..4 + key.len() + val.len()].copy_from_slice(val);
             }
+        }
+    }
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Cell::LeafCell { key, val: _ } => key,
+            Cell::InnerCell { key, left_ptr: _ } => key,
         }
     }
 }
