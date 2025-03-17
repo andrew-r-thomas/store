@@ -42,7 +42,10 @@ impl BTree {
                     }
                 }
             },
-            None => None,
+            None => {
+                println!("it just straight up don't exist");
+                None
+            }
         }
     }
     pub fn set(&mut self, key: &[u8], val: &[u8]) {
@@ -50,8 +53,17 @@ impl BTree {
         let new_cell = Cell::LeafCell { key, val };
         let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
         if let Err(cell) = { leaf_page.borrow_mut().set(new_cell) } {
-            self.split();
-            leaf_page.borrow_mut().set(cell).unwrap();
+            let (middle_key, other) = self.split();
+            if key <= &middle_key {
+                self.pager
+                    .get(other)
+                    .unwrap()
+                    .borrow_mut()
+                    .set(cell)
+                    .unwrap();
+            } else {
+                leaf_page.borrow_mut().set(cell).unwrap();
+            }
         }
     }
 
@@ -100,7 +112,7 @@ impl BTree {
     }
 
     /// assumes the caller will add the new key
-    fn split(&mut self) {
+    fn split(&mut self) -> (Vec<u8>, u32) {
         // do the split
         let from_id = self.page_stack.pop().unwrap();
         let from_page = self.pager.get(from_id).unwrap();
@@ -122,18 +134,15 @@ impl BTree {
                 to_page_borrow.set_right_sib(from_id);
             }
         }
-        from_page
+        // i know, i know, just trying to figure this shit out
+        let middle_key = from_page
             .borrow_mut()
             .split_into(&mut to_page.borrow_mut(), &mut scratch.borrow_mut());
 
         // try to update parent, it should get the to page id as the val,
         // and the last key of the to page
-        let to_page_borrow = to_page.borrow();
-        let last_slot = to_page_borrow.slots() as usize - 1;
-        let last_cell = to_page_borrow.get_cell(last_slot);
-        let key = last_cell.key();
         let new_parent_cell = Cell::InnerCell {
-            key,
+            key: &middle_key,
             left_ptr: to_page_id,
         };
 
@@ -143,9 +152,22 @@ impl BTree {
                 println!("split inner");
                 let parent = self.pager.get(*pid).unwrap();
                 if let Err(cell) = { parent.borrow_mut().set(new_parent_cell) } {
-                    self.split();
-                    parent.borrow_mut().set(cell).unwrap();
+                    // so i think the problem is that we always try to add the cell
+                    // to the original page when we split, but bc of the split,
+                    // it might need to go in the new one
+                    let (m_key, other) = self.split();
+                    if cell.key() <= &m_key {
+                        self.pager
+                            .get(other)
+                            .unwrap()
+                            .borrow_mut()
+                            .set(cell)
+                            .unwrap();
+                    } else {
+                        parent.borrow_mut().set(cell).unwrap();
+                    }
                 }
+                (middle_key, to_page_id)
             }
             None => {
                 // we just split the root
@@ -157,6 +179,7 @@ impl BTree {
                 new_root_mut.set_level(from_page.borrow().level() + 1);
                 new_root_mut.set(new_parent_cell).unwrap();
                 self.root_page_id = new_root_id;
+                (middle_key, to_page_id)
             }
         }
     }

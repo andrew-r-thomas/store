@@ -165,6 +165,7 @@ impl Page {
                     break;
                 } else if key == k {
                     out = SetOption::Eq(slot);
+                    panic!();
                     break;
                 }
             }
@@ -354,12 +355,8 @@ impl Page {
         self.dirty = true;
     }
 
-    // TODO: ok so this is where we left off, on some splits, we fail to move
-    // stuff around correctly, and the next get fails, with a None, bc the best
-    // key found is not equal, zoinks, why am i so bad at this
-    //
     /// this function splits left
-    pub fn split_into(&mut self, other: &mut Self, scratch: &mut Self) {
+    pub fn split_into(&mut self, other: &mut Self, scratch: &mut Self) -> Vec<u8> {
         let lvl = self.level();
         other.set_level(lvl);
         other.set_cells_start(self.buf.len() as u16);
@@ -371,14 +368,17 @@ impl Page {
         for _ in 0..middle_slot {
             self.delete_cell(0);
         }
+        self.compact(scratch);
         if let Cell::InnerCell { key: _, left_ptr } = self.get_cell(0) {
             other.set_right_ptr(left_ptr);
         }
-        self.compact(scratch);
+        match other.get_cell(other.slots() as usize - 1) {
+            Cell::LeafCell { key, val: _ } => key.to_vec(),
+            Cell::InnerCell { key, left_ptr: _ } => key.to_vec(),
+        }
     }
 
     pub fn compact(&mut self, scratch: &mut Self) {
-        // something got fucked here
         for cell in self.iter_cells() {
             scratch.set(cell).unwrap();
         }
@@ -445,5 +445,26 @@ impl<'ci> Iterator for CellsIter<'ci> {
         let out = self.page.get_cell(self.current_slot);
         self.current_slot += 1;
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split() {
+        let mut p1 = Page {
+            buf: vec![0; 4 * 1024],
+            dirty: false,
+        };
+        let mut p2 = Page {
+            buf: vec![0; 4 * 1024],
+            dirty: false,
+        };
+        let mut scratch = Page {
+            buf: vec![0; 4 * 1024],
+            dirty: false,
+        };
     }
 }
