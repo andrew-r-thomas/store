@@ -354,6 +354,10 @@ impl Page {
         self.dirty = true;
     }
 
+    // TODO: ok so this is where we left off, on some splits, we fail to move
+    // stuff around correctly, and the next get fails, with a None, bc the best
+    // key found is not equal, zoinks, why am i so bad at this
+    //
     /// this function splits left
     pub fn split_into(&mut self, other: &mut Self, scratch: &mut Self) {
         let lvl = self.level();

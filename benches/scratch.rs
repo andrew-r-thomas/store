@@ -1,3 +1,5 @@
+use std::fs;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use rand::Rng;
 use store::store::Store;
@@ -15,20 +17,18 @@ fn benchmark(c: &mut Criterion) {
     c.bench_function("bulk insert", |b| {
         b.iter_batched_ref(
             || {
-                let key_size = rng.random_range(128..256);
-                let mut key: Vec<u8> = vec![0; key_size];
-                rng.fill(&mut key[..]);
-                let val_size = rng.random_range(512..1024);
-                let mut val: Vec<u8> = vec![0; val_size];
-                rng.fill(&mut val[..]);
+                let key: u32 = rng.random();
+                let val: u32 = rng.random();
                 (key, val)
             },
             |(key, val)| {
-                store.btree.set(key, val);
+                store.btree.set(&key.to_be_bytes(), &val.to_be_bytes());
             },
             criterion::BatchSize::SmallInput,
         )
     });
+
+    fs::remove_file("bench.store").unwrap();
 }
 
 criterion_group!(benches, benchmark);

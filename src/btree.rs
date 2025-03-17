@@ -1,4 +1,9 @@
-use crate::pager::{Cell, Pager};
+use std::{
+    cell::{Ref, RefCell},
+    rc::Rc,
+};
+
+use crate::pager::{Cell, CellsIter, Page, Pager};
 
 /// NOTE:
 /// so there's a trade off here between splitting nodes, and opting to insert
@@ -21,19 +26,23 @@ impl BTree {
     /// the target value if it is found
     pub fn get(&mut self, key: &[u8], buf: &mut Vec<u8>) -> Option<()> {
         self.find_leaf(key);
-        let leaf_page = self.pager.get(*self.page_stack.last().unwrap()).unwrap();
+        let leaf_page = self.pager.get(self.page_stack.pop().unwrap()).unwrap();
         match leaf_page.borrow().get(key) {
-            Some(cell) => {
-                if let Cell::LeafCell { key: k, val } = cell {
+            Some(cell) => match cell {
+                Cell::InnerCell { key, left_ptr } => {
+                    let t = left_ptr;
+                    None
+                }
+                Cell::LeafCell { key: k, val } => {
                     if key == k {
                         for v in val {
                             buf.push(*v);
                         }
                         return Some(());
                     }
+                    None
                 }
-                None
-            }
+            },
             None => None,
         }
     }
@@ -45,6 +54,26 @@ impl BTree {
             self.split();
             leaf_page.borrow_mut().set(cell).unwrap();
         }
+    }
+
+    pub fn get_first_page(&mut self) -> Rc<RefCell<Page>> {
+        let mut current_page = self.pager.get(self.root_page_id).unwrap();
+        while current_page.borrow().level() > 0 {
+            let left = {
+                let page_borrow = current_page.borrow();
+                let left = page_borrow.get_cell(0);
+                if let Cell::InnerCell { key: _, left_ptr } = left {
+                    left_ptr
+                } else {
+                    panic!();
+                }
+            };
+            current_page = self.pager.get(left).unwrap();
+        }
+        current_page
+    }
+    pub fn get_page(&mut self, page_id: u32) -> Rc<RefCell<Page>> {
+        self.pager.get(page_id).unwrap()
     }
 
     fn find_leaf(&mut self, key: &[u8]) {
@@ -78,6 +107,21 @@ impl BTree {
         let to_page_id = self.pager.create_page();
         let to_page = self.pager.get(to_page_id).unwrap();
         let scratch = self.pager.get_scratch();
+        // get sibling pointers correct
+        match { from_page.borrow().left_sib() } {
+            0 => {
+                from_page.borrow_mut().set_left_sib(to_page_id);
+                to_page.borrow_mut().set_right_sib(from_id);
+            }
+            n => {
+                let left = self.pager.get(n).unwrap();
+                left.borrow_mut().set_right_sib(to_page_id);
+                let mut to_page_borrow = to_page.borrow_mut();
+                to_page_borrow.set_left_sib(n);
+                from_page.borrow_mut().set_left_sib(to_page_id);
+                to_page_borrow.set_right_sib(from_id);
+            }
+        }
         from_page
             .borrow_mut()
             .split_into(&mut to_page.borrow_mut(), &mut scratch.borrow_mut());
@@ -96,6 +140,7 @@ impl BTree {
         let parent_id = self.page_stack.last();
         match parent_id {
             Some(pid) => {
+                println!("split inner");
                 let parent = self.pager.get(*pid).unwrap();
                 if let Err(cell) = { parent.borrow_mut().set(new_parent_cell) } {
                     self.split();
@@ -104,6 +149,7 @@ impl BTree {
             }
             None => {
                 // we just split the root
+                println!("split root");
                 let new_root_id = self.pager.create_page();
                 let new_root = self.pager.get(new_root_id).unwrap();
                 let mut new_root_mut = new_root.borrow_mut();
