@@ -34,6 +34,7 @@ impl Pager {
         if let Some(i) = self.page_map.get(&page_id) {
             self.cache_tracker.hit(page_id);
             // TODO: might want to return a guard here or something instead
+            println!("get {i}");
             return Ok(self.pool[*i].clone());
         }
 
@@ -44,21 +45,23 @@ impl Pager {
                 self.cache_tracker.hit(page_id);
                 self.page_map.insert(page_id, free_frame);
             }
+            println!("get {free_frame}");
             return Ok(self.pool[free_frame].clone());
         }
 
         // if we reach this point, we need to evict something
         // we probably want a separate list of dirty pages instead of storing
         // the info in the page type itself
-        todo!("evict")
-    }
-    pub fn get_scratch(&mut self) -> Rc<RefCell<Page>> {
-        let idx = self.free_list.pop().unwrap();
-        let page = self.pool[idx].clone();
-        let mut guard = page.borrow_mut();
-        guard.set_cells_start(self.page_size as u16);
-        drop(guard);
-        page
+        println!("evicting in get");
+        let free_frame_idx = self.evict();
+        let free_frame = self.pool[free_frame_idx].clone();
+        {
+            self.io.read_page(page_id, &mut free_frame.borrow_mut().buf);
+            self.cache_tracker.hit(page_id);
+            self.page_map.insert(page_id, free_frame_idx);
+        }
+        println!("get {free_frame_idx}");
+        Ok(free_frame)
     }
 
     pub fn create_page(&mut self) -> u32 {
@@ -71,7 +74,31 @@ impl Pager {
         }
 
         // evict something
-        todo!("evict")
+        println!("evicting in create page");
+        let free_frame = self.evict();
+        let page = self.pool[free_frame].borrow();
+        let page_id = self.io.create_page(&page.buf);
+        self.page_map.insert(page_id, free_frame);
+        self.cache_tracker.hit(page_id);
+        // drop(page);
+        return page_id;
+    }
+
+    fn evict(&mut self) -> usize {
+        for evict_option in self.cache_tracker.evict() {
+            println!("evict option: {evict_option}");
+            let to_evict_idx = *self.page_map.get(&evict_option).unwrap();
+            // we should probably be handing out refs instead of pages
+            if let Ok(mut to_evict) = self.pool[to_evict_idx].try_borrow_mut() {
+                println!("evicting {evict_option}");
+                self.io.write_page(evict_option, &to_evict.buf);
+                to_evict.clear();
+                self.cache_tracker.remove(evict_option);
+                self.page_map.remove(&evict_option);
+                return to_evict_idx;
+            }
+        }
+        panic!()
     }
 }
 
@@ -79,12 +106,6 @@ impl Pager {
 pub enum PagerError {
     HotCache,
 }
-
-// pub enum Page_ {
-//     Overflow(OverflowPage),
-//     Leaf(LeafPage),
-//     Inner(InnerPage),
-// }
 
 enum SetOption {
     Gt,
@@ -94,7 +115,7 @@ enum SetOption {
 
 #[derive(Clone)] // don't like this
 pub struct Page {
-    buf: Vec<u8>,
+    pub buf: Vec<u8>,
     pub dirty: bool,
 }
 const LEVEL: usize = 0;
@@ -165,7 +186,6 @@ impl Page {
                     break;
                 } else if key == k {
                     out = SetOption::Eq(slot);
-                    panic!();
                     break;
                 }
             }

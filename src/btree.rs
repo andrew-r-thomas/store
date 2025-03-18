@@ -115,29 +115,31 @@ impl BTree {
     fn split(&mut self) -> (Vec<u8>, u32) {
         // do the split
         let from_id = self.page_stack.pop().unwrap();
-        let from_page = self.pager.get(from_id).unwrap();
         let to_page_id = self.pager.create_page();
-        let to_page = self.pager.get(to_page_id).unwrap();
-        let scratch = self.pager.get_scratch();
+        let from_page_guarded = self.pager.get(from_id).unwrap();
+        let mut from_page = from_page_guarded.borrow_mut();
+        let to_page_guarded = self.pager.get(to_page_id).unwrap();
+        let mut to_page = to_page_guarded.borrow_mut();
+        let mut scratch = Page {
+            buf: vec![0; to_page.buf.capacity()],
+            dirty: true,
+        };
         // get sibling pointers correct
-        match { from_page.borrow().left_sib() } {
+        match from_page.left_sib() {
             0 => {
-                from_page.borrow_mut().set_left_sib(to_page_id);
-                to_page.borrow_mut().set_right_sib(from_id);
+                from_page.set_left_sib(to_page_id);
+                to_page.set_right_sib(from_id);
             }
             n => {
                 let left = self.pager.get(n).unwrap();
                 left.borrow_mut().set_right_sib(to_page_id);
-                let mut to_page_borrow = to_page.borrow_mut();
-                to_page_borrow.set_left_sib(n);
-                from_page.borrow_mut().set_left_sib(to_page_id);
-                to_page_borrow.set_right_sib(from_id);
+                to_page.set_left_sib(n);
+                from_page.set_left_sib(to_page_id);
+                to_page.set_right_sib(from_id);
             }
         }
         // i know, i know, just trying to figure this shit out
-        let middle_key = from_page
-            .borrow_mut()
-            .split_into(&mut to_page.borrow_mut(), &mut scratch.borrow_mut());
+        let middle_key = from_page.split_into(&mut to_page, &mut scratch);
 
         // try to update parent, it should get the to page id as the val,
         // and the last key of the to page
@@ -176,7 +178,7 @@ impl BTree {
                 let new_root = self.pager.get(new_root_id).unwrap();
                 let mut new_root_mut = new_root.borrow_mut();
                 new_root_mut.set_right_ptr(from_id);
-                new_root_mut.set_level(from_page.borrow().level() + 1);
+                new_root_mut.set_level(from_page.level() + 1);
                 new_root_mut.set(new_parent_cell).unwrap();
                 self.root_page_id = new_root_id;
                 (middle_key, to_page_id)
