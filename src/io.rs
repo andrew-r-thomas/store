@@ -7,8 +7,6 @@ use std::{
 
 const CURRENT_VERSION: [u8; 3] = [0, 0, 1];
 const HEADER_OFFSET: u64 = 16;
-pub const KB: u32 = 1024;
-pub const MB: u32 = 1024 * KB;
 
 #[derive(Debug)]
 pub enum IOError {
@@ -144,6 +142,7 @@ mod tests {
 
     use super::*;
 
+    pub const KB: u32 = 1024;
     #[ignore]
     #[test]
     fn basic_fixed_header() {
