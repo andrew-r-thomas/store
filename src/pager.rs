@@ -120,16 +120,13 @@ impl Pager {
         return (page_id, free_frame);
     }
 
+    pub fn create_root(&self) -> (u32, ArcRwLockWriteGuard<RawRwLock, Page>) {
+        let (root_id, root) = self.create_page();
+        self.root_id.store(root_id, Ordering::Release);
+        (root_id, root)
+    }
     pub fn get_root(&self) -> u32 {
         self.root_id.load(Ordering::Acquire)
-    }
-    pub fn get_root_mut(&self) -> (ArcRwLockWriteGuard<RawRwLock, Page>, u32) {
-        let root_id = self.root_id.load(Ordering::Acquire);
-        (self.get_mut(root_id), root_id)
-    }
-    /// idk about this one scoobs
-    pub fn set_root(&self, new_root: u32) {
-        self.root_id.store(new_root, Ordering::Release);
     }
 
     fn evict(&self) -> (ArcRwLockWriteGuard<RawRwLock, Page>, usize) {
@@ -302,6 +299,14 @@ impl Page {
                 let slot_end = slot_start + 2;
                 self.buf[slot_start..slot_end].copy_from_slice(&(cell_start as u16).to_be_bytes());
                 self.set_slots(self.slots() + 1);
+
+                if self.level() > 0 {
+                    // so the problem is that i think im doing left/right ptrs
+                    // wrong, bc if we insert something greater than the right
+                    // pointer right now, we can have something like
+                    //
+                    // ptr-lowkey...ptr-highkey...middleptr
+                }
 
                 Ok(())
             }
