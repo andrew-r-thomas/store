@@ -1,7 +1,10 @@
-use crate::{cache::LRUKCache, io::FileIO};
+use crate::{
+    cache::{self, EvictOption, LRUKCache},
+    io::FileIO,
+};
 
 use std::{
-    collections::HashMap,
+    collections::{BinaryHeap, HashMap},
     ops::Range,
     sync::{
         Arc, Mutex,
@@ -11,12 +14,59 @@ use std::{
 
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock, RwLock};
 
+pub struct PageMap {
+    map: HashMap<u32, usize>,
+    cache_tracker: LRUKCache,
+}
+impl PageMap {
+    pub fn get(&mut self, page_id: u32) -> Option<usize> {
+        match self.map.get(&page_id) {
+            Some(idx) => {
+                self.cache_tracker.hit(page_id);
+                Some(*idx)
+            }
+            None => None,
+        }
+    }
+    pub fn set(&mut self, page_id: u32, idx: usize) {
+        self.map.insert(page_id, idx);
+        self.cache_tracker.hit(page_id);
+    }
+    pub fn evict(&mut self) -> Evict<'_> {
+        Evict {
+            evict: self.cache_tracker.evict(),
+            page_map: self,
+        }
+    }
+    pub fn remove(&mut self, page_id: u32) {
+        self.map.remove(&page_id);
+        self.cache_tracker.remove(page_id);
+    }
+}
+struct Evict<'e> {
+    page_map: &'e mut PageMap,
+    evict: BinaryHeap<EvictOption>,
+}
+impl Evict<'_> {
+    pub fn choose(self, option: u32) {
+        self.page_map.remove(option);
+    }
+}
+impl Iterator for Evict<'_> {
+    type Item = (u32, usize);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.evict.pop() {
+            Some(o) => Some((o.id, *self.page_map.map.get(&o.id).unwrap())),
+            None => None,
+        }
+    }
+}
+
 pub struct Pager {
     pool: Vec<Arc<RwLock<Page>>>,
     io: Mutex<FileIO>,
     free_list: Mutex<Vec<usize>>,
-    page_map: Mutex<HashMap<u32, usize>>,
-    cache_tracker: Mutex<LRUKCache>,
+    page_map: Mutex<PageMap>,
     root_id: AtomicU32,
 }
 impl Pager {
@@ -32,35 +82,24 @@ impl Pager {
         Self {
             pool,
             free_list: Mutex::new(Vec::from_iter(0..capacity)),
-            page_map: Mutex::new(HashMap::with_capacity(capacity)),
-            cache_tracker: Mutex::new(LRUKCache::new()),
+            page_map: Mutex::new(PageMap {
+                map: HashMap::with_capacity(capacity),
+                cache_tracker: LRUKCache::new(),
+            }),
             root_id: AtomicU32::new(io.root_id),
             io: Mutex::new(io),
         }
     }
     pub fn get(&self, page_id: u32) -> ArcRwLockReadGuard<RawRwLock, Page> {
-        if let Some(i) = {
-            match self.page_map.lock().unwrap().get(&page_id) {
-                Some(i) => Some(*i),
-                None => None,
-            }
-        } {
-            {
-                self.cache_tracker.lock().unwrap().hit(page_id)
-            };
+        if let Some(i) = { self.page_map.lock().unwrap().get(page_id) } {
             return self.pool[i].read_arc();
         }
 
         if let Some(free_frame) = { self.free_list.lock().unwrap().pop() } {
             let mut page = self.pool[free_frame].write_arc();
             {
-                self.io.lock().unwrap().read_page(page_id, &mut page.buf)
-            };
-            {
-                self.cache_tracker.lock().unwrap().hit(page_id)
-            };
-            {
-                self.page_map.lock().unwrap().insert(page_id, free_frame)
+                self.io.lock().unwrap().read_page(page_id, &mut page.buf);
+                self.page_map.lock().unwrap().set(page_id, free_frame);
             };
             return ArcRwLockWriteGuard::downgrade(page);
         }
@@ -73,42 +112,21 @@ impl Pager {
             self.io
                 .lock()
                 .unwrap()
-                .read_page(page_id, &mut free_frame.buf)
-        };
-        {
-            self.cache_tracker.lock().unwrap().hit(page_id)
-        };
-        {
-            self.page_map
-                .lock()
-                .unwrap()
-                .insert(page_id, free_frame_idx)
+                .read_page(page_id, &mut free_frame.buf);
+            self.page_map.lock().unwrap().set(page_id, free_frame_idx);
         };
         ArcRwLockWriteGuard::downgrade(free_frame)
     }
     pub fn get_mut(&self, page_id: u32) -> ArcRwLockWriteGuard<RawRwLock, Page> {
-        if let Some(i) = {
-            match self.page_map.lock().unwrap().get(&page_id) {
-                Some(i) => Some(*i),
-                None => None,
-            }
-        } {
-            {
-                self.cache_tracker.lock().unwrap().hit(page_id)
-            };
+        if let Some(i) = { self.page_map.lock().unwrap().get(page_id) } {
             return self.pool[i].write_arc();
         }
 
         if let Some(free_frame) = { self.free_list.lock().unwrap().pop() } {
             let mut page = self.pool[free_frame].write_arc();
             {
-                self.io.lock().unwrap().read_page(page_id, &mut page.buf)
-            };
-            {
-                self.cache_tracker.lock().unwrap().hit(page_id)
-            };
-            {
-                self.page_map.lock().unwrap().insert(page_id, free_frame)
+                self.io.lock().unwrap().read_page(page_id, &mut page.buf);
+                self.page_map.lock().unwrap().set(page_id, free_frame);
             };
             return page;
         }
@@ -121,16 +139,8 @@ impl Pager {
             self.io
                 .lock()
                 .unwrap()
-                .read_page(page_id, &mut free_frame.buf)
-        };
-        {
-            self.cache_tracker.lock().unwrap().hit(page_id)
-        };
-        {
-            self.page_map
-                .lock()
-                .unwrap()
-                .insert(page_id, free_frame_idx)
+                .read_page(page_id, &mut free_frame.buf);
+            self.page_map.lock().unwrap().set(page_id, free_frame_idx);
         };
         free_frame
     }
@@ -138,27 +148,14 @@ impl Pager {
         if let Some(free_frame) = { self.free_list.lock().unwrap().pop() } {
             let page = self.pool[free_frame].write_arc();
             let page_id = { self.io.lock().unwrap().create_page(&page.buf) };
-            {
-                self.page_map.lock().unwrap().insert(page_id, free_frame)
-            };
-            {
-                self.cache_tracker.lock().unwrap().hit(page_id)
-            };
+            self.page_map.lock().unwrap().set(page_id, free_frame);
             return (page_id, page);
         }
 
         // evict something
         let (free_frame, free_frame_idx) = self.evict();
         let page_id = { self.io.lock().unwrap().create_page(&free_frame.buf) };
-        {
-            self.page_map
-                .lock()
-                .unwrap()
-                .insert(page_id, free_frame_idx)
-        };
-        {
-            self.cache_tracker.lock().unwrap().hit(page_id)
-        };
+        self.page_map.lock().unwrap().set(page_id, free_frame_idx);
         return (page_id, free_frame);
     }
 
@@ -172,21 +169,15 @@ impl Pager {
     }
 
     fn evict(&self) -> (ArcRwLockWriteGuard<RawRwLock, Page>, usize) {
-        println!("evict called");
-        unimplemented!();
         let mut page_map = self.page_map.lock().unwrap();
-        for evict_option in self.cache_tracker.lock().unwrap().evict() {
-            let to_evict_idx = *page_map.get(&evict_option).unwrap();
+        let mut evict = page_map.evict();
+        while let Some((evict_id, evict_idx)) = evict.next() {
             // we should probably be handing out refs instead of pages
-            if let Some(mut to_evict) = self.pool[to_evict_idx].try_write_arc() {
-                page_map.remove(&evict_option);
-                self.cache_tracker.lock().unwrap().remove(evict_option);
-                self.io
-                    .lock()
-                    .unwrap()
-                    .write_page(evict_option, &to_evict.buf);
+            if let Some(mut to_evict) = self.pool[evict_idx].try_write_arc() {
+                evict.choose(evict_id);
+                self.io.lock().unwrap().write_page(evict_id, &to_evict.buf);
                 to_evict.clear();
-                return (to_evict, to_evict_idx);
+                return (to_evict, evict_idx);
             }
         }
         panic!()

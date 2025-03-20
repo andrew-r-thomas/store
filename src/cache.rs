@@ -3,7 +3,6 @@ use std::collections::{BinaryHeap, HashMap};
 pub struct LRUKCache {
     map: HashMap<u32, [u64; 2]>,
     ts: u64,
-    scratch_heap: BinaryHeap<EvictOption>,
 }
 
 impl LRUKCache {
@@ -11,7 +10,6 @@ impl LRUKCache {
         Self {
             map: HashMap::new(),
             ts: 0,
-            scratch_heap: BinaryHeap::new(),
         }
     }
 
@@ -33,17 +31,15 @@ impl LRUKCache {
     /// from the buffer pool, returns an iterator over pages ids from best
     /// eviction option to worst, so that pager can ignore pages it doesn't
     /// want to evict for some reason
-    pub fn evict(&mut self) -> Evict {
-        self.scratch_heap.clear();
+    pub fn evict(&mut self) -> BinaryHeap<EvictOption> {
+        let mut out = BinaryHeap::new();
         for item in &self.map {
-            self.scratch_heap.push(EvictOption {
+            out.push(EvictOption {
                 dist: item.1[0] - item.1[1],
                 id: *item.0,
             });
         }
-        Evict {
-            heap: &mut self.scratch_heap,
-        }
+        out
     }
 
     /// remove an item from the cache, this means it will not show up when
@@ -67,9 +63,9 @@ impl Iterator for Evict<'_> {
 }
 
 #[derive(Ord, Eq)]
-struct EvictOption {
+pub struct EvictOption {
     dist: u64,
-    id: u32,
+    pub id: u32,
 }
 impl PartialEq for EvictOption {
     fn eq(&self, other: &Self) -> bool {
