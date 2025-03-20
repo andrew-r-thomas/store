@@ -29,20 +29,28 @@ impl BTreeCursor {
         let mut searching = true;
         while searching {
             let current_page = self.pager.get(current_page_id);
-            if current_page.level() == 0 {
-                searching = false;
-            } else {
-                match current_page.get(key) {
-                    Some(cell) => {
-                        if let Cell::InnerCell { key: _, left_ptr } = cell {
-                            current_page_id = left_ptr;
+            let next_id = {
+                if current_page.level() == 0 {
+                    searching = false;
+                    None
+                } else {
+                    match current_page.get(key) {
+                        Some(cell) => {
+                            if let Cell::InnerCell { key: _, left_ptr } = cell {
+                                Some(left_ptr)
+                            } else {
+                                panic!()
+                            }
                         }
+                        None => Some(current_page.right_ptr()),
                     }
-                    None => current_page_id = current_page.right_ptr(),
                 }
-            }
+            };
             self.path.push(current_page_id);
             self.read_lock_map.insert(current_page_id, current_page);
+            if let Some(id) = next_id {
+                current_page_id = id;
+            }
         }
     }
     /// navigate to the leaf node that would contain [`key`] pessemistically
@@ -53,20 +61,28 @@ impl BTreeCursor {
         let mut searching = true;
         while searching {
             let current_page = self.pager.get_mut(current_page_id);
-            if current_page.level() == 0 {
-                searching = false;
-            } else {
-                match current_page.get(key) {
-                    Some(cell) => {
-                        if let Cell::InnerCell { key: _, left_ptr } = cell {
-                            current_page_id = left_ptr;
+            let next_id = {
+                if current_page.level() == 0 {
+                    searching = false;
+                    None
+                } else {
+                    match current_page.get(key) {
+                        Some(cell) => {
+                            if let Cell::InnerCell { key: _, left_ptr } = cell {
+                                Some(left_ptr)
+                            } else {
+                                panic!()
+                            }
                         }
+                        None => Some(current_page.right_ptr()),
                     }
-                    None => current_page_id = current_page.right_ptr(),
                 }
-            }
+            };
             self.path.push(current_page_id);
             self.write_lock_map.insert(current_page_id, current_page);
+            if let Some(id) = next_id {
+                current_page_id = id;
+            }
         }
     }
 
@@ -152,10 +168,6 @@ impl BTreeCursor {
         }
         // i know, i know, just trying to figure this shit out
         let middle_key = from_page.split_into(&mut to_page, &mut scratch);
-        println!(
-            "middle key: {}",
-            u32::from_be_bytes(middle_key.clone().try_into().unwrap())
-        );
         let new_parent_cell = Cell::InnerCell {
             key: &middle_key,
             left_ptr: to_id,
@@ -164,7 +176,6 @@ impl BTreeCursor {
         let parent_id = self.path.last();
         match parent_id {
             Some(parent_id) => {
-                println!("updating parent: {parent_id}");
                 let pid = *parent_id; // dumb
                 if let Err(cell) = self
                     .write_lock_map
@@ -172,7 +183,6 @@ impl BTreeCursor {
                     .unwrap()
                     .set(new_parent_cell)
                 {
-                    println!("recursive split incoming");
                     let (m_key, o) = self.split();
                     if cell.key() <= &m_key {
                         self.write_lock_map.get_mut(&o).unwrap().set(cell).unwrap();
@@ -186,8 +196,7 @@ impl BTreeCursor {
                 }
             }
             None => {
-                let (new_root_id, mut new_root) = self.pager.create_root();
-                println!("split root, new id is {new_root_id}");
+                let (_, mut new_root) = self.pager.create_root();
                 new_root.set_right_ptr(from_id);
                 new_root.set_level(from_page.level() + 1);
                 new_root.set(new_parent_cell).unwrap();

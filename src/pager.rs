@@ -15,7 +15,7 @@ pub struct Pager {
     pool: Vec<Arc<RwLock<Page>>>,
     io: Mutex<FileIO>,
     free_list: Mutex<Vec<usize>>,
-    page_map: RwLock<HashMap<u32, usize>>,
+    page_map: Mutex<HashMap<u32, usize>>,
     cache_tracker: Mutex<LRUKCache>,
     root_id: AtomicU32,
 }
@@ -32,91 +32,133 @@ impl Pager {
         Self {
             pool,
             free_list: Mutex::new(Vec::from_iter(0..capacity)),
-            page_map: RwLock::new(HashMap::with_capacity(capacity)),
+            page_map: Mutex::new(HashMap::with_capacity(capacity)),
             cache_tracker: Mutex::new(LRUKCache::new()),
             root_id: AtomicU32::new(io.root_id),
             io: Mutex::new(io),
         }
     }
     pub fn get(&self, page_id: u32) -> ArcRwLockReadGuard<RawRwLock, Page> {
-        let mut cache_tracker = self.cache_tracker.lock().unwrap();
-        {
-            if let Some(i) = self.page_map.read().get(&page_id) {
-                cache_tracker.hit(page_id);
-                return self.pool[*i].read_arc();
+        if let Some(i) = {
+            match self.page_map.lock().unwrap().get(&page_id) {
+                Some(i) => Some(*i),
+                None => None,
             }
+        } {
+            {
+                self.cache_tracker.lock().unwrap().hit(page_id)
+            };
+            return self.pool[i].read_arc();
         }
 
-        let mut io = self.io.lock().unwrap();
-        let mut page_map = self.page_map.write();
-        {
-            if let Some(free_frame) = self.free_list.lock().unwrap().pop() {
-                let mut page = self.pool[free_frame].write_arc();
-                io.read_page(page_id, &mut page.buf);
-                cache_tracker.hit(page_id);
-                page_map.insert(page_id, free_frame);
-                return ArcRwLockWriteGuard::downgrade(page);
-            }
+        if let Some(free_frame) = { self.free_list.lock().unwrap().pop() } {
+            let mut page = self.pool[free_frame].write_arc();
+            {
+                self.io.lock().unwrap().read_page(page_id, &mut page.buf)
+            };
+            {
+                self.cache_tracker.lock().unwrap().hit(page_id)
+            };
+            {
+                self.page_map.lock().unwrap().insert(page_id, free_frame)
+            };
+            return ArcRwLockWriteGuard::downgrade(page);
         }
 
         // if we reach this point, we need to evict something
         // we probably want a separate list of dirty pages instead of storing
         // the info in the page type itself
         let (mut free_frame, free_frame_idx) = self.evict();
-        io.read_page(page_id, &mut free_frame.buf);
-        cache_tracker.hit(page_id);
-        page_map.insert(page_id, free_frame_idx);
+        {
+            self.io
+                .lock()
+                .unwrap()
+                .read_page(page_id, &mut free_frame.buf)
+        };
+        {
+            self.cache_tracker.lock().unwrap().hit(page_id)
+        };
+        {
+            self.page_map
+                .lock()
+                .unwrap()
+                .insert(page_id, free_frame_idx)
+        };
         ArcRwLockWriteGuard::downgrade(free_frame)
     }
     pub fn get_mut(&self, page_id: u32) -> ArcRwLockWriteGuard<RawRwLock, Page> {
-        let mut cache_tracker = self.cache_tracker.lock().unwrap();
-        {
-            if let Some(i) = self.page_map.read().get(&page_id) {
-                cache_tracker.hit(page_id);
-                return self.pool[*i].write_arc();
+        if let Some(i) = {
+            match self.page_map.lock().unwrap().get(&page_id) {
+                Some(i) => Some(*i),
+                None => None,
             }
+        } {
+            {
+                self.cache_tracker.lock().unwrap().hit(page_id)
+            };
+            return self.pool[i].write_arc();
         }
 
-        let mut io = self.io.lock().unwrap();
-        let mut page_map = self.page_map.write();
-        {
-            if let Some(free_frame) = self.free_list.lock().unwrap().pop() {
-                let mut page = self.pool[free_frame].write_arc();
-                io.read_page(page_id, &mut page.buf);
-                cache_tracker.hit(page_id);
-                page_map.insert(page_id, free_frame);
-                return page;
-            }
+        if let Some(free_frame) = { self.free_list.lock().unwrap().pop() } {
+            let mut page = self.pool[free_frame].write_arc();
+            {
+                self.io.lock().unwrap().read_page(page_id, &mut page.buf)
+            };
+            {
+                self.cache_tracker.lock().unwrap().hit(page_id)
+            };
+            {
+                self.page_map.lock().unwrap().insert(page_id, free_frame)
+            };
+            return page;
         }
 
         // if we reach this point, we need to evict something
         // we probably want a separate list of dirty pages instead of storing
         // the info in the page type itself
         let (mut free_frame, free_frame_idx) = self.evict();
-        io.read_page(page_id, &mut free_frame.buf);
-        cache_tracker.hit(page_id);
-        page_map.insert(page_id, free_frame_idx);
+        {
+            self.io
+                .lock()
+                .unwrap()
+                .read_page(page_id, &mut free_frame.buf)
+        };
+        {
+            self.cache_tracker.lock().unwrap().hit(page_id)
+        };
+        {
+            self.page_map
+                .lock()
+                .unwrap()
+                .insert(page_id, free_frame_idx)
+        };
         free_frame
     }
     pub fn create_page(&self) -> (u32, ArcRwLockWriteGuard<RawRwLock, Page>) {
-        let mut page_map = self.page_map.write();
-        let mut cache_tracker = self.cache_tracker.lock().unwrap();
-        let mut io = self.io.lock().unwrap();
-        {
-            if let Some(free_frame) = self.free_list.lock().unwrap().pop() {
-                let page = self.pool[free_frame].write_arc();
-                let page_id = io.create_page(&page.buf);
-                page_map.insert(page_id, free_frame);
-                cache_tracker.hit(page_id);
-                return (page_id, page);
-            }
+        if let Some(free_frame) = { self.free_list.lock().unwrap().pop() } {
+            let page = self.pool[free_frame].write_arc();
+            let page_id = { self.io.lock().unwrap().create_page(&page.buf) };
+            {
+                self.page_map.lock().unwrap().insert(page_id, free_frame)
+            };
+            {
+                self.cache_tracker.lock().unwrap().hit(page_id)
+            };
+            return (page_id, page);
         }
 
         // evict something
         let (free_frame, free_frame_idx) = self.evict();
-        let page_id = io.create_page(&free_frame.buf);
-        page_map.insert(page_id, free_frame_idx);
-        cache_tracker.hit(page_id);
+        let page_id = { self.io.lock().unwrap().create_page(&free_frame.buf) };
+        {
+            self.page_map
+                .lock()
+                .unwrap()
+                .insert(page_id, free_frame_idx)
+        };
+        {
+            self.cache_tracker.lock().unwrap().hit(page_id)
+        };
         return (page_id, free_frame);
     }
 
@@ -130,22 +172,22 @@ impl Pager {
     }
 
     fn evict(&self) -> (ArcRwLockWriteGuard<RawRwLock, Page>, usize) {
-        let mut page_map = self.page_map.write();
-        for evict_option in self.cache_tracker.lock().unwrap().evict() {
-            let to_evict_idx = *page_map.get(&evict_option).unwrap();
-            // we should probably be handing out refs instead of pages
-            if let Some(mut to_evict) = self.pool[to_evict_idx].try_write_arc() {
-                page_map.remove(&evict_option);
-                self.cache_tracker.lock().unwrap().remove(evict_option);
-                self.io
-                    .lock()
-                    .unwrap()
-                    .write_page(evict_option, &to_evict.buf);
-                to_evict.clear();
-                return (to_evict, to_evict_idx);
-            }
-        }
-        panic!()
+        unimplemented!();
+        // let mut page_map = self.page_map.lock().unwrap();
+        // for evict_option in self.cache_tracker.lock().unwrap().evict() {
+        //     let to_evict_idx = *page_map.get(&evict_option).unwrap();
+        //     // we should probably be handing out refs instead of pages
+        //     if let Some(mut to_evict) = self.pool[to_evict_idx].try_write_arc() {
+        //         page_map.remove(&evict_option);
+        //         self.cache_tracker.lock().unwrap().remove(evict_option);
+        //         self.io
+        //             .lock()
+        //             .unwrap()
+        //             .write_page(evict_option, &to_evict.buf);
+        //         to_evict.clear();
+        //         return (to_evict, to_evict_idx);
+        //     }
+        // }
     }
 }
 
@@ -299,14 +341,6 @@ impl Page {
                 let slot_end = slot_start + 2;
                 self.buf[slot_start..slot_end].copy_from_slice(&(cell_start as u16).to_be_bytes());
                 self.set_slots(self.slots() + 1);
-
-                if self.level() > 0 {
-                    // so the problem is that i think im doing left/right ptrs
-                    // wrong, bc if we insert something greater than the right
-                    // pointer right now, we can have something like
-                    //
-                    // ptr-lowkey...ptr-highkey...middleptr
-                }
 
                 Ok(())
             }
