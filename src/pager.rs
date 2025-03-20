@@ -172,22 +172,24 @@ impl Pager {
     }
 
     fn evict(&self) -> (ArcRwLockWriteGuard<RawRwLock, Page>, usize) {
+        println!("evict called");
         unimplemented!();
-        // let mut page_map = self.page_map.lock().unwrap();
-        // for evict_option in self.cache_tracker.lock().unwrap().evict() {
-        //     let to_evict_idx = *page_map.get(&evict_option).unwrap();
-        //     // we should probably be handing out refs instead of pages
-        //     if let Some(mut to_evict) = self.pool[to_evict_idx].try_write_arc() {
-        //         page_map.remove(&evict_option);
-        //         self.cache_tracker.lock().unwrap().remove(evict_option);
-        //         self.io
-        //             .lock()
-        //             .unwrap()
-        //             .write_page(evict_option, &to_evict.buf);
-        //         to_evict.clear();
-        //         return (to_evict, to_evict_idx);
-        //     }
-        // }
+        let mut page_map = self.page_map.lock().unwrap();
+        for evict_option in self.cache_tracker.lock().unwrap().evict() {
+            let to_evict_idx = *page_map.get(&evict_option).unwrap();
+            // we should probably be handing out refs instead of pages
+            if let Some(mut to_evict) = self.pool[to_evict_idx].try_write_arc() {
+                page_map.remove(&evict_option);
+                self.cache_tracker.lock().unwrap().remove(evict_option);
+                self.io
+                    .lock()
+                    .unwrap()
+                    .write_page(evict_option, &to_evict.buf);
+                to_evict.clear();
+                return (to_evict, to_evict_idx);
+            }
+        }
+        panic!()
     }
 }
 

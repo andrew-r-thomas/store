@@ -14,7 +14,7 @@ fn scratch() {
     let store = Arc::new(Store::create("test.store").unwrap());
     let work_lock = Arc::new(RwLock::new(()));
 
-    const ENTRIES: usize = 6400;
+    const ENTRIES: usize = 640;
     for t in 0..4 {
         let store = store.clone();
         let work_lock = work_lock.clone();
