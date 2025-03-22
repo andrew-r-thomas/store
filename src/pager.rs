@@ -1,5 +1,5 @@
 use crate::{
-    cache::{self, EvictOption, LRUKCache},
+    cache::{EvictOption, LRUKCache},
     io::FileIO,
 };
 
@@ -14,7 +14,7 @@ use std::{
 
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock, RwLock};
 
-pub struct PageMap {
+struct PageMap {
     map: HashMap<u32, usize>,
     cache_tracker: LRUKCache,
 }
@@ -502,6 +502,24 @@ impl Page {
 pub enum Cell<'c> {
     InnerCell { key: &'c [u8], left_ptr: u32 },
     LeafCell { key: &'c [u8], val: &'c [u8] },
+}
+pub enum OwnedCell {
+    InnerCell { key: Vec<u8>, left_ptr: u32 },
+    LeafCell { key: Vec<u8>, val: Vec<u8> },
+}
+impl OwnedCell {
+    pub fn from_cell<'f>(cell: Cell<'f>) -> Self {
+        match cell {
+            Cell::InnerCell { key, left_ptr } => Self::InnerCell {
+                key: Vec::from(key),
+                left_ptr,
+            },
+            Cell::LeafCell { key, val } => Self::LeafCell {
+                key: Vec::from(key),
+                val: Vec::from(val),
+            },
+        }
+    }
 }
 impl Cell<'_> {
     pub fn len(&self) -> usize {

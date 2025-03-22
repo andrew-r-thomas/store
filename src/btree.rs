@@ -7,10 +7,10 @@ use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard, RawRwLock};
 /// btree cursors are single threaded, you will have one per transaction??
 /// something like that idk man
 pub struct BTreeCursor {
-    pager: Arc<Pager>,
-    write_lock_map: HashMap<u32, ArcRwLockWriteGuard<RawRwLock, Page>>,
-    read_lock_map: HashMap<u32, ArcRwLockReadGuard<RawRwLock, Page>>,
-    path: Vec<u32>,
+    pub pager: Arc<Pager>,
+    pub write_lock_map: HashMap<u32, ArcRwLockWriteGuard<RawRwLock, Page>>,
+    pub read_lock_map: HashMap<u32, ArcRwLockReadGuard<RawRwLock, Page>>,
+    pub path: Vec<u32>,
 }
 impl BTreeCursor {
     pub fn new(pager: Arc<Pager>) -> Self {
@@ -89,7 +89,7 @@ impl BTreeCursor {
     /// attempt to get the value indexed by [`key`], and write it into [`buf`]
     /// the returned boolean indicates whether the value was found
     /// idk if this api should be part of the cursor, or live above it
-    pub fn get(&mut self, key: &[u8], buf: &mut Vec<u8>) -> bool {
+    pub fn get(mut self, key: &[u8], buf: &mut Vec<u8>) -> bool {
         self.search_opt(key);
         let leaf_id = self.path.last().unwrap();
         let leaf = self.read_lock_map.get(&leaf_id).unwrap();
@@ -102,7 +102,11 @@ impl BTreeCursor {
                         }
                         true
                     } else {
-                        false
+                        panic!(
+                            "not equal!\ntarget: {}, k: {}",
+                            u64::from_be_bytes(key.try_into().unwrap()),
+                            u64::from_be_bytes(k.try_into().unwrap()),
+                        )
                     }
                 } else {
                     panic!(
@@ -110,15 +114,13 @@ impl BTreeCursor {
                     );
                 }
             }
-            None => false,
+            None => panic!("not found!"),
         };
-
-        self.read_lock_map.clear();
 
         out
     }
 
-    pub fn set(&mut self, key: &[u8], val: &[u8]) {
+    pub fn set(mut self, key: &[u8], val: &[u8]) {
         self.search_pes(key);
         let cell = Cell::LeafCell { key, val };
         let leaf_id = *self.path.last().unwrap();
@@ -138,8 +140,6 @@ impl BTreeCursor {
                     .unwrap();
             }
         }
-
-        self.write_lock_map.clear();
     }
 
     pub fn split(&mut self) -> (Vec<u8>, u32) {
@@ -151,8 +151,6 @@ impl BTreeCursor {
             dirty: false,
         };
 
-        // FIX: i think we're getting deadlocks, and this is a good culprit
-        // along with the haphazardly mutex'd stuff in the pager
         match from_page.left_sib() {
             0 => {
                 from_page.set_left_sib(to_id);
@@ -205,5 +203,32 @@ impl BTreeCursor {
 
         self.write_lock_map.insert(to_id, to_page);
         (middle_key, to_id)
+    }
+
+    pub fn iter(mut self) -> PageIter {
+        self.search_opt(&[]);
+        let next = self.path.pop().unwrap();
+        PageIter {
+            pager: self.pager.clone(),
+            next,
+        }
+    }
+}
+
+pub struct PageIter {
+    pager: Arc<Pager>,
+    next: u32,
+}
+
+impl Iterator for PageIter {
+    type Item = ArcRwLockReadGuard<RawRwLock, Page>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == 0 {
+            None
+        } else {
+            let page = self.pager.get(self.next);
+            self.next = page.right_sib();
+            Some(page)
+        }
     }
 }
