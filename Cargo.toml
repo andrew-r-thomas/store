@@ -4,13 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-parking_lot = { version = "0.12.3", features = ["arc_lock"] }
+# glommio = "0.9.0"
+num_cpus = "1.16.0"
 
 [dev-dependencies]
-criterion = "0.5.1"
 rand = "0.9.0"
-rand_chacha = "0.9.0"
-
-[[bench]]
-name = "scratch"
-harness = false
