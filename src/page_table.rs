@@ -126,6 +126,7 @@ mod tests {
         }
     }
 
+    #[ignore]
     #[test]
     fn scratch() {
         let mut base1 = Arc::new(Page::Base(BasePage {

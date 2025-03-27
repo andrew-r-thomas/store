@@ -79,7 +79,7 @@ impl Log {
 
         Ok((idx, offset))
     }
-    pub fn write_to_buffer(&self, buf: &[u8], idx: usize, offset: usize) -> Result<(), ()> {
+    pub fn write_to_buffer(&self, buf: &[u8], idx: usize, offset: usize) {
         let block = &self.buffers[idx];
 
         let block_buf = unsafe { std::slice::from_raw_parts_mut(block.buf, self.block_size) };
@@ -101,14 +101,13 @@ impl Log {
         } {
             self.flush_buffer(block);
         }
-
-        Ok(())
     }
 
     /// a thread that causes a buffer's state to be both sealed and have
     /// 0 active writers, is responsible for calling this function, it should
     /// not be called at any other time
     fn flush_buffer(&self, block: &BlockBuffer) {
+        println!("flushing a buffer");
         let file_offset = self
             .current_file_offset
             .fetch_add(self.block_size as u64, Ordering::SeqCst);
@@ -134,13 +133,16 @@ impl Log {
     }
 }
 
+unsafe impl Send for Log {}
+unsafe impl Sync for Log {}
+
 pub struct BlockBuffer {
     buf: *mut u8,
     state: AtomicU32,
 }
 impl BlockBuffer {
     pub fn new(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, 8096).unwrap();
+        let layout = Layout::from_size_align(size, 1024).unwrap();
         let buf = unsafe { alloc_zeroed(layout) };
         Self {
             buf,
