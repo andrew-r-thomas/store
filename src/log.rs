@@ -27,6 +27,12 @@ impl Log {
             current_file_offset: AtomicU64::new(0),
         }
     }
+    pub fn read(&self, block: u64, buf: &mut [u8]) {
+        assert_eq!(buf.len(), self.block_size); // so safe so cozy
+        self.file
+            .read_exact_at(buf, block * self.block_size as u64)
+            .unwrap();
+    }
     /// reserve space to write in the current block buffer,
     /// if successful, the Ok variant of the Result will return a tuple
     /// containing the idx for the current block, and the offset to write to
@@ -107,7 +113,6 @@ impl Log {
     /// 0 active writers, is responsible for calling this function, it should
     /// not be called at any other time
     fn flush_buffer(&self, block: &BlockBuffer) {
-        println!("flushing a buffer");
         let file_offset = self
             .current_file_offset
             .fetch_add(self.block_size as u64, Ordering::SeqCst);
