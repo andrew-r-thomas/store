@@ -1,56 +1,45 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicPtr, Ordering},
+use crate::{
+    atomic_arc::AtomicArc,
+    log::Log,
+    page::{DeltaNode, Page, PageNode},
 };
 
-use crate::{
-    log::Log,
-    page::{Base, Delta, Page},
-};
+use std::sync::Arc;
 
 type PageId = u64;
 
-pub struct PageTable<B, D>
-where
-    B: Base,
-    D: Delta,
-{
+pub struct PageTable {
     buf: Vec<Page>,
-    log: Log,
+    // log: Log,
 }
 impl PageTable {
-    pub fn read(&self, page_id: PageId) -> Arc<Page> {
-        let out = unsafe { &*self.buf[page_id as usize].load(Ordering::SeqCst) }.clone();
-        if let Page::Disk(d) = &*out {
+    pub fn read(&self, page_id: PageId) -> Arc<PageNode> {
+        let out = self.buf[page_id as usize].read();
+        if let PageNode::Disk(_d) = &*out {
             todo!("read from disk")
         }
         out
     }
 
-    /// in the case that this is an "update replace" we are assuming that the
-    /// [`new`] page is already a base page with everything folded in,
-    /// the data parameter is just there for the lss, i think
-    ///
-    /// in the case of a delta update, the new pointer should be a delta
-    /// that already points to the old page and is ready to go
-    ///
-    /// TODO: figure out what happens to [`data`]
-    pub fn update(
+    pub fn update_delta(
         &self,
-        page_id: u64,
-        mut current: Arc<Page>,
-        mut new: Arc<Page>,
-        _data: Vec<u8>,
-    ) -> Result<Arc<Page>, Arc<Page>> {
-        match self.buf[page_id as usize].compare_exchange(
-            &mut current,
-            &mut new,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(p) => Ok(unsafe { &*p }.clone()),
-            Err(p) => Ok(unsafe { &*p }.clone()),
-        }
+        page_id: PageId,
+        current: Arc<PageNode>,
+        data: Vec<u8>,
+    ) -> Result<Arc<PageNode>, Arc<PageNode>> {
+        let delta_node = Arc::new(PageNode::Delta(DeltaNode {
+            data,
+            next: Some(current.clone()),
+        }));
+        self.buf[page_id as usize].update(current, delta_node)
+    }
+    pub fn update_replace(
+        &self,
+        page_id: PageId,
+        current: Arc<PageNode>,
+        new: Arc<PageNode>,
+    ) -> Result<Arc<PageNode>, Arc<PageNode>> {
+        self.buf[page_id as usize].update(current, new)
     }
 
     pub fn flush() {
@@ -78,5 +67,15 @@ impl PageTable {
     }
     pub fn abort_tx() {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch() {
+        let page_table = Arc::new(PageTable { buf: vec![] });
     }
 }

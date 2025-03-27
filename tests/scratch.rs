@@ -1,36 +1,28 @@
-use std::{
-    fs::{self, File},
-    sync::Arc,
-    thread,
-};
+use std::{sync::Arc, thread};
 
-use store::log::Log;
+use store::page::{Page, PageNode};
 
 #[test]
 fn scratch() {
-    let file = File::create("scratch.store").unwrap();
-    let log = Arc::new(Log::new(1024, 4, file));
+    let page = Arc::new(Page::new(Arc::new(store::page::PageNode::Base(
+        store::page::BaseNode { data: vec![0; 4] },
+    ))));
 
-    let mut threads = Vec::with_capacity(4);
-    for t in 0..4 {
-        let log = log.clone();
+    let mut threads = Vec::new();
+    for t in 1..=8 {
+        let page = page.clone();
         threads.push(
             thread::Builder::new()
                 .name(format!("{t}"))
                 .spawn(move || {
-                    let mut buf = Vec::with_capacity(16);
-                    for i in 0..10000 {
-                        buf.clear();
-                        for b in (t as u64).to_be_bytes() {
-                            buf.push(b);
-                        }
-                        for b in (i as u64).to_be_bytes() {
-                            buf.push(b);
-                        }
-
+                    for i in 1..=100 {
                         loop {
-                            if let Ok((idx, offset)) = log.reserve(16) {
-                                log.write_to_buffer(&buf, idx, offset);
+                            let curr = page.read();
+                            let delta = Arc::new(PageNode::Delta(store::page::DeltaNode {
+                                data: vec![i; t],
+                                next: Some(curr.clone()),
+                            }));
+                            if let Ok(_) = page.update(curr, delta) {
                                 break;
                             }
                         }
@@ -43,13 +35,16 @@ fn scratch() {
     for t in threads {
         t.join().unwrap();
     }
-    drop(log);
 
-    let bytes = fs::read("scratch.store").unwrap();
-    for entry in bytes.chunks_exact(16) {
-        let thread = u64::from_be_bytes(entry[0..8].try_into().unwrap());
-        let i = u64::from_be_bytes(entry[8..16].try_into().unwrap());
-        println!("thread {thread}: {i}");
+    for node in page.iter() {
+        match &*node {
+            PageNode::Delta(d) => {
+                println!("delta node: {:?}", d.data);
+            }
+            PageNode::Base(b) => {
+                println!("base node: {:?}", b.data);
+            }
+            _ => panic!("invalid page node type!"),
+        }
     }
-    fs::remove_file("scratch.store").unwrap();
 }
