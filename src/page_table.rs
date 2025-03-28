@@ -1,12 +1,8 @@
-use crate::{
-    atomic_arc::AtomicArc,
-    log::Log,
-    page::{DeltaNode, Page, PageNode},
-};
+use crate::page::{DeltaNode, Page, PageNode, PageNodeInner};
 
 use std::sync::Arc;
 
-type PageId = u64;
+pub type PageId = u64;
 
 pub struct PageTable {
     buf: Vec<Page>,
@@ -15,7 +11,7 @@ pub struct PageTable {
 impl PageTable {
     pub fn read(&self, page_id: PageId) -> Arc<PageNode> {
         let out = self.buf[page_id as usize].read();
-        if let PageNode::Disk(_d) = &*out {
+        if let PageNodeInner::Disk(_d) = &out.data {
             todo!("read from disk")
         }
         out
@@ -27,10 +23,11 @@ impl PageTable {
         current: Arc<PageNode>,
         data: Vec<u8>,
     ) -> Result<Arc<PageNode>, Arc<PageNode>> {
-        let delta_node = Arc::new(PageNode::Delta(DeltaNode {
-            data,
+        let delta_node = Arc::new(PageNode {
+            data: PageNodeInner::Delta(DeltaNode { data }),
             next: Some(current.clone()),
-        }));
+        });
+
         self.buf[page_id as usize].update(current, delta_node)
     }
     pub fn update_replace(
@@ -67,15 +64,5 @@ impl PageTable {
     }
     pub fn abort_tx() {
         unimplemented!()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scratch() {
-        let page_table = Arc::new(PageTable { buf: vec![] });
     }
 }
