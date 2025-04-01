@@ -6,7 +6,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -123,9 +123,8 @@ pub enum Frame {
 
 pub struct PageBuffer {
     buf: NonNull<[u8]>,
-    read_ptr: AtomicUsize,
-    write_ptr: AtomicUsize,
-    cap: usize,
+    read_offset: AtomicUsize,
+    write_offset: AtomicIsize,
 }
 
 impl PageBuffer {
@@ -141,33 +140,33 @@ impl PageBuffer {
 
         Self {
             buf,
-            read_ptr: AtomicUsize::new(capacity),
-            write_ptr: AtomicUsize::new(0),
-            cap: capacity,
+            read_offset: AtomicUsize::new(capacity),
+            write_offset: AtomicIsize::new(capacity as isize),
         }
     }
-    pub fn read(&self) -> Result<ReadGuard, ()> {
-        if self.write_ptr.load(Ordering::SeqCst) >= self.cap {
-            // buffer is sealed
-            return Err(());
-        }
-        let read_ptr = self.read_ptr.load(Ordering::SeqCst);
-        let read = &unsafe { self.buf.as_ref() }[read_ptr as usize..];
-        Ok(ReadGuard { read, p: self })
+    pub fn read(&self) -> &[u8] {
+        let read_offset = self.read_offset.load(Ordering::Acquire);
+        let b = &unsafe { self.buf.as_ref() }[read_offset..];
+        b
     }
     pub fn reserve(&self, len: usize) -> Result<WriteGuard, ()> {
-        let old_write_ptr = self.write_ptr.fetch_add(len, Ordering::SeqCst);
-        if old_write_ptr + len > self.cap {
-            // buffer is sealed
+        let old_write_offset = self.write_offset.fetch_sub(len as isize, Ordering::SeqCst);
+        let new_write_offset = old_write_offset - len as isize;
+        if new_write_offset < 0 {
+            if old_write_offset >= 0 {
+                // we caused the buffer to be sealed
+                // first we wait for the other writers to finish
+                while self.read_offset.load(Ordering::Acquire) != old_write_offset as usize {}
+                todo!("now we can do some compaction")
+            }
             return Err(());
         }
-        let write_offset = self.cap - (old_write_ptr + len);
-        let write =
-            &mut unsafe { self.buf.as_ptr().as_mut().unwrap() }[write_offset..write_offset + len];
+        let write = &mut unsafe { self.buf.as_ptr().as_mut().unwrap() }
+            [new_write_offset as usize..old_write_offset as usize];
         Ok(WriteGuard {
             write,
             p: self,
-            bottom: write_offset + len,
+            bottom: old_write_offset as usize,
         })
     }
 }
@@ -178,13 +177,13 @@ pub struct ReadGuard<'r> {
 }
 
 pub struct WriteGuard<'w> {
-    bottom: usize,
-    p: &'w PageBuffer,
     pub write: &'w mut [u8],
+    p: &'w PageBuffer,
+    bottom: usize,
 }
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        while let Err(_) = self.p.read_ptr.compare_exchange_weak(
+        while let Err(_) = self.p.read_offset.compare_exchange_weak(
             self.bottom,
             self.bottom - self.write.len(),
             Ordering::SeqCst,
