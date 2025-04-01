@@ -1,3 +1,4 @@
+pub mod buffer;
 pub mod log;
 pub mod mapping_table;
 pub mod page;
