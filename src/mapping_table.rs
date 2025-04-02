@@ -20,6 +20,10 @@ pub struct Table<const B: usize> {
 
 // TODO: add some way to assert (ideally at compile time) that B is a power of 2
 // something like this: const_assert_eq!(B & (B - 1), 0);
+//
+// NOTE: for now, we're just gonna try *not* fixing the free list pointers,
+// this seems like it will still work, we would just see > len as the end of
+// the free list -> we should try to break this to verify
 impl<const B: usize> Table<B> {
     pub fn new(capacity: usize) -> Self {
         // allocate the pointer block
@@ -38,17 +42,11 @@ impl<const B: usize> Table<B> {
             }
         }
 
-        let out = Self {
+        Self {
             ptr: AtomicPtr::new(blocks),
             blocks: AtomicUsize::new(num_blocks),
             grow_lock: Mutex::new(()),
-        };
-
-        let last = &out[(capacity - 1) as PageId];
-        let end = Box::new(FrameInner::Free(0));
-        last.ptr.store(Box::into_raw(end), Ordering::Release);
-
-        out
+        }
     }
     pub fn grow(&self) -> Result<(), ()> {
         match self.grow_lock.try_lock() {
@@ -76,32 +74,6 @@ impl<const B: usize> Table<B> {
 
                 self.ptr.store(new_blocks, Ordering::Release);
                 self.blocks.store(num_blocks + 1, Ordering::Release);
-
-                // FIX: problem child
-                // fix free list
-                // let zero = &self[0];
-                // let len = self.len();
-                // loop {
-                //     let z = zero.ptr.load(Ordering::Acquire);
-                //     let i = match unsafe { z.as_ref().unwrap() } {
-                //         FrameInner::Free(i) => i,
-                //         _ => panic!("non free frame in 0!"),
-                //     };
-                //     let tail = Box::new(FrameInner::Free(*i));
-                //     (&self[(len + B - 1) as u64])
-                //         .ptr
-                //         .store(Box::into_raw(tail), Ordering::Release);
-                //
-                //     let head = Box::new(FrameInner::Free(len as u64));
-                //     if let Ok(_) = zero.ptr.compare_exchange_weak(
-                //         z,
-                //         Box::into_raw(head),
-                //         Ordering::SeqCst,
-                //         Ordering::SeqCst,
-                //     ) {
-                //         break;
-                //     }
-                // }
 
                 Ok(())
             }
