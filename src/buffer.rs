@@ -1,6 +1,6 @@
 use std::{
-    alloc::{Layout, alloc_zeroed, handle_alloc_error},
-    ptr::NonNull,
+    alloc::{Layout, alloc, alloc_zeroed, handle_alloc_error},
+    ptr::{self, NonNull},
     sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering},
 };
 
@@ -76,26 +76,34 @@ impl Drop for WriteGuard<'_> {
 }
 
 pub struct Pool {
-    buf: Vec<AtomicPtr<PoolFrame>>,
+    buf: NonNull<PageBuffer>,
+    pop: AtomicUsize,
+    cap: usize,
 }
 
 impl Pool {
     pub fn new(capacity: usize, buffer_capacity: usize) -> Self {
-        let mut buf = Vec::with_capacity(capacity);
-        for i in 1..capacity {
-            let ptr = Box::new(PoolFrame::Buffer {
-                buf: PageBuffer::new(buffer_capacity),
-                next: i - 1,
-            });
-            buf.push(AtomicPtr::new(Box::into_raw(ptr)));
+        let layout = Layout::array::<PageBuffer>(capacity).unwrap();
+        let ptr = unsafe { alloc(layout) } as *mut PageBuffer;
+        let buf = match NonNull::new(ptr) {
+            Some(nn) => nn,
+            None => handle_alloc_error(layout),
+        };
+        for i in 0..capacity {
+            let page = PageBuffer::new(buffer_capacity);
+            unsafe { ptr::write(buf.add(i).as_ptr(), page) };
         }
-        Self { buf }
+        Self {
+            buf,
+            cap: capacity,
+            pop: AtomicUsize::new(0),
+        }
     }
-}
-
-enum PoolFrame {
-    Buffer { buf: PageBuffer, next: usize },
-    Empty(usize),
-    // probably will have something like 'hazard' or 'epoch' for buffers that
-    // are in the frame but shouldn't be reclaimed yet
+    pub fn pop(&self) -> *mut PageBuffer {
+        let i = self.pop.fetch_add(1, Ordering::SeqCst);
+        if i >= self.cap {
+            panic!("ran out of memory in buffer pool")
+        }
+        unsafe { self.buf.add(i).as_ptr() }
+    }
 }

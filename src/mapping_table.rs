@@ -15,8 +15,11 @@ use std::{
 pub struct Table<const B: usize> {
     ptr: AtomicPtr<FrameBlock<B>>,
     blocks: AtomicUsize,
-    grow_lock: Mutex<()>,
+    grow_lock: Mutex<Vec<*mut FrameBlock<B>>>,
 }
+
+unsafe impl<const B: usize> Send for Table<B> {}
+unsafe impl<const B: usize> Sync for Table<B> {}
 
 // TODO: add some way to assert (ideally at compile time) that B is a power of 2
 // something like this: const_assert_eq!(B & (B - 1), 0);
@@ -45,12 +48,12 @@ impl<const B: usize> Table<B> {
         Self {
             ptr: AtomicPtr::new(blocks),
             blocks: AtomicUsize::new(num_blocks),
-            grow_lock: Mutex::new(()),
+            grow_lock: Mutex::new(Vec::new()),
         }
     }
     pub fn grow(&self) -> Result<(), ()> {
         match self.grow_lock.try_lock() {
-            Ok(_guard) => {
+            Ok(mut garbage) => {
                 let blocks = self.ptr();
                 let num_blocks = self.num_blocks();
 
@@ -58,7 +61,8 @@ impl<const B: usize> Table<B> {
                 // PERF: we can probably get a benefit from doubling the pointer
                 // block size when it's full, and then just storing the new frame
                 // block in the next pointer if we have space, but let's just
-                // keep it simple for now
+                // keep it simple for now -> important note, this will be the
+                // first step when we run into "the garbase list is getting too big"
                 let layout = Layout::array::<FrameBlock<B>>(num_blocks + 1).unwrap();
                 let new_blocks = unsafe { alloc(layout) } as *mut FrameBlock<B>;
                 if new_blocks.is_null() {
@@ -74,6 +78,10 @@ impl<const B: usize> Table<B> {
 
                 self.ptr.store(new_blocks, Ordering::Release);
                 self.blocks.store(num_blocks + 1, Ordering::Release);
+
+                // for now we'll just keep things super simple and accumulate
+                // garbage until we drop the table
+                garbage.push(blocks);
 
                 Ok(())
             }
@@ -102,8 +110,12 @@ impl<const B: usize> Index<PageId> for Table<B> {
     fn index(&self, index: PageId) -> &Self::Output {
         let block_idx = index >> B.trailing_zeros();
         let item_idx = index & (B as u64 - 1);
-        let block = unsafe { &*self.ptr().add(block_idx as usize) };
-        unsafe { block.0.add(item_idx as usize).as_ref() }
+        unsafe {
+            (&*self.ptr().add(block_idx as usize))
+                .0
+                .add(item_idx as usize)
+                .as_ref()
+        }
     }
 }
 
@@ -184,24 +196,5 @@ mod tests {
                 _ => panic!("we should only have free frames at this point"),
             }
         }
-
-        // let table = Table::<32>::new(128);
-        // for i in 0..table.len() {
-        //     let frame = &table[i as PageId];
-        //     let inner = unsafe { frame.ptr.load(Ordering::Acquire).as_ref().unwrap() };
-        //     match inner {
-        //         FrameInner::Free(next) => println!("frame {i} has next {next}"),
-        //         _ => panic!("woah why do we have not a free frame"),
-        //     }
-        // }
-        // table.grow().unwrap();
-        // for i in 0..table.len() {
-        //     let frame = &table[i as PageId];
-        //     let inner = unsafe { frame.ptr.load(Ordering::Acquire).as_ref().unwrap() };
-        //     match inner {
-        //         FrameInner::Free(next) => println!("frame {i} has next {next}"),
-        //         _ => panic!("woah why do we have not a free frame"),
-        //     }
-        // }
     }
 }
