@@ -6,15 +6,22 @@ use std::{
     ptr::{self, NonNull},
     sync::{
         Mutex,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
-// trying to do something like Fidor's RCU deque with this,
-// video here: https://www.youtube.com/watch?v=rxQ5K9lo034
 pub struct Table<const B: usize> {
     ptr: AtomicPtr<FrameBlock<B>>,
     blocks: AtomicUsize,
+
+    pub root: AtomicU64,
+
+    /// we lock the grow to make sure only one thread does it,
+    /// grows are rare so a lock isn't a huge deal.
+    /// inside the mutex there's just a vec of old pointer blocks,
+    /// because we can't delete them immediately.
+    /// for now, this vec will just accumulate old blocks and we won't deal
+    /// with freeing them
     grow_lock: Mutex<Vec<*mut FrameBlock<B>>>,
 }
 
@@ -49,8 +56,29 @@ impl<const B: usize> Table<B> {
             ptr: AtomicPtr::new(blocks),
             blocks: AtomicUsize::new(num_blocks),
             grow_lock: Mutex::new(Vec::new()),
+            root: AtomicU64::new(1),
         }
     }
+
+    /// for now we can assume everything is in memory, but this function will
+    /// also handle reading in pages from disk if necessary
+    pub fn read(&self, page_id: PageId) -> &PageBuffer {
+        assert!((page_id as usize) < self.len());
+        let frame = &self[page_id];
+        match frame.load() {
+            FrameInner::Mem(buf) => buf,
+            _ => panic!("page not in memory!"),
+        }
+    }
+
+    /// since we only update frames when there is a single writer, we can just
+    /// do a store on the pointer, and don't have to deal with doing a CAS
+    pub fn update(&self, page_id: PageId, new: &FrameInner) {
+        assert!((page_id as usize) < self.len());
+        let frame = &self[page_id];
+        frame.store(new);
+    }
+
     pub fn grow(&self) -> Result<(), ()> {
         match self.grow_lock.try_lock() {
             Ok(mut garbage) => {
@@ -150,6 +178,28 @@ pub enum FrameInner {
     Mem(PageBuffer),
     Disk(PageId),
     Free(PageId),
+}
+
+impl Frame {
+    pub fn load(&self) -> &FrameInner {
+        unsafe { &*self.ptr.load(Ordering::Acquire) }
+    }
+    pub fn store(&self, new: &FrameInner) {
+        self.ptr
+            .store(ptr::from_ref(new).cast_mut(), Ordering::Release);
+    }
+    pub fn compare_exchange(
+        &self,
+        current: &FrameInner,
+        new: &FrameInner,
+    ) -> Result<*mut FrameInner, *mut FrameInner> {
+        self.ptr.compare_exchange(
+            ptr::from_ref(current).cast_mut(),
+            ptr::from_ref(new).cast_mut(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+    }
 }
 
 #[cfg(test)]
