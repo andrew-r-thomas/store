@@ -32,25 +32,68 @@ impl PageBuffer {
         let b = &unsafe { self.buf.as_ref() }[read_offset..];
         b
     }
-    pub fn reserve(&self, len: usize) -> Result<WriteGuard, ()> {
+    pub fn reserve(&self, len: usize) -> ReserveResult {
         let old_write_offset = self.write_offset.fetch_sub(len as isize, Ordering::SeqCst);
         let new_write_offset = old_write_offset - len as isize;
-        if new_write_offset < 0 {
-            if old_write_offset >= 0 {
+        if new_write_offset <= 0 {
+            if old_write_offset > 0 {
                 // we caused the buffer to be sealed
-                // first we wait for the other writers to finish
-                while self.read_offset.load(Ordering::Acquire) != old_write_offset as usize {}
-                todo!("now we can do some compaction")
+                return ReserveResult::Sealer(SealGuard {
+                    p: self,
+                    bottom: old_write_offset as usize,
+                });
             }
-            return Err(());
+            return ReserveResult::Sealed;
         }
         let write = &mut unsafe { self.buf.as_ptr().as_mut().unwrap() }
             [new_write_offset as usize..old_write_offset as usize];
-        Ok(WriteGuard {
+        ReserveResult::Ok(WriteGuard {
             write,
             p: self,
             bottom: old_write_offset as usize,
         })
+    }
+
+    /// caller should be the only one with access to this page buffer.
+    ///
+    /// this is typically called as a utility during page compaction
+    /// as there's no need to pay the cost of atomic access when the
+    /// new base page is being created and not visible to the rest
+    /// of the system.
+    pub unsafe fn raw_buffer(&self) -> &mut [u8] {
+        unsafe { self.buf.as_ptr().as_mut().unwrap() }
+    }
+}
+
+pub enum ReserveResult<'r> {
+    Ok(WriteGuard<'r>),
+    Sealer(SealGuard<'r>),
+    Sealed,
+}
+
+pub struct SealGuard<'s> {
+    p: &'s PageBuffer,
+    bottom: usize,
+}
+impl SealGuard<'_> {
+    // TODO: so here there might be a benefit to interleaving waiting
+    // for writes and returning them, i.e. say we're waiting for 3 writers,
+    // when one of them completes, we could in theory process that write
+    // and add it to the new compacted buffer, while the other writes are
+    // still in flight, since we're already looping here, that *should* get
+    // us some more concurrent work happening. one caveat though is that if
+    // the writes we're waiting for are for the same item (like say one write
+    // updates a key, and the next one deletes it) and in that case we'd
+    // probably be doing *more* work, so we should profile this and see if it
+    // makes sense to do
+    #[inline]
+    pub fn wait_for_writers(&self) -> &[u8] {
+        loop {
+            let r = self.p.read_offset.load(Ordering::Acquire);
+            if r == self.bottom {
+                return unsafe { &self.p.buf.as_ref()[r..] };
+            }
+        }
     }
 }
 
