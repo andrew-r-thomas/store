@@ -125,43 +125,80 @@ struct InnerPage<'p> {
     buf: &'p [u8],
 }
 impl InnerPage<'_> {
+    pub fn iter_chunks(&self) -> InnerChunkIter {
+        InnerChunkIter { buf: self.buf }
+    }
     pub fn search(&self, key: &[u8]) -> PageId {
-        let mut i = 0;
-        loop {
-            let p = &self.buf[i + 1..];
-            match self.buf[i] {
-                0 => {
-                    // base page
-                    let entries = u16::from_be_bytes(p[0..2].try_into().unwrap()) as usize;
-                    for e in 0..entries {
-                        let key_off_start = 2 + (2 * e);
-                        let key_off_end = key_off_start + 2;
-                        let key_offset =
-                            u16::from_be_bytes(p[key_off_start..key_off_end].try_into().unwrap())
-                                as usize;
-                        let key_len =
-                            u32::from_be_bytes(p[key_offset..key_offset + 4].try_into().unwrap())
-                                as usize;
-                        if key <= &p[key_offset + 4..key_offset + 4 + key_len] {
-                            let ids = &p[p.len() - (entries * 8)..];
-                            return u64::from_be_bytes(ids[e * 8..(e * 8) + 8].try_into().unwrap());
-                        }
+        for chunk in self.iter_chunks() {
+            match chunk {
+                InnerChunk::Base(base) => return base.search(key),
+                InnerChunk::InsUp { key: k, page_id } => {
+                    if key <= k {
+                        return page_id;
                     }
-                    todo!("if we get here, we gotta go right");
                 }
-                1 => {
-                    // insert or update
-                    let key_len = u32::from_be_bytes(p[0..4].try_into().unwrap()) as usize;
-                    if key <= &p[4..4 + key_len] {
-                        return u64::from_be_bytes(
-                            p[4 + key_len..4 + key_len + 8].try_into().unwrap(),
-                        );
-                    }
-                    i += 1 + 4 + key_len + 8;
-                }
-                _ => panic!(),
             }
         }
+        panic!()
+    }
+}
+struct InnerChunkIter<'i> {
+    buf: &'i [u8],
+}
+impl<'i> Iterator for InnerChunkIter<'i> {
+    type Item = InnerChunk<'i>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buf.len() == 0 {
+            return None;
+        }
+        let p = &self.buf[1..];
+        match self.buf[0] {
+            0 => {
+                let out = Some(InnerChunk::Base(InnerBase { buf: p }));
+                self.buf = &self.buf[0..0];
+                out
+            }
+            1 => {
+                // insert or update
+                let key_len = u32::from_be_bytes(p[0..4].try_into().unwrap()) as usize;
+                let out = Some(InnerChunk::InsUp {
+                    key: &p[4..4 + key_len],
+                    page_id: u64::from_be_bytes(
+                        p[4 + key_len..4 + key_len + 8].try_into().unwrap(),
+                    ),
+                });
+                self.buf = &p[4 + key_len + 8..];
+                out
+            }
+            _ => panic!(),
+        }
+    }
+}
+enum InnerChunk<'c> {
+    InsUp { key: &'c [u8], page_id: PageId },
+    Base(InnerBase<'c>),
+}
+struct InnerBase<'i> {
+    buf: &'i [u8],
+}
+impl InnerBase<'_> {
+    pub fn search(self, key: &[u8]) -> PageId {
+        // base page
+        // let entries = u16::from_be_bytes(p[0..2].try_into().unwrap()) as usize;
+        // for e in 0..entries {
+        //     let key_off_start = 2 + (2 * e);
+        //     let key_off_end = key_off_start + 2;
+        //     let key_offset =
+        //         u16::from_be_bytes(p[key_off_start..key_off_end].try_into().unwrap()) as usize;
+        //     let key_len =
+        //         u32::from_be_bytes(p[key_offset..key_offset + 4].try_into().unwrap()) as usize;
+        //     if key <= &p[key_offset + 4..key_offset + 4 + key_len] {
+        //         let ids = &p[p.len() - (entries * 8)..];
+        //         return u64::from_be_bytes(ids[e * 8..(e * 8) + 8].try_into().unwrap());
+        //     }
+        // }
+        // todo!("if we get here, we gotta go right");
+        todo!()
     }
 }
 struct LeafPage<'p> {
