@@ -14,6 +14,8 @@ pub struct Table<const B: usize> {
     ptr: AtomicPtr<FrameBlock<B>>,
     blocks: AtomicUsize,
 
+    /// for now we'll keep the btree root in here, but this will probably
+    /// need to be moved if we want to add other access methods
     pub root: AtomicU64,
 
     /// we lock the grow to make sure only one thread does it,
@@ -115,6 +117,14 @@ impl<const B: usize> Table<B> {
             }
             Err(_) => Err(()),
         }
+    }
+
+    /// this function traverses the free list to find a free page id,
+    /// if there isn't one, it will grow the mapping table.
+    ///
+    /// returns the new page id, along with it's buffer
+    pub fn pop(&self) -> (PageId, &PageBuffer) {
+        todo!()
     }
 
     #[inline]

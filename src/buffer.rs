@@ -6,8 +6,8 @@ use std::{
 
 pub struct PageBuffer {
     buf: NonNull<[u8]>,
-    read_offset: AtomicUsize,
-    write_offset: AtomicIsize,
+    pub read_offset: AtomicUsize,
+    pub write_offset: AtomicIsize,
 }
 
 impl PageBuffer {
