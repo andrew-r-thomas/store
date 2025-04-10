@@ -8,6 +8,7 @@
 */
 
 use std::{
+    any::Any,
     collections::BTreeMap,
     sync::{Arc, atomic::Ordering},
 };
@@ -90,7 +91,23 @@ impl BTreeCursor {
                         // the page is compacted, but needs to be split
                         let (to_page_id, to_page) = self.table.pop();
                         let to_buf = unsafe { to_page.raw_buffer() };
-                        let middle_key = split_leaf(&mut new_buf[top..], to_buf, split_idx);
+                        // TODO: make sure we use these to update the page buffer atomic indices
+                        let (from_top, to_top) = split_leaf(&mut new_buf[top..], to_buf, split_idx);
+                        // then we find the middle key, which is the right most key of the "to"
+                        // page
+                        let middle_key = {
+                            let num_entries = u16::from_be_bytes(
+                                to_buf[to_top + 1..to_top + 3].try_into().unwrap(),
+                            ) as usize;
+                            let key_len = u32::from_be_bytes(
+                                to_buf[to_top + 3 + ((num_entries - 1) * 8)
+                                    ..to_top + 3 + ((num_entries - 1) * 8) + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            ) as usize;
+                            &to_buf[to_top + 3 + ((num_entries - 1) * 8) + 8
+                                ..to_top + 3 + ((num_entries - 1) * 8) + 8 + key_len]
+                        };
 
                         // page has been split, now we need to add the new
                         // page id to the parent, this may trigger another
@@ -142,8 +159,58 @@ impl BTreeCursor {
     }
 }
 
-/// returns the middle key from the split, this is the first key in the new page
-fn split_leaf<'s>(from: &'s mut [u8], to: &'s mut [u8], idx: usize) -> &'s [u8] {
+fn split_inner() {
+    todo!()
+}
+
+// NOTE:
+// - we always split to the left
+// - we always assume empty buffers are filled with 0s
+//
+// TODO:
+// - get rid of all the offset stuff
+
+/// splits [`from`] "left", with everything less than or equal to [`idx`] going into [`to`],
+/// returns the new top offset of both pages
+fn split_leaf<'s>(from: &'s mut [u8], to: &'s mut [u8], idx: usize) -> (usize, usize) {
+    // first we find the start and end of the section we're taking out (since slots are sorted in
+    // ascending key order, and actual data is sorted in descending key order, we're keeping the
+    // middle chunk in the og buffer, and copying the edges out)
+    let from_entries = u16::from_be_bytes(from[1..3].try_into().unwrap()) as usize;
+    let from_len = from.len();
+    let from_start = 3 + (8 * idx);
+    let mut from_end = from_len - 1;
+    for i in 0..idx {
+        let key_len =
+            u32::from_be_bytes(from[3 + (8 * i)..3 + (8 * i) + 4].try_into().unwrap()) as usize;
+        let val_len =
+            u32::from_be_bytes(from[3 + (8 * i) + 4..3 + (8 * i) + 8].try_into().unwrap()) as usize;
+        from_end -= key_len + val_len;
+    }
+
+    // then copy the stuff around that middle chunk to the bottom of the to buffer
+    let to_len = to.len();
+    // copy the actual data
+    to[to_len - (from_len - from_end)..].copy_from_slice(&from[from_end..]);
+    // copy the header info
+    to[(to_len - (from_len - from_end)) - (3 + idx * 8)..to_len - (from_len - from_end)]
+        .copy_from_slice(&from[..from_start]);
+    // update num_entries
+    to[(to_len - (from_len - from_end)) - (3 + idx * 8)
+        ..(to_len - (from_len - from_end)) - (3 + idx * 8) + 2]
+        .copy_from_slice(&(idx as u16).to_be_bytes());
+
+    // then we update the from page
+    // first we clear everything below what we're keeping
+    from[from_end..].fill(0);
+    // then we bump everything down
+    from.copy_within(from_start..from_end, from_start + (from_end - from_start));
+    // then we clear everything above
+    from[..from_start + (from_end - from_start)].fill(0);
+    // and update the num entries
+    from[from_start + (from_end - from_start) - 2..from_start + (from_end - from_start)]
+        .copy_from_slice(&((from_entries - idx) as u16).to_be_bytes());
+
     todo!()
 }
 
@@ -153,6 +220,10 @@ enum CompactResult {
     /// this second usize is the middle key index for performing the split
     NeedsSplit(usize, usize),
     NeedsMerge,
+}
+
+fn compact_inner() {
+    todo!()
 }
 
 fn compact_leaf(og: &[u8], new: &mut [u8]) -> CompactResult {
@@ -170,25 +241,20 @@ fn compact_leaf(og: &[u8], new: &mut [u8]) -> CompactResult {
             0 => {
                 // base page
                 let num_entries = u16::from_be_bytes(og[i + 1..i + 3].try_into().unwrap()) as usize;
+                let mut cursor = og.len() - 1;
                 for e in 0..num_entries {
-                    let offset = u32::from_be_bytes(
-                        og[i + 3 + (e * 12)..i + 3 + (e * 12) + 4]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
                     let key_len = u32::from_be_bytes(
-                        og[i + 3 + (e * 12) + 4..i + 3 + (e * 12) + 8]
-                            .try_into()
-                            .unwrap(),
+                        og[i + 3 + (e * 8)..i + 3 + (e * 8) + 4].try_into().unwrap(),
                     ) as usize;
                     let val_len = u32::from_be_bytes(
-                        og[i + 3 + (e * 12) + 8..i + 3 + (e * 12) + 12]
+                        og[i + 3 + (e * 8) + 4..i + 3 + (e * 8) + 8]
                             .try_into()
                             .unwrap(),
                     ) as usize;
-                    let key = &og[i + offset..i + offset + key_len];
-                    let val = &og[i + offset + key_len..i + offset + key_len + val_len];
+                    let key = &og[cursor - (key_len + val_len)..cursor - val_len];
+                    let val = &og[cursor - val_len..cursor];
                     entries.insert(key, val);
+                    cursor -= key_len + val_len;
                 }
                 break;
             }
@@ -213,20 +279,17 @@ fn compact_leaf(og: &[u8], new: &mut [u8]) -> CompactResult {
     // the number of entries
     new[1..3].copy_from_slice(&(entries.len() as u16).to_be_bytes());
     let mut top_i = 3;
-    let mut bottom_i = PAGE_CAP - 1;
+    let mut bottom_i = new.len() - 1;
     for (key, val) in &entries {
         // copy in the new key and value at the bottom, and update the cursor
         new[bottom_i - val.len()..bottom_i].copy_from_slice(val);
-        new[bottom_i - val.len() - key.len()..bottom_i - val.len()].copy_from_slice(key);
+        new[bottom_i - (val.len() + key.len())..bottom_i - val.len()].copy_from_slice(key);
         bottom_i -= key.len() + val.len();
 
         // write in the slot data, and update the cursor
-        // FIX: this means we need to update the logic to use the offset as
-        // "from the bottom" not "from the top"
-        new[top_i..top_i + 4].copy_from_slice(&(bottom_i as u32).to_be_bytes());
-        new[top_i + 4..top_i + 8].copy_from_slice(&(key.len() as u32).to_be_bytes());
-        new[top_i + 8..top_i + 12].copy_from_slice(&(val.len() as u32).to_be_bytes());
-        top_i += 12;
+        new[top_i..top_i + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+        new[top_i + 4..top_i + 8].copy_from_slice(&(val.len() as u32).to_be_bytes());
+        top_i += 8;
     }
 
     // for now this will let us uphold our assumption that we have enough space
@@ -254,34 +317,32 @@ fn search_inner(page_buf: &[u8], key: &[u8]) -> PageId {
                 // TODO: make these indexing things way more clear
                 let num_entries =
                     u16::from_be_bytes(page_buf[i + 1..i + 3].try_into().unwrap()) as usize;
+                let mut cursor = page_buf.len() - 1;
                 for e in 0..num_entries {
-                    let offset = u32::from_be_bytes(
-                        page_buf[i + 3 + 8 + (e * 16)..i + 3 + 8 + (e * 16) + 4]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
                     let key_len = u32::from_be_bytes(
-                        page_buf[i + 3 + 8 + (e * 16) + 4..i + 3 + 8 + (e * 16) + 8]
+                        page_buf[i + 3 + (e * 12)..i + 3 + (e * 12) + 4]
                             .try_into()
                             .unwrap(),
                     ) as usize;
-                    if key <= &page_buf[i + offset..i + offset + key_len] {
+                    if key <= &page_buf[cursor - key_len..cursor] {
                         return u64::from_be_bytes(
-                            page_buf[i + 3 + 8 + (e * 16) + 8..i + 3 + 8 + (e * 16) + 16]
+                            page_buf[i + 3 + (e * 12) + 4..i + 3 + (e * 12) + 12]
                                 .try_into()
                                 .unwrap(),
                         );
                     }
+                    cursor -= key_len;
                 }
 
-                // TODO: we need to go right at this point, which may have been in the
-                // deltas maybe?
                 return u64::from_be_bytes(page_buf[i + 3..i + 3 + 8].try_into().unwrap());
             }
             1 => {
                 // insert or update
                 let key_len =
                     u32::from_be_bytes(page_buf[i + 1..i + 5].try_into().unwrap()) as usize;
+                // FIX: this won't work, if we find a delta for an entry super far to the right,
+                // we'd return early even if there's an entry in a lower delta or base page that
+                // would be closer (correct)
                 if key <= &page_buf[i + 5 + 8..i + 5 + 8 + key_len] {
                     return u64::from_be_bytes(page_buf[i + 5..i + 5 + 8].try_into().unwrap());
                 }
@@ -301,25 +362,25 @@ fn search_leaf<'s>(leaf: &'s [u8], key: &[u8]) -> Option<&'s [u8]> {
                 // base page
                 let num_entries =
                     u16::from_be_bytes(leaf[i + 1..i + 3].try_into().unwrap()) as usize;
+                let mut cursor = leaf.len() - 1;
                 for e in 0..num_entries {
-                    let offset = u32::from_be_bytes(
-                        leaf[i + 3 + (e * 12)..i + 3 + (e * 12) + 4]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
                     let key_len = u32::from_be_bytes(
-                        leaf[i + 3 + (e * 12) + 4..i + 3 + (e * 12) + 8]
+                        leaf[i + 3 + (e * 8)..i + 3 + (e * 8) + 4]
                             .try_into()
                             .unwrap(),
                     ) as usize;
-                    if key == &leaf[i + offset..i + offset + key_len] {
-                        let val_len = u32::from_be_bytes(
-                            leaf[i + 3 + (e * 12) + 8..i + 3 + (e * 12) + 12]
-                                .try_into()
-                                .unwrap(),
-                        ) as usize;
-                        return Some(&leaf[i + offset + key_len..i + offset + key_len + val_len]);
+                    let val_len = u32::from_be_bytes(
+                        leaf[i + 3 + (e * 8) + 4..i + 3 + (e * 8) + 8]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    let k = &leaf[cursor - (key_len + val_len)..cursor - val_len];
+                    if key < k {
+                        return None;
+                    } else if key == k {
+                        return Some(&leaf[cursor - val_len..cursor]);
                     }
+                    cursor -= key_len + val_len;
                 }
                 return None;
             }
