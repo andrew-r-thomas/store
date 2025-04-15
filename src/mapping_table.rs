@@ -123,7 +123,7 @@ impl<const B: usize> Table<B> {
     /// if there isn't one, it will grow the mapping table.
     ///
     /// returns the new page id, along with it's buffer
-    pub fn pop(&self) -> (PageId, &PageBuffer) {
+    pub fn pop(&self) -> PageId {
         todo!()
     }
 

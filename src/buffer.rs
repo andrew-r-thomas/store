@@ -48,7 +48,7 @@ impl PageBuffer {
         let write = &mut unsafe { self.buf.as_ptr().as_mut().unwrap() }
             [new_write_offset as usize..old_write_offset as usize];
         ReserveResult::Ok(WriteGuard {
-            write,
+            buf: write,
             p: self,
             bottom: old_write_offset as usize,
         })
@@ -103,7 +103,7 @@ pub struct ReadGuard<'r> {
 }
 
 pub struct WriteGuard<'w> {
-    pub write: &'w mut [u8],
+    pub buf: &'w mut [u8],
     p: &'w PageBuffer,
     bottom: usize,
 }
@@ -111,7 +111,7 @@ impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         while let Err(_) = self.p.read_offset.compare_exchange_weak(
             self.bottom,
-            self.bottom - self.write.len(),
+            self.bottom - self.buf.len(),
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {}
