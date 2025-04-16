@@ -1,9 +1,16 @@
+/*
+
+    TODO:
+    - make buckets a pow of 2 and do bit manipulation for the bucket finding
+
+*/
+
+use crate::{buffer::ReserveResult, mapping_table::Table, page_table::PageId};
+
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     sync::atomic::{AtomicU64, Ordering},
 };
-
-use crate::{mapping_table::Table, page_table::PageId};
 
 pub struct HashTable<const PAGE_SIZE: usize, const B: usize> {
     buckets: AtomicU64,
@@ -32,7 +39,28 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
             }
         }
     }
-    pub fn set() {}
+    pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        let buckets = self.buckets();
+        let page_id = (hash % buckets) + 1;
+
+        // TODO: ok we gotta figure out how to manage compacting vs looking into the next page in
+        // the chain if we're doing chained hashing
+        let delta_len = 9 + key.len() + val.len();
+        match self.table.read(page_id).reserve(delta_len) {
+            ReserveResult::Ok(write_guard) => {
+                Self::write_insup(write_guard.buf, key, val);
+                Ok(())
+            }
+            ReserveResult::Sealed => Err(()),
+            ReserveResult::Sealer(_seal_guard) => {
+                todo!()
+            }
+        }
+    }
     pub fn delete() {}
 
     #[inline]
@@ -97,6 +125,14 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                 _ => panic!(),
             }
         }
+    }
+    #[inline]
+    fn write_insup(buf: &mut [u8], key: &[u8], val: &[u8]) {
+        buf[0] = 1;
+        buf[1..5].copy_from_slice(&(key.len() as u32).to_be_bytes());
+        buf[5..9].copy_from_slice(&(val.len() as u32).to_be_bytes());
+        buf[9..9 + key.len()].copy_from_slice(key);
+        buf[9 + key.len()..].copy_from_slice(val);
     }
 }
 
