@@ -75,7 +75,7 @@ pub fn set<const B: usize, const PAGE_CAP: usize, const SPLIT_POINT: usize>(
                     // and do a store on the mapping table
                     new_page.read_offset.store(top, Ordering::Release);
                     new_page.write_offset.store(top as isize, Ordering::Release);
-                    table.update(page_id, &FrameInner::Mem(new_page));
+                    table.update(page_id, new_page);
                 }
                 CompactResult::NeedsSplit(top, split_idx) => {
                     // first we do the split for the leaf page
@@ -118,7 +118,7 @@ pub fn set<const B: usize, const PAGE_CAP: usize, const SPLIT_POINT: usize>(
                             new_root
                                 .write_offset
                                 .store(new_root_top as isize, Ordering::Release);
-                            table.update(new_root_id, &FrameInner::Mem(new_root));
+                            table.update(new_root_id, new_root);
                         }
                     }
                 }

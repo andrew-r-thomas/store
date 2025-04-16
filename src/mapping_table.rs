@@ -75,10 +75,10 @@ impl<const B: usize> Table<B> {
 
     /// since we only update frames when there is a single writer, we can just
     /// do a store on the pointer, and don't have to deal with doing a CAS
-    pub fn update(&self, page_id: PageId, new: &FrameInner) {
+    pub fn update(&self, page_id: PageId, new: PageBuffer) {
         assert!((page_id as usize) < self.len());
         let frame = &self[page_id];
-        frame.store(new);
+        frame.store(&FrameInner::Mem(new));
     }
 
     pub fn grow(&self) -> Result<(), ()> {
