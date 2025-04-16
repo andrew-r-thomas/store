@@ -6,17 +6,13 @@ use std::{
     ptr::{self, NonNull},
     sync::{
         Mutex,
-        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
 
 pub struct Table<const B: usize> {
     ptr: AtomicPtr<FrameBlock<B>>,
     blocks: AtomicUsize,
-
-    /// for now we'll keep the btree root in here, but this will probably
-    /// need to be moved if we want to add other access methods
-    pub root: AtomicU64,
 
     /// we lock the grow to make sure only one thread does it,
     /// grows are rare so a lock isn't a huge deal.
@@ -58,7 +54,6 @@ impl<const B: usize> Table<B> {
             ptr: AtomicPtr::new(blocks),
             blocks: AtomicUsize::new(num_blocks),
             grow_lock: Mutex::new(Vec::new()),
-            root: AtomicU64::new(1),
         }
     }
 
