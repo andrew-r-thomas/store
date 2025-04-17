@@ -3,9 +3,13 @@
     TODO:
     - make hard retry interface as well as simple "try" interface for looping on sealed buffers vs
       just failing, right now everything is the "try" interface
+    - right now, after we compact/split, we add writes as a delta, but we could just update the
+      base page itself since we have exclusive access
+    - ok actually, extendible hashing is a little tricky, and the whole point of this is to make
+      something simple to test the other pieces before we tackle the btree, so let's just make it a
+      plain old hash table, and if we run out of room, we just error
 
     NOTE:
-    - i think we'll do extendible hashing for this, which is currently in progress
     - we won't ever shrink the hash table, that will be done by a vaccuum operation or something
 
 */
@@ -19,11 +23,11 @@ use crate::{
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::Ordering,
 };
 
 pub struct HashTable<const PAGE_SIZE: usize, const B: usize> {
-    depth: AtomicU8,
+    buckets: u64,
     table: Table<B>,
 }
 impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
@@ -58,8 +62,9 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     }
 
     pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
-        let delta_len = 9 + key.len() + val.len();
-        match self.table.read(self.find_bucket(key)).reserve(delta_len) {
+        let delta_len = Self::insup_delta_len(key.len(), val.len());
+        let bucket_id = self.find_bucket(key);
+        match self.table.read(bucket_id).reserve(delta_len) {
             ReserveResult::Ok(write_guard) => {
                 Self::write_insup(write_guard.buf, key, val);
                 Ok(())
@@ -73,18 +78,36 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                 let old_buf = seal_guard.wait_for_writers();
                 let new_top = Self::compact_bucket(old_buf, new_buf);
 
-                // then we check if there's room for our write after compacting
+                // now we check if there's room in the compacted buffer for our write
+                let size = PAGE_SIZE - new_top;
+                let out = {
+                    if size + delta_len <= PAGE_SIZE {
+                        Self::write_insup(&mut new_buf[new_top - delta_len..new_top], key, val);
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                };
 
-                // if not, we need to split the bucket
+                // need to update the ptrs for the page buffer, and replace the page in the
+                // mapping table
+                new_page
+                    .read_offset
+                    .store(new_top - delta_len, Ordering::Release);
+                new_page
+                    .write_offset
+                    .store((new_top - delta_len) as isize, Ordering::Release);
+                self.table.update(bucket_id, new_page);
 
-                todo!()
+                out
             }
         }
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<(), ()> {
-        let delta_len = 5 + key.len();
-        match self.table.read(self.find_bucket(key)).reserve(delta_len) {
+        let delta_len = Self::delete_delta_len(key.len());
+        let bucket_id = self.find_bucket(key);
+        match self.table.read(bucket_id).reserve(delta_len) {
             ReserveResult::Ok(write_guard) => {
                 Self::write_delete(write_guard.buf, key);
                 Ok(())
@@ -98,11 +121,27 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                 let old_buf = seal_guard.wait_for_writers();
                 let new_top = Self::compact_bucket(old_buf, new_buf);
 
-                // then we check if there's room for our write after compacting
+                let size = PAGE_SIZE - new_top;
+                let out = {
+                    if size + delta_len <= PAGE_SIZE {
+                        Self::write_delete(&mut new_buf[new_top - delta_len..new_top], key);
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                };
 
-                // if not, we need to split the bucket
+                // need to update the ptrs for the page buffer, and replace the page in the
+                // mapping table
+                new_page
+                    .read_offset
+                    .store(new_top - delta_len, Ordering::Release);
+                new_page
+                    .write_offset
+                    .store((new_top - delta_len) as isize, Ordering::Release);
+                self.table.update(bucket_id, new_page);
 
-                todo!()
+                out
             }
         }
     }
@@ -110,16 +149,11 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     // private functions ==========================================================================
 
     #[inline]
-    fn depth(&self) -> u8 {
-        self.depth.load(Ordering::Acquire)
-    }
-    #[inline]
     fn find_bucket(&self, key: &[u8]) -> PageId {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        let depth = self.depth();
-        hash & ((1 << depth) - 1)
+        hash % self.buckets
     }
 
     // utils ======================================================================================
@@ -127,7 +161,8 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     /// takes bucket to be compacted ([`old`]), and a zeroed complete page buffer to compact into
     /// ([`new`]). performs the compaction and returns the new "top" of the bucket
     fn compact_bucket(old: &[u8], new: &mut [u8]) -> usize {
-        // PERF: use a thread local scratch allocator for this;
+        // PERF: use a thread local scratch allocator for this, might need to use nightly or wait
+        // until the allocator api is stable (ugh)
         let mut scratch = HashMap::new();
 
         let mut total_len: isize = 0;
@@ -189,6 +224,20 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
         buf[1..5].copy_from_slice(&(key.len() as u32).to_be_bytes());
         buf[5..5 + key.len()].copy_from_slice(key);
     }
+    #[inline]
+    fn insup_delta_len(key_len: usize, val_len: usize) -> usize {
+        9 + key_len + val_len
+    }
+    #[inline]
+    fn delete_delta_len(key_len: usize) -> usize {
+        5 + key_len
+    }
+}
+
+pub enum WriteResult {
+    Ok,
+    Sealed,
+    Full,
 }
 
 // some quality of life iterators =================================================================
@@ -273,7 +322,7 @@ impl<'i> BaseEntryIter<'i> {
 impl<'i> Iterator for BaseEntryIter<'i> {
     type Item = Entry<'i>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cursor >= self.buf.len() - 1 {
+        if self.cursor >= self.buf.len() {
             return None;
         }
 
