@@ -3,11 +3,8 @@
     TODO:
     - make hard retry interface as well as simple "try" interface for looping on sealed buffers vs
       just failing, right now everything is the "try" interface
-    - right now, after we compact/split, we add writes as a delta, but we could just update the
+    - right now, after we compact, we add writes as a delta, but we could just update the
       base page itself since we have exclusive access
-    - ok actually, extendible hashing is a little tricky, and the whole point of this is to make
-      something simple to test the other pieces before we tackle the btree, so let's just make it a
-      plain old hash table, and if we run out of room, we just error
 
     NOTE:
     - we won't ever shrink the hash table, that will be done by a vaccuum operation or something
