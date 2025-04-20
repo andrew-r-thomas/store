@@ -108,7 +108,7 @@ impl<T, const BLOCK_SIZE: usize> Index<usize> for RCUTable<T, BLOCK_SIZE> {
     }
 }
 
-struct Block<T, const SIZE: usize>(NonNull<T>);
+pub struct Block<T, const SIZE: usize>(NonNull<T>);
 impl<T, const SIZE: usize> Block<T, SIZE> {
     pub fn from_iter<I: ExactSizeIterator<Item = T>>(iter: &mut I) -> Self {
         let layout = Layout::array::<T>(SIZE).unwrap();
@@ -120,25 +120,5 @@ impl<T, const SIZE: usize> Block<T, SIZE> {
             unsafe { ptr::write(ptr.add(i).as_mut(), item) };
         }
         Self(ptr)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-
-    #[test]
-    fn scratch() {
-        struct Point {
-            x: i32,
-            y: i32,
-        }
-        let table: Arc<RCUTable<AtomicPtr<Point>, 8>> = Arc::new(
-            (0..64)
-                .map(|i| AtomicPtr::new(&mut Point { x: i, y: i }))
-                .into(),
-        );
     }
 }

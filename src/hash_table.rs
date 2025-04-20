@@ -12,26 +12,45 @@
 */
 
 use crate::{
+    PageId,
     buffer::{PageBuffer, ReserveResult},
-    mapping_table::Table,
-    page_table::PageId,
+    // rcu_table::RCUTable,
 };
 
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
-pub struct HashTable<const PAGE_SIZE: usize, const B: usize> {
-    buckets: u64,
-    table: Table<B>,
+pub struct HashTable<const PAGE_SIZE: usize, const BUCKETS: usize> {
+    // buckets: u64,
+    // table: RCUTable<AtomicPtr<PageBuffer>, B>,
+    table: Vec<AtomicPtr<PageBuffer<PAGE_SIZE>>>,
 }
 impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     // public interface ===========================================================================
+    pub fn new() -> Self {
+        // let table = (0..num_buckets)
+        //     .map(|_| AtomicPtr::new(&mut PageBuffer::new(PAGE_SIZE)))
+        //     .into();
+        let mut table = Vec::with_capacity(B);
+        for _ in 0..B {
+            let (page, _) = PageBuffer::new();
+            let boxed = Box::new(page);
+            table.push(AtomicPtr::new(Box::into_raw(boxed)));
+        }
+
+        Self {
+            // buckets: num_buckets as u64,
+            table,
+        }
+    }
 
     pub fn get(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
-        let bucket = self.table.read(self.find_bucket(key)).read();
+        let bucket = unsafe {
+            (&*self.table[self.find_bucket(key) as usize].load(Ordering::Acquire)).read()
+        };
         for chunk in ChunkIter::new(bucket) {
             match chunk {
                 Chunk::Insup { key: k, val } => {
@@ -61,7 +80,9 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
         let delta_len = Self::insup_delta_len(key.len(), val.len());
         let bucket_id = self.find_bucket(key);
-        match self.table.read(bucket_id).reserve(delta_len) {
+        match unsafe {
+            (&*self.table[bucket_id as usize].load(Ordering::Acquire)).reserve(delta_len)
+        } {
             ReserveResult::Ok(write_guard) => {
                 Self::write_insup(write_guard.buf, key, val);
                 Ok(())
@@ -70,8 +91,7 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
             ReserveResult::Sealer(seal_guard) => {
                 // we sealed the buffer and need to compact it,
                 // first we do the compaction
-                let new_page = PageBuffer::new(PAGE_SIZE);
-                let new_buf = unsafe { new_page.raw_buffer() };
+                let (new_page, new_buf) = PageBuffer::new();
                 let old_buf = seal_guard.wait_for_writers();
                 let new_top = Self::compact_bucket(old_buf, new_buf);
 
@@ -80,21 +100,26 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                 let out = {
                     if size + delta_len <= PAGE_SIZE {
                         Self::write_insup(&mut new_buf[new_top - delta_len..new_top], key, val);
+                        new_page
+                            .read_offset
+                            .store(new_top - delta_len, Ordering::Release);
+                        new_page
+                            .write_offset
+                            .store((new_top - delta_len) as isize, Ordering::Release);
                         Ok(())
                     } else {
+                        new_page.read_offset.store(new_top, Ordering::Release);
+                        new_page
+                            .write_offset
+                            .store(new_top as isize, Ordering::Release);
                         Err(())
                     }
                 };
 
                 // need to update the ptrs for the page buffer, and replace the page in the
                 // mapping table
-                new_page
-                    .read_offset
-                    .store(new_top - delta_len, Ordering::Release);
-                new_page
-                    .write_offset
-                    .store((new_top - delta_len) as isize, Ordering::Release);
-                self.table.update(bucket_id, new_page);
+                self.table[bucket_id as usize]
+                    .store(Box::into_raw(Box::new(new_page)), Ordering::Release);
 
                 out
             }
@@ -104,7 +129,8 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     pub fn delete(&self, key: &[u8]) -> Result<(), ()> {
         let delta_len = Self::delete_delta_len(key.len());
         let bucket_id = self.find_bucket(key);
-        match self.table.read(bucket_id).reserve(delta_len) {
+        match unsafe { &*self.table[bucket_id as usize].load(Ordering::Acquire) }.reserve(delta_len)
+        {
             ReserveResult::Ok(write_guard) => {
                 Self::write_delete(write_guard.buf, key);
                 Ok(())
@@ -113,8 +139,7 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
             ReserveResult::Sealer(seal_guard) => {
                 // we sealed the buffer and need to compact it,
                 // first we do the compaction
-                let new_page = PageBuffer::new(PAGE_SIZE);
-                let new_buf = unsafe { new_page.raw_buffer() };
+                let (new_page, new_buf) = PageBuffer::new();
                 let old_buf = seal_guard.wait_for_writers();
                 let new_top = Self::compact_bucket(old_buf, new_buf);
 
@@ -122,21 +147,26 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                 let out = {
                     if size + delta_len <= PAGE_SIZE {
                         Self::write_delete(&mut new_buf[new_top - delta_len..new_top], key);
+                        new_page
+                            .read_offset
+                            .store(new_top - delta_len, Ordering::Release);
+                        new_page
+                            .write_offset
+                            .store((new_top - delta_len) as isize, Ordering::Release);
                         Ok(())
                     } else {
+                        new_page.read_offset.store(new_top, Ordering::Release);
+                        new_page
+                            .write_offset
+                            .store(new_top as isize, Ordering::Release);
                         Err(())
                     }
                 };
 
                 // need to update the ptrs for the page buffer, and replace the page in the
                 // mapping table
-                new_page
-                    .read_offset
-                    .store(new_top - delta_len, Ordering::Release);
-                new_page
-                    .write_offset
-                    .store((new_top - delta_len) as isize, Ordering::Release);
-                self.table.update(bucket_id, new_page);
+                self.table[bucket_id as usize]
+                    .store(Box::into_raw(Box::new(new_page)), Ordering::Release);
 
                 out
             }
@@ -150,7 +180,7 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        hash % self.buckets
+        hash % B as u64
     }
 
     // utils ======================================================================================
@@ -185,12 +215,10 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
             }
         }
 
-        let local_level = *old.last().unwrap();
         let num_entries = scratch.len();
-        let top = new.len() - (3 + (num_entries * 8) + total_len as usize + 1);
+        let top = new.len() - (3 + (num_entries * 8) + total_len as usize);
 
         new[top + 1..top + 3].copy_from_slice(&(num_entries as u16).to_be_bytes());
-        *new.last_mut().unwrap() = local_level;
 
         let mut cursor = top + 3 + num_entries * 8;
         for ((key, val), i) in scratch.iter().zip(0..) {
@@ -229,6 +257,15 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     fn delete_delta_len(key_len: usize) -> usize {
         5 + key_len
     }
+}
+
+unsafe impl<const PAGE_SIZE: usize, const BLOCK_SIZE: usize> Send
+    for HashTable<PAGE_SIZE, BLOCK_SIZE>
+{
+}
+unsafe impl<const PAGE_SIZE: usize, const BLOCK_SIZE: usize> Sync
+    for HashTable<PAGE_SIZE, BLOCK_SIZE>
+{
 }
 
 pub enum WriteResult {
@@ -287,7 +324,7 @@ impl<'i> Iterator for ChunkIter<'i> {
                         as usize;
                 let out = Some(Chunk::Insup {
                     key: &self.buf[self.i + 9..self.i + 9 + key_len],
-                    val: &self.buf[self.i + 9 + key_len..self.i + 9 + val_len],
+                    val: &self.buf[self.i + 9 + key_len..self.i + 9 + key_len + val_len],
                 });
                 self.i += 9 + key_len + val_len;
                 out
@@ -343,5 +380,68 @@ impl<'i> Iterator for BaseEntryIter<'i> {
         self.entry += 1;
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{sync::Arc, thread};
+
+    use rand::Rng;
+
+    #[test]
+    fn scratch() {
+        const PAGE_SIZE: usize = 1024;
+        let hash_table = Arc::new(HashTable::<PAGE_SIZE, 64>::new());
+
+        let mut threads = Vec::new();
+        for t in 0..4 {
+            let table = hash_table.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name(format!("{t}"))
+                    .spawn(move || {
+                        let mut rng = rand::rng();
+                        let mut get_vec = Vec::new();
+                        for i in 0..10000 as u32 {
+                            let d = &i.to_be_bytes();
+                            if rng.random_bool(0.5) {
+                                // get
+                                get_vec.clear();
+                                if table.get(d, &mut get_vec) {
+                                    assert_eq!(&get_vec, d);
+                                }
+                            } else if rng.random_bool(0.75) {
+                                // set
+                                match table.set(d, d) {
+                                    Ok(()) => {
+                                        // bro idk i just need a breakpoint here
+                                    }
+                                    Err(()) => {
+                                        // same here
+                                    }
+                                }
+                            } else {
+                                // delete
+                                match table.delete(d) {
+                                    Ok(()) => {
+                                        //
+                                    }
+                                    Err(()) => {
+                                        //
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .unwrap(),
+            );
+        }
+
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }
