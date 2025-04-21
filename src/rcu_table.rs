@@ -61,6 +61,13 @@ impl<T, const BLOCK_SIZE: usize> RCUTable<T, BLOCK_SIZE> {
         }
     }
 
+    pub fn get(&self, idx: usize) -> &T {
+        let block_idx = idx >> BLOCK_SIZE.trailing_zeros();
+        let item_idx = idx & (BLOCK_SIZE - 1);
+        let block = unsafe { &*(self.ptr().add(block_idx)) };
+        unsafe { &*(block.0.add(item_idx)) }
+    }
+
     #[inline]
     pub fn ptr(&self) -> *mut Block<T, BLOCK_SIZE> {
         self.ptr.load(Ordering::Acquire)
@@ -83,6 +90,9 @@ impl<I: ExactSizeIterator<Item = T>, T, const BLOCK_SIZE: usize> From<I>
         let ptr_block_layout = Layout::array::<Block<T, BLOCK_SIZE>>(num_blocks).unwrap();
         let ptr_block =
             unsafe { alloc::alloc_zeroed(ptr_block_layout) } as *mut Block<T, BLOCK_SIZE>;
+        if ptr_block.is_null() {
+            alloc::handle_alloc_error(ptr_block_layout)
+        }
 
         let mut cursor = 0;
         while i.len() > 0 {
@@ -98,26 +108,17 @@ impl<I: ExactSizeIterator<Item = T>, T, const BLOCK_SIZE: usize> From<I>
         }
     }
 }
-impl<T, const BLOCK_SIZE: usize> Index<usize> for RCUTable<T, BLOCK_SIZE> {
-    type Output = T;
-    #[inline]
-    fn index(&self, idx: usize) -> &Self::Output {
-        let block_idx = idx >> BLOCK_SIZE.trailing_zeros();
-        let item_idx = idx & (BLOCK_SIZE - 1);
-        unsafe { (&*self.ptr().add(block_idx)).0.add(item_idx).as_ref() }
-    }
-}
 
-pub struct Block<T, const SIZE: usize>(NonNull<T>);
+pub struct Block<T, const SIZE: usize>(*mut T);
 impl<T, const SIZE: usize> Block<T, SIZE> {
     pub fn from_iter<I: ExactSizeIterator<Item = T>>(iter: &mut I) -> Self {
         let layout = Layout::array::<T>(SIZE).unwrap();
-        let ptr = match NonNull::new(unsafe { alloc::alloc_zeroed(layout) } as *mut T) {
-            Some(nn) => nn,
-            None => alloc::handle_alloc_error(layout),
-        };
-        for (item, i) in iter.zip(0..SIZE) {
-            unsafe { ptr::write(ptr.add(i).as_mut(), item) };
+        let ptr = unsafe { alloc::alloc_zeroed(layout) } as *mut T;
+        if ptr.is_null() {
+            alloc::handle_alloc_error(layout)
+        }
+        for i in 0..SIZE {
+            unsafe { ptr::write(ptr.add(i), iter.next().unwrap()) };
         }
         Self(ptr)
     }
