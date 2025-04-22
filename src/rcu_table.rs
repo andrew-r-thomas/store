@@ -7,96 +7,157 @@
 
 use std::{
     alloc::{self, Layout},
-    ops::Index,
-    ptr::{self, NonNull},
+    ptr,
     sync::{
         Mutex,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
 
-pub struct RCUTable<T, const BLOCK_SIZE: usize> {
-    ptr: AtomicPtr<Block<T, BLOCK_SIZE>>,
-    pub num_blocks: AtomicUsize,
-    grow_lock: Mutex<Vec<*mut Block<T, BLOCK_SIZE>>>,
+use crate::{PageId, buffer::PageBuffer};
+
+pub struct MappingTable<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> {
+    ptr: AtomicPtr<Block<BLOCK_SIZE, PAGE_SIZE>>,
+    num_blocks: AtomicUsize,
+    grow_lock: Mutex<Vec<*mut Block<BLOCK_SIZE, PAGE_SIZE>>>,
 }
 
-impl<T, const BLOCK_SIZE: usize> RCUTable<T, BLOCK_SIZE> {
-    /// the size of [`iter`] needs to be a multiple of [`BLOCK_SIZE`]
-    pub fn grow<I: ExactSizeIterator<Item = T>>(&self, mut iter: I) -> Result<(), ()> {
-        match self.grow_lock.try_lock() {
-            Ok(mut mutex_guard) => {
-                // allocate a new pointer block
-                let num_new_blocks = iter.len() / BLOCK_SIZE;
-                let num_blocks = self.num_blocks();
-                let layout =
-                    Layout::array::<Block<T, BLOCK_SIZE>>(num_blocks + num_new_blocks).unwrap();
-                let new_blocks =
-                    unsafe { alloc::alloc_zeroed(layout) } as *mut Block<T, BLOCK_SIZE>;
-                if new_blocks.is_null() {
-                    alloc::handle_alloc_error(layout)
-                }
+impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> MappingTable<BLOCK_SIZE, PAGE_SIZE> {
+    pub fn new(capacity: usize) -> Self {
+        todo!()
+    }
 
-                // copy the old pointer block
-                let blocks = self.ptr();
-                unsafe { ptr::copy_nonoverlapping(blocks, new_blocks, num_blocks) };
-
-                // write in the new blocks from the iterator
-                let mut cursor = 0;
-                while iter.len() > 0 {
-                    let block: Block<T, BLOCK_SIZE> = Block::from_iter(&mut iter);
-                    unsafe { ptr::write(new_blocks.add(num_blocks + cursor), block) };
-                    cursor += 1;
-                }
-
-                // add the old pointer block to the garbage list, update to the new pointer, and
-                // bump the size
-                mutex_guard.push(blocks);
-                self.ptr.store(new_blocks, Ordering::Release);
-                self.num_blocks
-                    .store(num_blocks + num_new_blocks, Ordering::Release);
-                Ok(())
-            }
-            Err(_) => Err(()),
+    pub fn get(&self, page_id: PageId) -> &PageBuffer<PAGE_SIZE> {
+        let frame = self.get_frame(page_id as usize);
+        match unsafe { &*frame.ptr.load(Ordering::Acquire) } {
+            FrameInner::Mem(page_buffer) => page_buffer,
+            FrameInner::Disk(_) => todo!(),
+            FrameInner::Free(_) => panic!(),
         }
     }
 
-    pub fn get(&self, idx: usize) -> &T {
-        let block_idx = idx >> BLOCK_SIZE.trailing_zeros();
-        let item_idx = idx & (BLOCK_SIZE - 1);
-        let block = unsafe { &*(self.ptr().add(block_idx)) };
-        unsafe { &*(block.0.add(item_idx)) }
+    /// this function performs an atomic store, not a compare and swap, so you should have
+    /// exclusive write access to the logical page when you call it (i.e. the page is sealed, or
+    /// you just created it, etc)
+    pub fn set(&self, page_id: PageId, buf: PageBuffer<PAGE_SIZE>) {
+        let frame = self.get_frame(page_id as usize);
+        let ptr = Box::into_raw(Box::new(FrameInner::Mem(buf)));
+        frame.ptr.store(ptr, Ordering::Release);
+    }
+
+    pub fn pop_free(&self) -> PageId {
+        loop {
+            // load the 0th slot, which points to the head of the free list
+            let head = self.get_frame(0);
+            let head_inner = unsafe { &mut *head.ptr.load(Ordering::Acquire) };
+            let head_id = head_inner.unwrap_as_free();
+
+            if head_id == 0 {
+                // there are no free pages and we need to grow the table
+                self.grow();
+                continue;
+            }
+
+            let next_id = unsafe { &*self.get_frame(head_id as usize).ptr.load(Ordering::Acquire) }
+                .unwrap_as_free();
+            if let Ok(_) = head.ptr.compare_exchange_weak(
+                head_inner,
+                Box::into_raw(Box::new(FrameInner::Free(next_id))),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                return head_id;
+            }
+        }
+    }
+
+    /// this function performs an atomic store on the frame at [`page_id`], so you should have
+    /// exclusive write access to the logical page
+    pub fn push_free(&self, page_id: PageId) {
+        loop {
+            let head = self.get_frame(0);
+            let head_inner = unsafe { &mut *head.ptr.load(Ordering::Acquire) };
+            let head_id = head_inner.unwrap_as_free();
+
+            let next = Box::into_raw(Box::new(FrameInner::Free(head_id)));
+            let frame = self.get_frame(page_id as usize);
+            frame.ptr.store(next, Ordering::Release);
+
+            if let Ok(_) =
+                head.ptr
+                    .compare_exchange_weak(head_inner, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                return;
+            }
+        }
+    }
+
+    // TODO: figure out where exactly we need CAS loops for free list manipulation if we're taking
+    // a lock in this function (like we might not need the loops in certain spots if we already
+    // have a lock, ykwim)
+    fn grow(&self) {
+        if let Ok(grow_guard) = self.grow_lock.try_lock() {
+            // allocate a new pointer block
+            let num_blocks = self.num_blocks();
+            let layout = Layout::array::<Block<BLOCK_SIZE, PAGE_SIZE>>(num_blocks * 2).unwrap();
+            let new_blocks =
+                unsafe { alloc::alloc_zeroed(layout) } as *mut Block<BLOCK_SIZE, PAGE_SIZE>;
+            if new_blocks.is_null() {
+                alloc::handle_alloc_error(layout)
+            }
+
+            // copy the old pointer block
+            let blocks = self.ptr();
+            unsafe { ptr::copy_nonoverlapping(blocks, new_blocks, num_blocks) };
+
+            // allocate new blocks and expand free list
+            todo!();
+
+            // add the old pointer block to the garbage list, update to the new pointer, and
+            // bump the size
+            grow_guard.push(blocks);
+            self.ptr.store(new_blocks, Ordering::Release);
+            self.num_blocks.store(num_blocks * 2, Ordering::Release);
+        }
     }
 
     #[inline]
-    pub fn ptr(&self) -> *mut Block<T, BLOCK_SIZE> {
+    fn ptr(&self) -> *mut Block<BLOCK_SIZE, PAGE_SIZE> {
         self.ptr.load(Ordering::Acquire)
     }
     #[inline]
-    pub fn num_blocks(&self) -> usize {
+    fn num_blocks(&self) -> usize {
         self.num_blocks.load(Ordering::Acquire)
     }
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.num_blocks() * BLOCK_SIZE
     }
+    #[inline]
+    fn get_frame(&self, idx: usize) -> &Frame<PAGE_SIZE> {
+        let block_idx = idx >> BLOCK_SIZE.trailing_zeros();
+        let item_idx = idx & (BLOCK_SIZE - 1);
+
+        let block = unsafe { &*(self.ptr().add(block_idx)) };
+        unsafe { &*(block.0.add(item_idx)) }
+    }
 }
-impl<I: ExactSizeIterator<Item = T>, T, const BLOCK_SIZE: usize> From<I>
-    for RCUTable<T, BLOCK_SIZE>
+impl<I: ExactSizeIterator<Item = Frame<PAGE_SIZE>>, const BLOCK_SIZE: usize, const PAGE_SIZE: usize>
+    From<I> for MappingTable<BLOCK_SIZE, PAGE_SIZE>
 {
     fn from(mut i: I) -> Self {
         let size = i.len();
         let num_blocks = size / BLOCK_SIZE;
-        let ptr_block_layout = Layout::array::<Block<T, BLOCK_SIZE>>(num_blocks).unwrap();
+        let ptr_block_layout = Layout::array::<Block<BLOCK_SIZE, PAGE_SIZE>>(num_blocks).unwrap();
         let ptr_block =
-            unsafe { alloc::alloc_zeroed(ptr_block_layout) } as *mut Block<T, BLOCK_SIZE>;
+            unsafe { alloc::alloc_zeroed(ptr_block_layout) } as *mut Block<BLOCK_SIZE, PAGE_SIZE>;
         if ptr_block.is_null() {
             alloc::handle_alloc_error(ptr_block_layout)
         }
 
         let mut cursor = 0;
         while i.len() > 0 {
-            let block: Block<T, BLOCK_SIZE> = Block::from_iter(&mut i);
+            let block: Block<BLOCK_SIZE, PAGE_SIZE> = Block::from_iter(&mut i);
             unsafe { ptr::write(ptr_block.add(cursor), block) };
             cursor += 1;
         }
@@ -109,11 +170,11 @@ impl<I: ExactSizeIterator<Item = T>, T, const BLOCK_SIZE: usize> From<I>
     }
 }
 
-pub struct Block<T, const SIZE: usize>(*mut T);
-impl<T, const SIZE: usize> Block<T, SIZE> {
-    pub fn from_iter<I: ExactSizeIterator<Item = T>>(iter: &mut I) -> Self {
-        let layout = Layout::array::<T>(SIZE).unwrap();
-        let ptr = unsafe { alloc::alloc_zeroed(layout) } as *mut T;
+struct Block<const SIZE: usize, const PAGE_SIZE: usize>(*mut Frame<PAGE_SIZE>);
+impl<const SIZE: usize, const PAGE_SIZE: usize> Block<SIZE, PAGE_SIZE> {
+    pub fn from_iter<I: ExactSizeIterator<Item = Frame<PAGE_SIZE>>>(iter: &mut I) -> Self {
+        let layout = Layout::array::<Frame<PAGE_SIZE>>(SIZE).unwrap();
+        let ptr = unsafe { alloc::alloc_zeroed(layout) } as *mut Frame<PAGE_SIZE>;
         if ptr.is_null() {
             alloc::handle_alloc_error(layout)
         }
@@ -121,5 +182,34 @@ impl<T, const SIZE: usize> Block<T, SIZE> {
             unsafe { ptr::write(ptr.add(i), iter.next().unwrap()) };
         }
         Self(ptr)
+    }
+}
+
+struct Frame<const PAGE_SIZE: usize> {
+    ptr: AtomicPtr<FrameInner<PAGE_SIZE>>,
+}
+enum FrameInner<const PAGE_SIZE: usize> {
+    Mem(PageBuffer<PAGE_SIZE>),
+    Disk(u64),
+    Free(PageId),
+}
+impl<const PAGE_SIZE: usize> FrameInner<PAGE_SIZE> {
+    pub fn unwrap_as_mem(&self) -> &PageBuffer<PAGE_SIZE> {
+        if let Self::Mem(buf) = self {
+            return buf;
+        }
+        panic!()
+    }
+    pub fn unwrap_as_disk(&self) -> u64 {
+        if let Self::Disk(offset) = self {
+            return *offset;
+        }
+        panic!()
+    }
+    pub fn unwrap_as_free(&self) -> PageId {
+        if let Self::Free(next) = self {
+            return *next;
+        }
+        panic!()
     }
 }

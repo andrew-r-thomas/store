@@ -8,44 +8,41 @@
 
     NOTE:
     - we won't ever shrink the hash table, that will be done by a vaccuum operation or something
+    - we could probably pull off extendible hashing if we have the directory kept as a page itself
+      rather than just an in memory structure, this would also make it easier to just have one
+      mapping table implementation
 
 */
 
 use crate::{
     PageId,
     buffer::{PageBuffer, ReserveResult},
-    rcu_table::RCUTable,
+    rcu_table::MappingTable,
 };
 
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::Ordering,
 };
 
-pub struct HashTable<const PAGE_SIZE: usize, const B: usize> {
+pub struct HashTable<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> {
     buckets: u64,
-    table: RCUTable<AtomicPtr<PageBuffer<PAGE_SIZE>>, B>,
-    // table: Vec<AtomicPtr<PageBuffer<PAGE_SIZE>>>,
+    table: MappingTable<BLOCK_SIZE, PAGE_SIZE>,
 }
-impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
+impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE_SIZE> {
     // public interface ===========================================================================
     pub fn new(num_buckets: usize) -> Self {
-        let table = (0..num_buckets)
-            .map(|_| AtomicPtr::new(Box::into_raw(Box::new(PageBuffer::new().0))))
-            .into();
-
         Self {
             buckets: num_buckets as u64,
-            table,
+            table: MappingTable::new(num_buckets),
         }
     }
 
     pub fn get(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
-        let bucket_idx = self.find_bucket(key) as usize;
-        let bucket_ptr = self.table.get(bucket_idx);
-        let loaded = unsafe { &*bucket_ptr.load(Ordering::Acquire) };
-        let bucket = loaded.read();
+        let bucket_idx = self.find_bucket(key);
+        let bucket_buffer = self.table.get(bucket_idx);
+        let bucket = bucket_buffer.read();
         for chunk in ChunkIter::new(bucket) {
             match chunk {
                 Chunk::Insup { key: k, val } => {
@@ -73,11 +70,10 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     }
 
     pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
-        let bucket_idx = self.find_bucket(key) as usize;
-        let bucket_ptr = self.table.get(bucket_idx);
-        let loaded = unsafe { &*bucket_ptr.load(Ordering::Acquire) };
+        let bucket_idx = self.find_bucket(key);
+        let bucket_buffer = self.table.get(bucket_idx);
         let delta_len = Self::insup_delta_len(key.len(), val.len());
-        match loaded.reserve(delta_len) {
+        match bucket_buffer.reserve(delta_len) {
             ReserveResult::Ok(write_guard) => {
                 Self::write_insup(write_guard.buf, key, val);
                 Ok(())
@@ -111,11 +107,7 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                     }
                 };
 
-                // need to update the ptrs for the page buffer, and replace the page in the
-                // mapping table
-                self.table
-                    .get(bucket_idx as usize)
-                    .store(Box::into_raw(Box::new(new_page)), Ordering::Release);
+                self.table.set(bucket_idx, new_page);
 
                 out
             }
@@ -123,11 +115,10 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<(), ()> {
-        let bucket_idx = self.find_bucket(key) as usize;
-        let bucket_ptr = self.table.get(bucket_idx);
-        let loaded = unsafe { &*bucket_ptr.load(Ordering::Acquire) };
+        let bucket_idx = self.find_bucket(key);
+        let bucket_buffer = self.table.get(bucket_idx);
         let delta_len = Self::delete_delta_len(key.len());
-        match loaded.reserve(delta_len) {
+        match bucket_buffer.reserve(delta_len) {
             ReserveResult::Ok(write_guard) => {
                 Self::write_delete(write_guard.buf, key);
                 Ok(())
@@ -160,11 +151,7 @@ impl<const PAGE_SIZE: usize, const B: usize> HashTable<PAGE_SIZE, B> {
                     }
                 };
 
-                // need to update the ptrs for the page buffer, and replace the page in the
-                // mapping table
-                self.table
-                    .get(bucket_idx as usize)
-                    .store(Box::into_raw(Box::new(new_page)), Ordering::Release);
+                self.table.set(bucket_idx, new_page);
 
                 out
             }
@@ -381,6 +368,8 @@ impl<'i> Iterator for BaseEntryIter<'i> {
     }
 }
 
+// tests ==========================================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +383,8 @@ mod tests {
         const PAGE_SIZE: usize = 1024;
         let hash_table = Arc::new(HashTable::<PAGE_SIZE, 8>::new(64));
 
+        // ok we wanna rewrite this a bit so that we get contention on buckets, but not on keys,
+        // that way we can have ~deterministic checking of values we know should be in there vs not
         let mut threads = Vec::new();
         for t in 0..4 {
             let table = hash_table.clone();
@@ -403,7 +394,7 @@ mod tests {
                     .spawn(move || {
                         let mut rng = rand::rng();
                         let mut get_vec = Vec::new();
-                        for i in 0..10000 as u32 {
+                        for i in 0..100000 as u32 {
                             let d = &i.to_be_bytes();
                             if rng.random_bool(0.5) {
                                 // get
