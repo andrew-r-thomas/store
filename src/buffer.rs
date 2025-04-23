@@ -108,36 +108,3 @@ impl<const S: usize> Drop for WriteGuard<'_, S> {
         ) {}
     }
 }
-
-// pub struct Pool<const PAGE_SIZE: usize> {
-//     buf: NonNull<PageBuffer<PAGE_SIZE>>,
-//     pop: AtomicUsize,
-//     cap: usize,
-// }
-
-// impl<const PAGE_SIZE: usize> Pool<PAGE_SIZE> {
-// pub fn new(capacity: usize, buffer_capacity: usize) -> Self {
-//     let layout = Layout::array::<PageBuffer<PAGE_SIZE>>(capacity).unwrap();
-//     let ptr = unsafe { alloc(layout) } as *mut PageBuffer<PAGE_SIZE>;
-//     let buf = match NonNull::new(ptr) {
-//         Some(nn) => nn,
-//         None => handle_alloc_error(layout),
-//     };
-//     for i in 0..capacity {
-//         let page = PageBuffer::new();
-//         unsafe { ptr::write(buf.add(i).as_ptr(), page) };
-//     }
-//     Self {
-//         buf,
-//         cap: capacity,
-//         pop: AtomicUsize::new(0),
-//     }
-// }
-// pub fn pop(&self) -> *mut PageBuffer<PAGE_SIZE> {
-//     let i = self.pop.fetch_add(1, Ordering::SeqCst);
-//     if i >= self.cap {
-//         panic!("ran out of memory in buffer pool")
-//     }
-//     unsafe { self.buf.add(i).as_ptr() }
-// }
-// }

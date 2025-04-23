@@ -17,7 +17,7 @@
 use crate::{
     PageId,
     buffer::{PageBuffer, ReserveResult},
-    rcu_table::MappingTable,
+    page_dir::PageDirectory,
 };
 
 use std::{
@@ -26,38 +26,41 @@ use std::{
     sync::atomic::Ordering,
 };
 
+const DIR_PAGE: PageId = 1;
+
 pub struct HashTable<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> {
-    buckets: u64,
-    table: MappingTable<BLOCK_SIZE, PAGE_SIZE>,
+    page_dir: PageDirectory<BLOCK_SIZE, PAGE_SIZE>,
 }
 impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE_SIZE> {
     // public interface ===========================================================================
+
+    /// hmmm
     pub fn new(num_buckets: usize) -> Self {
-        Self {
-            buckets: num_buckets as u64,
-            table: MappingTable::new(num_buckets),
-        }
+        todo!()
     }
 
     pub fn get(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
-        let bucket_idx = self.find_bucket(key);
-        let bucket_buffer = self.table.get(bucket_idx);
-        let bucket = bucket_buffer.read();
-        for chunk in ChunkIter::new(bucket) {
+        let (bucket_id, _) = self.get_bucket_id(key);
+        let bucket = Bucket::from(self.page_dir.get(bucket_id).read());
+        for chunk in bucket.iter_chunks() {
             match chunk {
-                Chunk::Insup { key: k, val } => {
+                BucketChunk::Insup {
+                    key: k,
+                    val,
+                    hash: _,
+                } => {
                     if key == k {
                         out.extend(val);
                         return true;
                     }
                 }
-                Chunk::Delete(k) => {
+                BucketChunk::Delete(k) => {
                     if key == k {
                         return false;
                     }
                 }
-                Chunk::Base(base_page) => {
-                    for entry in BaseEntryIter::new(base_page) {
+                BucketChunk::Base(base_page) => {
+                    for entry in base_page.iter_entries() {
                         if entry.key == key {
                             out.extend(entry.val);
                             return true;
@@ -70,8 +73,8 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
     }
 
     pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
-        let bucket_idx = self.find_bucket(key);
-        let bucket_buffer = self.table.get(bucket_idx);
+        let (bucket_id, global_lvl) = self.get_bucket_id(key);
+        let bucket_buffer = self.page_dir.get(bucket_id);
         let delta_len = Self::insup_delta_len(key.len(), val.len());
         match bucket_buffer.reserve(delta_len) {
             ReserveResult::Ok(write_guard) => {
@@ -99,15 +102,20 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
                             .store((new_top - delta_len) as isize, Ordering::Release);
                         Ok(())
                     } else {
-                        new_page.read_offset.store(new_top, Ordering::Release);
-                        new_page
-                            .write_offset
-                            .store(new_top as isize, Ordering::Release);
-                        Err(())
+                        // there isn't room in the buffer still, so we need to do a split
+                        let (to_page, to_buf) = PageBuffer::<PAGE_SIZE>::new();
+                        let local_lvl = Self::split_bucket(&mut new_buf[new_top..], to_buf);
+                        if local_lvl < global_lvl {
+                            // we can split the page without growing the dir
+                            todo!()
+                        } else {
+                            // we need to grow the dir
+                            todo!()
+                        }
                     }
                 };
 
-                self.table.set(bucket_idx, new_page);
+                self.page_dir.set(bucket_id, new_page);
 
                 out
             }
@@ -115,8 +123,8 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<(), ()> {
-        let bucket_idx = self.find_bucket(key);
-        let bucket_buffer = self.table.get(bucket_idx);
+        let (bucket_id, global_lvl) = self.get_bucket_id(key);
+        let bucket_buffer = self.page_dir.get(bucket_id);
         let delta_len = Self::delete_delta_len(key.len());
         match bucket_buffer.reserve(delta_len) {
             ReserveResult::Ok(write_guard) => {
@@ -143,81 +151,57 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
                             .store((new_top - delta_len) as isize, Ordering::Release);
                         Ok(())
                     } else {
-                        new_page.read_offset.store(new_top, Ordering::Release);
-                        new_page
-                            .write_offset
-                            .store(new_top as isize, Ordering::Release);
-                        Err(())
+                        todo!()
                     }
                 };
 
-                self.table.set(bucket_idx, new_page);
+                self.page_dir.set(bucket_id, new_page);
 
                 out
             }
         }
     }
 
-    // private functions ==========================================================================
-
-    #[inline]
-    fn find_bucket(&self, key: &[u8]) -> PageId {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-        hash % self.buckets
-    }
-
-    // utils ======================================================================================
-
-    /// takes bucket to be compacted ([`old`]), and a zeroed complete page buffer to compact into
-    /// ([`new`]). performs the compaction and returns the new "top" of the bucket
-    fn compact_bucket(old: &[u8], new: &mut [u8]) -> usize {
-        // PERF: use a thread local scratch allocator for this, might need to use nightly or wait
-        // until the allocator api is stable (ugh)
-        let mut scratch = HashMap::new();
-
-        let mut total_len: isize = 0;
-        for chunk in ChunkIter::new(old) {
-            match chunk {
-                Chunk::Insup { key, val } => {
-                    if let None = scratch.insert(key, val) {
-                        total_len += (key.len() + val.len()) as isize;
-                    }
-                }
-                Chunk::Delete(key) => {
-                    if let Some(val) = scratch.remove(key) {
-                        total_len -= (key.len() + val.len()) as isize;
-                    }
-                }
-                Chunk::Base(base_page) => {
-                    for entry in BaseEntryIter::new(base_page) {
-                        if let None = scratch.insert(entry.key, entry.val) {
-                            total_len += (entry.key.len() + entry.val.len()) as isize;
+    fn get_bucket_id(&self, key: &[u8]) -> (PageId, usize) {
+        let mut dir = Dir::from(self.page_dir.get(DIR_PAGE).read());
+        let mut global_lvl = None;
+        let mut slot = None;
+        'list: loop {
+            for chunk in dir.iter_chunks() {
+                match chunk {
+                    DirChunk::Base(dir_base) => {
+                        if let None = global_lvl {
+                            global_lvl = Some(dir_base.global_lvl());
+                        }
+                        if let None = slot {
+                            slot = Some(Self::find_slot(key, global_lvl.unwrap() as u64));
+                        }
+                        match dir_base.page_id_at(slot.unwrap()) {
+                            Some(bucket_id) => return (bucket_id, global_lvl.unwrap()),
+                            None => {
+                                dir = Dir::from(self.page_dir.get(dir_base.next().unwrap()).read());
+                                continue 'list;
+                            }
                         }
                     }
                 }
             }
         }
-
-        let num_entries = scratch.len();
-        let top = new.len() - (3 + (num_entries * 8) + total_len as usize);
-
-        new[top + 1..top + 3].copy_from_slice(&(num_entries as u16).to_be_bytes());
-
-        let mut cursor = top + 3 + num_entries * 8;
-        for ((key, val), i) in scratch.iter().zip(0..) {
-            new[top + 3 + (i * 8)..top + 3 + (i * 8) + 4]
-                .copy_from_slice(&(key.len() as u32).to_be_bytes());
-            new[top + 3 + (i * 8) + 4..top + 3 + (i * 8) + 8]
-                .copy_from_slice(&(val.len() as u32).to_be_bytes());
-            new[cursor..cursor + key.len()].copy_from_slice(key);
-            new[cursor + key.len()..cursor + key.len() + val.len()].copy_from_slice(val);
-            cursor += key.len() + val.len();
-        }
-
-        top
     }
+
+    // utils ======================================================================================
+
+    #[inline]
+    fn find_slot(key: &[u8], lvl: u64) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        (hash & ((1 << lvl) - 1)) as usize
+    }
+
+    /// takes bucket to be compacted ([`old`]), and a zeroed complete page buffer to compact into
+    /// ([`new`]). performs the compaction and returns the new "top" of the bucket
+    fn compact_bucket(old: &[u8], new: &mut [u8]) -> usize {}
 
     #[inline]
     fn write_insup(buf: &mut [u8], key: &[u8], val: &[u8]) {
@@ -227,7 +211,6 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
         buf[9..9 + key.len()].copy_from_slice(key);
         buf[9 + key.len()..9 + key.len() + val.len()].copy_from_slice(val);
     }
-
     #[inline]
     fn write_delete(buf: &mut [u8], key: &[u8]) {
         buf[0] = 2;
@@ -253,40 +236,132 @@ unsafe impl<const PAGE_SIZE: usize, const BLOCK_SIZE: usize> Sync
 {
 }
 
-pub enum WriteResult {
-    Ok,
-    Sealed,
-    Full,
+// ================================================================================================
+// page layout logic and quality of life utils
+// ================================================================================================
+
+// dir pages ======================================================================================
+
+struct Dir<'d> {
+    buf: &'d [u8],
+}
+impl<'d> From<&'d [u8]> for Dir<'d> {
+    fn from(buf: &'d [u8]) -> Self {
+        Self { buf }
+    }
+}
+impl<'d> Dir<'d> {
+    pub fn iter_chunks(&self) -> DirChunkIter {
+        DirChunkIter::from(self.buf)
+    }
 }
 
-// some quality of life iterators =================================================================
-
-struct ChunkIter<'i> {
+struct DirChunkIter<'i> {
     buf: &'i [u8],
     i: usize,
 }
-enum Chunk<'c> {
-    Insup { key: &'c [u8], val: &'c [u8] },
-    Delete(&'c [u8]),
-    Base(&'c [u8]),
-}
-struct BaseEntryIter<'i> {
-    buf: &'i [u8],
-    cursor: usize,
-    entry: usize,
-}
-struct Entry<'e> {
-    pub key: &'e [u8],
-    pub val: &'e [u8],
-}
-
-impl<'i> ChunkIter<'i> {
-    fn new(page: &'i [u8]) -> Self {
-        Self { buf: page, i: 0 }
+impl<'i> From<&'i [u8]> for DirChunkIter<'i> {
+    fn from(buf: &'i [u8]) -> Self {
+        Self { buf, i: 0 }
     }
 }
-impl<'i> Iterator for ChunkIter<'i> {
-    type Item = Chunk<'i>;
+enum DirChunk<'c> {
+    Base(DirBase<'c>),
+}
+impl<'i> Iterator for DirChunkIter<'i> {
+    type Item = DirChunk<'i>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.buf.len() {
+            return None;
+        }
+
+        match self.buf[self.i] {
+            0 => {
+                let out = Some(DirChunk::Base(DirBase::from(&self.buf[self.i..])));
+                self.i = self.buf.len();
+                out
+            }
+            _ => panic!(),
+        }
+    }
+}
+
+struct DirBase<'b> {
+    buf: &'b [u8],
+}
+impl<'b> From<&'b [u8]> for DirBase<'b> {
+    fn from(buf: &'b [u8]) -> Self {
+        Self { buf }
+    }
+}
+impl<'b> DirBase<'b> {
+    #[inline]
+    pub fn global_lvl(&self) -> usize {
+        self.buf[1] as usize
+    }
+    #[inline]
+    pub fn next(&self) -> Option<PageId> {
+        let n = u64::from_be_bytes(self.buf[self.buf.len() - 8..].try_into().unwrap());
+        if n == 0 { None } else { Some(n) }
+    }
+    #[inline]
+    pub fn num_entries(&self) -> usize {
+        u16::from_be_bytes(self.buf[2..4].try_into().unwrap()) as usize
+    }
+    #[inline]
+    pub fn page_id_at(&self, slot: usize) -> Option<PageId> {
+        if slot >= self.num_entries() {
+            None
+        } else {
+            Some(u64::from_be_bytes(
+                self.buf[4 + (slot * 8)..4 + (slot * 8) + 8]
+                    .try_into()
+                    .unwrap(),
+            ))
+        }
+    }
+}
+
+// bucket pages ===================================================================================
+
+struct Bucket<'b> {
+    buf: &'b [u8],
+}
+impl<'b> From<&'b [u8]> for Bucket<'b> {
+    fn from(buf: &'b [u8]) -> Self {
+        Self { buf }
+    }
+}
+impl Bucket<'_> {
+    pub fn iter_chunks(&self) -> BucketChunkIter {
+        BucketChunkIter::from(self.buf)
+    }
+    #[inline]
+    pub fn local_lvl(&self) -> usize {
+        *self.buf.last().unwrap() as usize
+    }
+}
+
+struct BucketChunkIter<'i> {
+    buf: &'i [u8],
+    i: usize,
+}
+impl<'i> From<&'i [u8]> for BucketChunkIter<'i> {
+    fn from(buf: &'i [u8]) -> Self {
+        Self { buf, i: 0 }
+    }
+}
+enum BucketChunk<'c> {
+    Insup {
+        key: &'c [u8],
+        val: &'c [u8],
+        hash: u64,
+    },
+    Delete(&'c [u8]),
+    Base(BucketBase<'c>),
+}
+impl<'i> Iterator for BucketChunkIter<'i> {
+    type Item = BucketChunk<'i>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.i >= self.buf.len() {
             return None;
@@ -295,23 +370,25 @@ impl<'i> Iterator for ChunkIter<'i> {
         match self.buf[self.i] {
             0 => {
                 // base page
-                let out = Some(Chunk::Base(&self.buf[self.i..]));
+                let out = Some(BucketChunk::Base(BucketBase::from(&self.buf[self.i..])));
                 self.i = self.buf.len();
                 out
             }
             1 => {
                 // insup
+                let hash = u64::from_be_bytes(self.buf[self.i + 1..self.i + 9].try_into().unwrap());
                 let key_len =
-                    u32::from_be_bytes(self.buf[self.i + 1..self.i + 5].try_into().unwrap())
+                    u32::from_be_bytes(self.buf[self.i + 9..self.i + 13].try_into().unwrap())
                         as usize;
                 let val_len =
-                    u32::from_be_bytes(self.buf[self.i + 5..self.i + 9].try_into().unwrap())
+                    u32::from_be_bytes(self.buf[self.i + 13..self.i + 17].try_into().unwrap())
                         as usize;
-                let out = Some(Chunk::Insup {
-                    key: &self.buf[self.i + 9..self.i + 9 + key_len],
-                    val: &self.buf[self.i + 9 + key_len..self.i + 9 + key_len + val_len],
+                let out = Some(BucketChunk::Insup {
+                    key: &self.buf[self.i + 17..self.i + 17 + key_len],
+                    val: &self.buf[self.i + 17 + key_len..self.i + 17 + key_len + val_len],
+                    hash,
                 });
-                self.i += 9 + key_len + val_len;
+                self.i += 17 + key_len + val_len;
                 out
             }
             2 => {
@@ -319,7 +396,9 @@ impl<'i> Iterator for ChunkIter<'i> {
                 let key_len =
                     u32::from_be_bytes(self.buf[self.i + 1..self.i + 5].try_into().unwrap())
                         as usize;
-                let out = Some(Chunk::Delete(&self.buf[self.i + 5..self.i + 5 + key_len]));
+                let out = Some(BucketChunk::Delete(
+                    &self.buf[self.i + 5..self.i + 5 + key_len],
+                ));
                 self.i += 5 + key_len;
                 out
             }
@@ -327,9 +406,32 @@ impl<'i> Iterator for ChunkIter<'i> {
         }
     }
 }
+struct BucketBase<'b> {
+    buf: &'b [u8],
+}
+impl<'b> From<&'b [u8]> for BucketBase<'b> {
+    fn from(buf: &'b [u8]) -> Self {
+        Self { buf }
+    }
+}
+impl<'b> BucketBase<'b> {
+    pub fn iter_entries(&self) -> BucketBaseEntryIter {
+        BucketBaseEntryIter::from(self.buf)
+    }
+}
+struct BucketBaseEntryIter<'i> {
+    buf: &'i [u8],
+    cursor: usize,
+    entry: usize,
+}
+struct BucketBaseEntry<'e> {
+    pub key: &'e [u8],
+    pub val: &'e [u8],
+    pub hash: u64,
+}
 
-impl<'i> BaseEntryIter<'i> {
-    pub fn new(buf: &'i [u8]) -> Self {
+impl<'i> From<&'i [u8]> for BucketBaseEntryIter<'i> {
+    fn from(buf: &'i [u8]) -> Self {
         let num_entries = u16::from_be_bytes(buf[1..3].try_into().unwrap()) as usize;
         Self {
             buf,
@@ -338,33 +440,112 @@ impl<'i> BaseEntryIter<'i> {
         }
     }
 }
-impl<'i> Iterator for BaseEntryIter<'i> {
-    type Item = Entry<'i>;
+impl<'i> Iterator for BucketBaseEntryIter<'i> {
+    type Item = BucketBaseEntry<'i>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor >= self.buf.len() {
             return None;
         }
 
+        let hash = u64::from_be_bytes(
+            self.buf[3 + (self.entry * 16)..3 + (self.entry * 16) + 8]
+                .try_into()
+                .unwrap(),
+        );
         let key_len = u32::from_be_bytes(
-            self.buf[3 + self.entry * 8..3 + (self.entry * 8) + 4]
+            self.buf[3 + (self.entry * 16) + 8..3 + (self.entry * 16) + 12]
                 .try_into()
                 .unwrap(),
         ) as usize;
         let val_len = u32::from_be_bytes(
-            self.buf[3 + (self.entry * 8) + 4..3 + (self.entry * 8) + 8]
+            self.buf[3 + (self.entry * 16) + 12..3 + (self.entry * 16) + 16]
                 .try_into()
                 .unwrap(),
         ) as usize;
 
-        let out = Some(Entry {
+        let out = Some(BucketBaseEntry {
             key: &self.buf[self.cursor..self.cursor + key_len],
             val: &self.buf[self.cursor + key_len..self.cursor + key_len + val_len],
+            hash,
         });
 
         self.cursor += key_len + val_len;
         self.entry += 1;
 
         out
+    }
+}
+
+/// this is assumed to be logically a base page,
+/// with [`buf`] being a full, exclusively owned page buffer
+struct BucketBaseMut<'b> {
+    buf: &'b mut [u8],
+    top: usize,
+}
+impl<'b> BucketBaseMut<'b> {
+    fn compact_from(buf: &'b mut [u8], other: Bucket<'b>) -> Self {
+        // PERF: use a thread local scratch allocator for this, might need to use nightly or wait
+        // until the allocator api is stable (ugh)
+        let mut scratch = HashMap::new();
+        let mut deltas = Vec::new();
+
+        let mut total_data_len: isize = 0;
+        for chunk in other.iter_chunks() {
+            match chunk {
+                BucketChunk::Insup {
+                    key: _,
+                    val: _,
+                    hash: _,
+                }
+                | BucketChunk::Delete(_) => deltas.push(chunk),
+                BucketChunk::Base(base_page) => {
+                    for entry in base_page.iter_entries() {
+                        scratch.insert(entry.key, (entry.val, entry.hash));
+                        total_data_len += (entry.key.len() + entry.val.len()) as isize;
+                    }
+                }
+            }
+        }
+        while let Some(delta) = deltas.pop() {
+            match delta {
+                BucketChunk::Delete(key) => {
+                    if let Some((val, _)) = scratch.remove(key) {
+                        total_data_len -= (key.len() + val.len()) as isize;
+                    }
+                }
+                BucketChunk::Insup { key, val, hash } => {
+                    if let None = scratch.insert(key, (val, hash)) {
+                        total_data_len += (key.len() + val.len()) as isize;
+                    }
+                }
+                _ => panic!(),
+            }
+        }
+
+        let num_entries = scratch.len();
+        let top = buf.len() - (3 + (num_entries * 16) + total_data_len as usize + 1);
+
+        buf[top + 1..top + 3].copy_from_slice(&(num_entries as u16).to_be_bytes());
+
+        let mut cursor = top + 3 + num_entries * 8;
+        for ((key, (val, hash)), i) in scratch.iter().zip(0..) {
+            buf[top + 3 + (i * 16)..top + 3 + (i * 16) + 8].copy_from_slice(&hash.to_be_bytes());
+            buf[top + 3 + (i * 16) + 8..top + 3 + (i * 16) + 12]
+                .copy_from_slice(&(key.len() as u32).to_be_bytes());
+            buf[top + 3 + (i * 16) + 12..top + 3 + (i * 16) + 16]
+                .copy_from_slice(&(val.len() as u32).to_be_bytes());
+            buf[cursor..cursor + key.len()].copy_from_slice(key);
+            buf[cursor + key.len()..cursor + key.len() + val.len()].copy_from_slice(val);
+            cursor += key.len() + val.len();
+        }
+
+        todo!()
+    }
+    pub fn as_base(&self) -> BucketBase {
+        BucketBase::from(&self.buf[self.top..])
+    }
+    pub fn unwrap(self) -> (&'b mut [u8], usize) {
+        (self.buf, self.top)
     }
 }
 
