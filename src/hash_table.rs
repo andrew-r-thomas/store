@@ -16,7 +16,7 @@
 
 use crate::{
     PageId,
-    buffer::{PageBuffer, PageChunk, PageLayout, ReserveResult},
+    buffer::{Base, BaseMut, Delta, Page, PageBuffer, PageChunk, PageLayout, WriteRes},
     page_dir::PageDirectory,
 };
 
@@ -40,9 +40,9 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
     }
 
     pub fn get(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
-        let (bucket_id, _) = self.get_bucket_id(key);
+        let (bucket_id, _, _) = self.get_bucket_id(key);
         let bucket_page = self.page_dir.get(bucket_id).read::<Bucket>();
-        for chunk in bucket_page {
+        for chunk in bucket_page.iter_chunks() {
             match chunk {
                 PageChunk::Delta(delta) => match delta {
                     BucketDelta::Set { key: k, val, .. } => {
@@ -71,111 +71,81 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
     }
 
     pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
-        let (bucket_id, global_lvl) = self.get_bucket_id(key);
+        let (bucket_id, global_lvl, hash) = self.get_bucket_id(key);
         let bucket_buffer = self.page_dir.get(bucket_id);
-        let delta_len = Self::insup_delta_len(key.len(), val.len());
-        match bucket_buffer.reserve(delta_len) {
-            ReserveResult::Ok(write_guard) => {
-                Self::write_insup(write_guard.buf, key, val);
-                Ok(())
-            }
-            ReserveResult::Sealed => Err(()),
-            ReserveResult::Sealer(seal_guard) => {
+        let delta = BucketDelta::Set { key, val, hash };
+        match bucket_buffer.write_delta::<Bucket>(&delta) {
+            WriteRes::Ok => Ok(()),
+            WriteRes::Sealed => Err(()),
+            WriteRes::Sealer(old_page) => {
                 // we sealed the buffer and need to compact it,
-                // first we do the compaction
                 let (new_page, new_buf) = PageBuffer::new();
-                let old_buf = seal_guard.wait_for_writers();
-                let new_top = Self::compact_bucket(old_buf, new_buf);
+                let mut new_base = BucketBaseMut::from(new_buf);
+                old_page.compact_into(&mut new_base);
 
-                // now we check if there's room in the compacted buffer for our write
-                let size = PAGE_SIZE - new_top;
-                let out = {
-                    if size + delta_len <= PAGE_SIZE {
-                        Self::write_insup(&mut new_buf[new_top - delta_len..new_top], key, val);
-                        new_page
-                            .read_offset
-                            .store(new_top - delta_len, Ordering::Release);
-                        new_page
-                            .write_offset
-                            .store((new_top - delta_len) as isize, Ordering::Release);
-                        Ok(())
-                    } else {
-                        // there isn't room in the buffer still, so we need to do a split
-                        let (to_page, to_buf) = PageBuffer::<PAGE_SIZE>::new();
-                        let local_lvl = Self::split_bucket(&mut new_buf[new_top..], to_buf);
-                        if local_lvl < global_lvl {
-                            // we can split the page without growing the dir
-                            todo!()
-                        } else {
-                            // we need to grow the dir
-                            todo!()
-                        }
-                    }
-                };
+                if let Err(()) = new_base.apply_delta(delta) {
+                    // compacted buffer is still too full for our delta, so we need to split it
+                    todo!()
+                }
 
+                let (_, new_top) = new_base.unwrap();
+                new_page.read_offset.store(new_top, Ordering::Release);
+                new_page
+                    .write_offset
+                    .store(new_top as isize, Ordering::Release);
                 self.page_dir.set(bucket_id, new_page);
 
-                out
+                Ok(())
             }
         }
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<(), ()> {
-        let (bucket_id, global_lvl) = self.get_bucket_id(key);
+        let (bucket_id, global_lvl, hash) = self.get_bucket_id(key);
         let bucket_buffer = self.page_dir.get(bucket_id);
-        let delta_len = Self::delete_delta_len(key.len());
-        match bucket_buffer.reserve(delta_len) {
-            ReserveResult::Ok(write_guard) => {
-                Self::write_delete(write_guard.buf, key);
-                Ok(())
-            }
-            ReserveResult::Sealed => Err(()),
-            ReserveResult::Sealer(seal_guard) => {
+        let delta = BucketDelta::Del(key);
+        match bucket_buffer.write_delta::<Bucket>(&delta) {
+            WriteRes::Ok => Ok(()),
+            WriteRes::Sealed => Err(()),
+            WriteRes::Sealer(old_page) => {
                 // we sealed the buffer and need to compact it,
                 // first we do the compaction
                 let (new_page, new_buf) = PageBuffer::new();
-                let old_buf = seal_guard.wait_for_writers();
-                let new_top = Self::compact_bucket(old_buf, new_buf);
+                let mut new_base = BucketBaseMut::from(new_buf);
+                old_page.compact_into(&mut new_base);
 
-                let size = PAGE_SIZE - new_top;
-                let out = {
-                    if size + delta_len <= PAGE_SIZE {
-                        Self::write_delete(&mut new_buf[new_top - delta_len..new_top], key);
-                        new_page
-                            .read_offset
-                            .store(new_top - delta_len, Ordering::Release);
-                        new_page
-                            .write_offset
-                            .store((new_top - delta_len) as isize, Ordering::Release);
-                        Ok(())
-                    } else {
-                        todo!()
-                    }
-                };
+                if let Err(()) = new_base.apply_delta(delta) {
+                    todo!()
+                }
 
                 self.page_dir.set(bucket_id, new_page);
 
-                out
+                Ok(())
             }
         }
     }
 
-    fn get_bucket_id(&self, key: &[u8]) -> (PageId, usize) {
+    fn get_bucket_id(&self, key: &[u8]) -> (PageId, usize, u64) {
         let mut dir = self.page_dir.get(DIR_PAGE).read::<Dir>();
         let mut global_lvl = None;
         let mut slot = None;
+        let mut hash = None;
         'list: loop {
-            for chunk in dir {
+            for chunk in dir.iter_chunks() {
                 match chunk {
                     PageChunk::Base(dir_base) => {
                         if let None = global_lvl {
                             global_lvl = Some(dir_base.global_lvl());
                         }
                         if let None = slot {
-                            slot = Some(Self::find_slot(key, global_lvl.unwrap() as u64));
+                            let (s, h) = Self::find_slot(key, global_lvl.unwrap() as u64);
+                            slot = Some(s);
+                            hash = Some(h);
                         }
                         match dir_base.page_id_at(slot.unwrap()) {
-                            Some(bucket_id) => return (bucket_id, global_lvl.unwrap()),
+                            Some(bucket_id) => {
+                                return (bucket_id, global_lvl.unwrap(), hash.unwrap());
+                            }
                             None => {
                                 dir = self.page_dir.get(dir_base.next().unwrap()).read();
                                 continue 'list;
@@ -191,34 +161,11 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
     // utils ======================================================================================
 
     #[inline]
-    fn find_slot(key: &[u8], lvl: u64) -> usize {
+    fn find_slot(key: &[u8], lvl: u64) -> (usize, u64) {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        (hash & ((1 << lvl) - 1)) as usize
-    }
-
-    #[inline]
-    fn write_insup(buf: &mut [u8], key: &[u8], val: &[u8]) {
-        buf[0] = 1;
-        buf[1..5].copy_from_slice(&(key.len() as u32).to_be_bytes());
-        buf[5..9].copy_from_slice(&(val.len() as u32).to_be_bytes());
-        buf[9..9 + key.len()].copy_from_slice(key);
-        buf[9 + key.len()..9 + key.len() + val.len()].copy_from_slice(val);
-    }
-    #[inline]
-    fn write_delete(buf: &mut [u8], key: &[u8]) {
-        buf[0] = 2;
-        buf[1..5].copy_from_slice(&(key.len() as u32).to_be_bytes());
-        buf[5..5 + key.len()].copy_from_slice(key);
-    }
-    #[inline]
-    fn insup_delta_len(key_len: usize, val_len: usize) -> usize {
-        9 + key_len + val_len
-    }
-    #[inline]
-    fn delete_delta_len(key_len: usize) -> usize {
-        5 + key_len
+        ((hash & ((1 << lvl) - 1)) as usize, hash)
     }
 }
 
@@ -241,11 +188,37 @@ enum Dir {}
 impl<'d> PageLayout<'d> for Dir {
     type Delta = DirDelta;
     type Base = DirBase<'d>;
+    type BaseMut = DirBaseMut;
+}
+struct DirBaseMut;
+impl<'b> From<&'b mut [u8]> for DirBaseMut {
+    fn from(_: &'b mut [u8]) -> Self {
+        todo!()
+    }
+}
+impl<'b> BaseMut<'b, Dir> for DirBaseMut {
+    fn unwrap(self) -> (&'b mut [u8], usize) {
+        todo!()
+    }
+    fn apply_base(&mut self, _base: DirBase) {
+        todo!()
+    }
+    fn apply_delta(&mut self, _delta: DirDelta) -> Result<(), ()> {
+        todo!()
+    }
+    fn split_into(&mut self, _to: &mut Self) {
+        todo!()
+    }
 }
 enum DirDelta {}
-
+impl Delta<'_> for DirDelta {
+    fn len(&self) -> usize {
+        0
+    }
+    fn write_to_buf(&self, _buf: &mut [u8]) {}
+}
 impl<'d> From<(&'d [u8], u8)> for DirDelta {
-    fn from(data: (&'d [u8], u8)) -> Self {
+    fn from(_data: (&'d [u8], u8)) -> Self {
         todo!()
     }
 }
@@ -258,6 +231,7 @@ impl<'b> From<&'b [u8]> for DirBase<'b> {
         Self { buf }
     }
 }
+impl<'b> Base<'b> for DirBase<'b> {}
 impl<'b> DirBase<'b> {
     #[inline]
     pub fn global_lvl(&self) -> usize {
@@ -292,6 +266,7 @@ enum Bucket {}
 impl<'p> PageLayout<'p> for Bucket {
     type Base = BucketBase<'p>;
     type Delta = BucketDelta<'p>;
+    type BaseMut = BucketBaseMut<'p>;
 }
 enum BucketDelta<'d> {
     Set {
@@ -300,6 +275,27 @@ enum BucketDelta<'d> {
         hash: u64,
     },
     Del(&'d [u8]),
+}
+impl<'d> Delta<'d> for BucketDelta<'d> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Del(key) => key.len(),
+            Self::Set { key, val, .. } => 16 + key.len() + val.len(),
+        }
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        debug_assert!(self.len() == buf.len());
+        match self {
+            Self::Del(key) => buf.copy_from_slice(key),
+            Self::Set { key, val, hash } => {
+                buf[0..8].copy_from_slice(&hash.to_be_bytes());
+                buf[8..12].copy_from_slice(&(key.len()).to_be_bytes());
+                buf[12..16].copy_from_slice(&(val.len()).to_be_bytes());
+                buf[16..16 + key.len()].copy_from_slice(key);
+                buf[16 + key.len()..].copy_from_slice(val);
+            }
+        }
+    }
 }
 impl<'d> From<(&'d [u8], u8)> for BucketDelta<'d> {
     fn from(data: (&'d [u8], u8)) -> Self {
@@ -320,6 +316,7 @@ impl<'d> From<(&'d [u8], u8)> for BucketDelta<'d> {
         }
     }
 }
+
 struct BucketBase<'b> {
     buf: &'b [u8],
 }
@@ -328,6 +325,7 @@ impl<'b> From<&'b [u8]> for BucketBase<'b> {
         Self { buf }
     }
 }
+impl<'b> Base<'b> for BucketBase<'b> {}
 impl<'b> BucketBase<'b> {
     pub fn iter_entries(&self) -> BucketBaseEntryIter {
         BucketBaseEntryIter::from(self.buf)
@@ -343,7 +341,6 @@ struct BucketBaseEntry<'e> {
     pub val: &'e [u8],
     pub hash: u64,
 }
-
 impl<'i> From<&'i [u8]> for BucketBaseEntryIter<'i> {
     fn from(buf: &'i [u8]) -> Self {
         let num_entries = u16::from_be_bytes(buf[1..3].try_into().unwrap()) as usize;
@@ -404,72 +401,18 @@ impl<'b> From<&'b mut [u8]> for BucketBaseMut<'b> {
         }
     }
 }
-impl<'b> BucketBaseMut<'b> {
-    /// [`BucketBaseMut`] performs it's in place manipulation similar to a typical slotted page,
-    /// meaning it keeps space in the center for growing into/pruning out of.
-    /// this function copies down the top section (header, slots, etc) to meet the bottom section,
-    /// which contains the actual data. this function returns the complete buffer, along with the
-    /// top of the base page
-    pub fn unwrap(self) -> (&'b mut [u8], usize) {
+impl<'b> BaseMut<'b, Bucket> for BucketBaseMut<'b> {
+    fn unwrap(self) -> (&'b mut [u8], usize) {
         self.buf.copy_within(0..self.top, self.bottom - self.top);
         (self.buf, self.bottom - self.top)
     }
-    pub fn compact_from(&mut self, other: Bucket<'b>) {
-        // PERF: use a thread local scratch allocator for this, might need to use nightly or wait
-        // until the allocator api is stable (ugh)
-        let mut scratch = HashMap::new();
-        let mut deltas = Vec::new();
-
-        let mut total_data_len: isize = 0;
-        for chunk in other.iter_chunks().rev() {
-            match chunk {
-                BucketChunk::Insup {
-                    key: _,
-                    val: _,
-                    hash: _,
-                }
-                | BucketChunk::Delete(_) => deltas.push(chunk),
-                BucketChunk::Base(base_page) => {
-                    for entry in base_page.iter_entries() {
-                        scratch.insert(entry.key, (entry.val, entry.hash));
-                        total_data_len += (entry.key.len() + entry.val.len()) as isize;
-                    }
-                }
-            }
-        }
-        while let Some(delta) = deltas.pop() {
-            match delta {
-                BucketChunk::Delete(key) => {
-                    if let Some((val, _)) = scratch.remove(key) {
-                        total_data_len -= (key.len() + val.len()) as isize;
-                    }
-                }
-                BucketChunk::Insup { key, val, hash } => {
-                    if let None = scratch.insert(key, (val, hash)) {
-                        total_data_len += (key.len() + val.len()) as isize;
-                    }
-                }
-                _ => panic!(),
-            }
-        }
-
-        let num_entries = scratch.len();
-        let top = buf.len() - (3 + (num_entries * 16) + total_data_len as usize + 1);
-
-        buf[top + 1..top + 3].copy_from_slice(&(num_entries as u16).to_be_bytes());
-
-        let mut cursor = top + 3 + num_entries * 8;
-        for ((key, (val, hash)), i) in scratch.iter().zip(0..) {
-            buf[top + 3 + (i * 16)..top + 3 + (i * 16) + 8].copy_from_slice(&hash.to_be_bytes());
-            buf[top + 3 + (i * 16) + 8..top + 3 + (i * 16) + 12]
-                .copy_from_slice(&(key.len() as u32).to_be_bytes());
-            buf[top + 3 + (i * 16) + 12..top + 3 + (i * 16) + 16]
-                .copy_from_slice(&(val.len() as u32).to_be_bytes());
-            buf[cursor..cursor + key.len()].copy_from_slice(key);
-            buf[cursor + key.len()..cursor + key.len() + val.len()].copy_from_slice(val);
-            cursor += key.len() + val.len();
-        }
-
+    fn apply_base(&mut self, _base: BucketBase) {
+        todo!()
+    }
+    fn apply_delta(&mut self, _delta: BucketDelta) -> Result<(), ()> {
+        todo!()
+    }
+    fn split_into(&mut self, _to: &mut Self) {
         todo!()
     }
 }

@@ -35,98 +35,102 @@ impl<const SIZE: usize> PageBuffer<SIZE> {
         let ptr = unsafe { self.ptr.add(read_offset) };
         Page::from(unsafe { slice::from_raw_parts(ptr, SIZE - read_offset) })
     }
-    pub fn reserve(&self, len: usize) -> ReserveResult<SIZE> {
+    pub fn write_delta<'w, P: PageLayout<'w>>(&self, delta: &P::Delta) -> WriteRes<'w, P> {
+        let len = delta.len() + 18;
         let old_write_offset = self.write_offset.fetch_sub(len as isize, Ordering::SeqCst);
         let new_write_offset = old_write_offset - len as isize;
+
         if new_write_offset <= 0 {
             if old_write_offset > 0 {
                 // we caused the buffer to be sealed
-                return ReserveResult::Sealer(SealGuard {
-                    p: self,
-                    bottom: old_write_offset as usize,
-                });
+                while self.read_offset.load(Ordering::Acquire) != old_write_offset as usize {}
+                return WriteRes::Sealer(Page::from(unsafe {
+                    slice::from_raw_parts(
+                        self.ptr.add(old_write_offset as usize),
+                        SIZE - old_write_offset as usize,
+                    )
+                }));
             }
-            return ReserveResult::Sealed;
+            // the buffer is already sealed
+            return WriteRes::Sealed;
         }
-        let write = unsafe {
-            slice::from_raw_parts_mut(
-                self.ptr.add(new_write_offset as usize),
-                (old_write_offset - new_write_offset) as usize,
-            )
+
+        let buf = unsafe {
+            slice::from_raw_parts_mut(self.ptr.add(new_write_offset as usize + 9), delta.len())
         };
-        ReserveResult::Ok(WriteGuard {
-            buf: write,
-            p: self,
-            bottom: old_write_offset as usize,
-        })
-    }
-}
+        delta.write_to_buf(buf);
 
-pub enum ReserveResult<'r, const S: usize> {
-    Ok(WriteGuard<'r, S>),
-    Sealer(SealGuard<'r, S>),
-    Sealed,
-}
-
-pub struct SealGuard<'s, const S: usize> {
-    p: &'s PageBuffer<S>,
-    bottom: usize,
-}
-impl<const S: usize> SealGuard<'_, S> {
-    // TODO: so here there might be a benefit to interleaving waiting
-    // for writes and returning them, i.e. say we're waiting for 3 writers,
-    // when one of them completes, we could in theory process that write
-    // and add it to the new compacted buffer, while the other writes are
-    // still in flight, since we're already looping here, that *should* get
-    // us some more concurrent work happening. one caveat though is that if
-    // the writes we're waiting for are for the same item (like say one write
-    // updates a key, and the next one deletes it) and in that case we'd
-    // probably be doing *more* work, so we should profile this and see if it
-    // makes sense to do
-    #[inline]
-    pub fn wait_for_writers(&self) -> &[u8] {
-        loop {
-            let r = self.p.read_offset.load(Ordering::Acquire);
-            if r == self.bottom {
-                return unsafe { slice::from_raw_parts(self.p.ptr.add(r), S - r) };
-            }
-        }
-    }
-}
-
-pub struct WriteGuard<'w, const S: usize> {
-    pub buf: &'w mut [u8],
-    p: &'w PageBuffer<S>,
-    bottom: usize,
-}
-impl<const S: usize> Drop for WriteGuard<'_, S> {
-    fn drop(&mut self) {
-        while let Err(_) = self.p.read_offset.compare_exchange_weak(
-            self.bottom,
-            self.bottom - self.buf.len(),
+        while let Err(_) = self.read_offset.compare_exchange_weak(
+            old_write_offset as usize,
+            new_write_offset as usize,
             Ordering::SeqCst,
             Ordering::SeqCst,
         ) {}
+        WriteRes::Ok
     }
 }
 
-pub trait PageLayout<'p> {
-    type Base: From<&'p [u8]>;
-    type Delta: From<(&'p [u8], u8)>;
+pub enum WriteRes<'r, P: PageLayout<'r>> {
+    Ok,
+    Sealed,
+    Sealer(Page<'r, P>),
 }
-pub struct Page<'p, P: PageLayout<'p>> {
+
+// ================================================================================================
+// page access types
+// ================================================================================================
+
+// page layout traits =============================================================================
+
+pub trait PageLayout<'p> {
+    type Base: Base<'p>;
+    type BaseMut: BaseMut<'p, Self>;
+    type Delta: Delta<'p>;
+}
+pub trait Delta<'d>: From<(&'d [u8], u8)> {
+    fn len(&self) -> usize;
+    fn write_to_buf(&self, buf: &mut [u8]);
+}
+pub trait Base<'b>: From<&'b [u8]> {}
+pub trait BaseMut<'b, P: PageLayout<'b> + ?Sized>: From<&'b mut [u8]> {
+    fn apply_base(&mut self, base: P::Base);
+    fn apply_delta(&mut self, delta: P::Delta) -> Result<(), ()>;
+    fn unwrap(self) -> (&'b mut [u8], usize);
+    fn split_into(&mut self, to: &mut Self);
+}
+
+pub struct Page<'p, P: PageLayout<'p> + ?Sized> {
+    buf: &'p [u8],
+    _p: PhantomData<P>,
+}
+impl<'p, P: PageLayout<'p>> From<&'p [u8]> for Page<'p, P> {
+    fn from(buf: &'p [u8]) -> Self {
+        Self {
+            buf,
+            _p: PhantomData,
+        }
+    }
+}
+impl<'p, P: PageLayout<'p> + ?Sized> Page<'p, P> {
+    pub fn iter_chunks(&self) -> PageChunkIter<'p, P> {
+        PageChunkIter::from(self.buf)
+    }
+    pub fn compact_into(&self, to: &mut P::BaseMut) {
+        for chunk in self.iter_chunks().rev() {
+            match chunk {
+                PageChunk::Base(base) => to.apply_base(base),
+                PageChunk::Delta(delta) => to.apply_delta(delta).unwrap(),
+            }
+        }
+    }
+}
+pub struct PageChunkIter<'p, P: PageLayout<'p> + ?Sized> {
     buf: &'p [u8],
     top: usize,
     bottom: usize,
     _p: PhantomData<P>,
 }
-impl<'p, P: PageLayout<'p>> Page<'p, P> {
-    pub fn reset_iter(&mut self) {
-        self.top = 0;
-        self.bottom = self.buf.len();
-    }
-}
-impl<'p, P: PageLayout<'p>> From<&'p [u8]> for Page<'p, P> {
+impl<'p, P: PageLayout<'p> + ?Sized> From<&'p [u8]> for PageChunkIter<'p, P> {
     fn from(buf: &'p [u8]) -> Self {
         Self {
             buf,
@@ -136,7 +140,13 @@ impl<'p, P: PageLayout<'p>> From<&'p [u8]> for Page<'p, P> {
         }
     }
 }
-impl<'p, P: PageLayout<'p>> Iterator for Page<'p, P> {
+impl<'p, P: PageLayout<'p>> PageChunkIter<'p, P> {
+    pub fn reset_iter(&mut self) {
+        self.top = 0;
+        self.bottom = self.buf.len();
+    }
+}
+impl<'p, P: PageLayout<'p> + ?Sized> Iterator for PageChunkIter<'p, P> {
     type Item = PageChunk<'p, P>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.top >= self.bottom {
@@ -164,7 +174,7 @@ impl<'p, P: PageLayout<'p>> Iterator for Page<'p, P> {
         }
     }
 }
-impl<'p, P: PageLayout<'p>> DoubleEndedIterator for Page<'p, P> {
+impl<'p, P: PageLayout<'p> + ?Sized> DoubleEndedIterator for PageChunkIter<'p, P> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.top >= self.bottom {
             return None;
@@ -192,7 +202,7 @@ impl<'p, P: PageLayout<'p>> DoubleEndedIterator for Page<'p, P> {
         out
     }
 }
-pub enum PageChunk<'c, P: PageLayout<'c>> {
+pub enum PageChunk<'c, P: PageLayout<'c> + ?Sized> {
     Delta(P::Delta),
     Base(P::Base),
 }
