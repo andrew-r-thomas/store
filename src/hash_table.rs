@@ -16,7 +16,7 @@
 
 use crate::{
     PageId,
-    buffer::{PageBuffer, ReserveResult},
+    buffer::{PageBuffer, PageChunk, PageLayout, ReserveResult},
     page_dir::PageDirectory,
 };
 
@@ -41,26 +41,24 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
 
     pub fn get(&self, key: &[u8], out: &mut Vec<u8>) -> bool {
         let (bucket_id, _) = self.get_bucket_id(key);
-        let bucket = Bucket::from(self.page_dir.get(bucket_id).read());
-        for chunk in bucket.iter_chunks() {
+        let bucket_page = self.page_dir.get(bucket_id).read::<Bucket>();
+        for chunk in bucket_page {
             match chunk {
-                BucketChunk::Insup {
-                    key: k,
-                    val,
-                    hash: _,
-                } => {
-                    if key == k {
-                        out.extend(val);
-                        return true;
+                PageChunk::Delta(delta) => match delta {
+                    BucketDelta::Set { key: k, val, .. } => {
+                        if k == key {
+                            out.extend(val);
+                            return true;
+                        }
                     }
-                }
-                BucketChunk::Delete(k) => {
-                    if key == k {
-                        return false;
+                    BucketDelta::Del(k) => {
+                        if k == key {
+                            return false;
+                        }
                     }
-                }
-                BucketChunk::Base(base_page) => {
-                    for entry in base_page.iter_entries() {
+                },
+                PageChunk::Base(base) => {
+                    for entry in base.iter_entries() {
                         if entry.key == key {
                             out.extend(entry.val);
                             return true;
@@ -163,13 +161,13 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
     }
 
     fn get_bucket_id(&self, key: &[u8]) -> (PageId, usize) {
-        let mut dir = Dir::from(self.page_dir.get(DIR_PAGE).read());
+        let mut dir = self.page_dir.get(DIR_PAGE).read::<Dir>();
         let mut global_lvl = None;
         let mut slot = None;
         'list: loop {
-            for chunk in dir.iter_chunks() {
+            for chunk in dir {
                 match chunk {
-                    DirChunk::Base(dir_base) => {
+                    PageChunk::Base(dir_base) => {
                         if let None = global_lvl {
                             global_lvl = Some(dir_base.global_lvl());
                         }
@@ -179,11 +177,12 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
                         match dir_base.page_id_at(slot.unwrap()) {
                             Some(bucket_id) => return (bucket_id, global_lvl.unwrap()),
                             None => {
-                                dir = Dir::from(self.page_dir.get(dir_base.next().unwrap()).read());
+                                dir = self.page_dir.get(dir_base.next().unwrap()).read();
                                 continue 'list;
                             }
                         }
                     }
+                    PageChunk::Delta(_) => panic!(),
                 }
             }
         }
@@ -198,10 +197,6 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
         let hash = hasher.finish();
         (hash & ((1 << lvl) - 1)) as usize
     }
-
-    /// takes bucket to be compacted ([`old`]), and a zeroed complete page buffer to compact into
-    /// ([`new`]). performs the compaction and returns the new "top" of the bucket
-    fn compact_bucket(old: &[u8], new: &mut [u8]) -> usize {}
 
     #[inline]
     fn write_insup(buf: &mut [u8], key: &[u8], val: &[u8]) {
@@ -242,47 +237,16 @@ unsafe impl<const PAGE_SIZE: usize, const BLOCK_SIZE: usize> Sync
 
 // dir pages ======================================================================================
 
-struct Dir<'d> {
-    buf: &'d [u8],
+enum Dir {}
+impl<'d> PageLayout<'d> for Dir {
+    type Delta = DirDelta;
+    type Base = DirBase<'d>;
 }
-impl<'d> From<&'d [u8]> for Dir<'d> {
-    fn from(buf: &'d [u8]) -> Self {
-        Self { buf }
-    }
-}
-impl<'d> Dir<'d> {
-    pub fn iter_chunks(&self) -> DirChunkIter {
-        DirChunkIter::from(self.buf)
-    }
-}
+enum DirDelta {}
 
-struct DirChunkIter<'i> {
-    buf: &'i [u8],
-    i: usize,
-}
-impl<'i> From<&'i [u8]> for DirChunkIter<'i> {
-    fn from(buf: &'i [u8]) -> Self {
-        Self { buf, i: 0 }
-    }
-}
-enum DirChunk<'c> {
-    Base(DirBase<'c>),
-}
-impl<'i> Iterator for DirChunkIter<'i> {
-    type Item = DirChunk<'i>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.i >= self.buf.len() {
-            return None;
-        }
-
-        match self.buf[self.i] {
-            0 => {
-                let out = Some(DirChunk::Base(DirBase::from(&self.buf[self.i..])));
-                self.i = self.buf.len();
-                out
-            }
-            _ => panic!(),
-        }
+impl<'d> From<(&'d [u8], u8)> for DirDelta {
+    fn from(data: (&'d [u8], u8)) -> Self {
+        todo!()
     }
 }
 
@@ -324,84 +288,34 @@ impl<'b> DirBase<'b> {
 
 // bucket pages ===================================================================================
 
-struct Bucket<'b> {
-    buf: &'b [u8],
+enum Bucket {}
+impl<'p> PageLayout<'p> for Bucket {
+    type Base = BucketBase<'p>;
+    type Delta = BucketDelta<'p>;
 }
-impl<'b> From<&'b [u8]> for Bucket<'b> {
-    fn from(buf: &'b [u8]) -> Self {
-        Self { buf }
-    }
-}
-impl Bucket<'_> {
-    pub fn iter_chunks(&self) -> BucketChunkIter {
-        BucketChunkIter::from(self.buf)
-    }
-    #[inline]
-    pub fn local_lvl(&self) -> usize {
-        *self.buf.last().unwrap() as usize
-    }
-}
-
-struct BucketChunkIter<'i> {
-    buf: &'i [u8],
-    i: usize,
-}
-impl<'i> From<&'i [u8]> for BucketChunkIter<'i> {
-    fn from(buf: &'i [u8]) -> Self {
-        Self { buf, i: 0 }
-    }
-}
-enum BucketChunk<'c> {
-    Insup {
-        key: &'c [u8],
-        val: &'c [u8],
+enum BucketDelta<'d> {
+    Set {
+        key: &'d [u8],
+        val: &'d [u8],
         hash: u64,
     },
-    Delete(&'c [u8]),
-    Base(BucketBase<'c>),
+    Del(&'d [u8]),
 }
-impl<'i> Iterator for BucketChunkIter<'i> {
-    type Item = BucketChunk<'i>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.i >= self.buf.len() {
-            return None;
-        }
-
-        match self.buf[self.i] {
-            0 => {
-                // base page
-                let out = Some(BucketChunk::Base(BucketBase::from(&self.buf[self.i..])));
-                self.i = self.buf.len();
-                out
-            }
+impl<'d> From<(&'d [u8], u8)> for BucketDelta<'d> {
+    fn from(data: (&'d [u8], u8)) -> Self {
+        match data.1 {
             1 => {
-                // insup
-                let hash = u64::from_be_bytes(self.buf[self.i + 1..self.i + 9].try_into().unwrap());
-                let key_len =
-                    u32::from_be_bytes(self.buf[self.i + 9..self.i + 13].try_into().unwrap())
-                        as usize;
-                let val_len =
-                    u32::from_be_bytes(self.buf[self.i + 13..self.i + 17].try_into().unwrap())
-                        as usize;
-                let out = Some(BucketChunk::Insup {
-                    key: &self.buf[self.i + 17..self.i + 17 + key_len],
-                    val: &self.buf[self.i + 17 + key_len..self.i + 17 + key_len + val_len],
+                // set
+                let hash = u64::from_be_bytes(data.0[0..8].try_into().unwrap());
+                let key_len = u32::from_be_bytes(data.0[8..12].try_into().unwrap()) as usize;
+                let val_len = u32::from_be_bytes(data.0[12..16].try_into().unwrap()) as usize;
+                Self::Set {
+                    key: &data.0[16..16 + key_len],
+                    val: &data.0[16 + key_len..16 + key_len + val_len],
                     hash,
-                });
-                self.i += 17 + key_len + val_len;
-                out
+                }
             }
-            2 => {
-                // delete
-                let key_len =
-                    u32::from_be_bytes(self.buf[self.i + 1..self.i + 5].try_into().unwrap())
-                        as usize;
-                let out = Some(BucketChunk::Delete(
-                    &self.buf[self.i + 5..self.i + 5 + key_len],
-                ));
-                self.i += 5 + key_len;
-                out
-            }
+            2 => Self::Del(data.0),
             _ => panic!(),
         }
     }
@@ -476,21 +390,38 @@ impl<'i> Iterator for BucketBaseEntryIter<'i> {
     }
 }
 
-/// this is assumed to be logically a base page,
-/// with [`buf`] being a full, exclusively owned page buffer
 struct BucketBaseMut<'b> {
     buf: &'b mut [u8],
     top: usize,
+    bottom: usize,
+}
+impl<'b> From<&'b mut [u8]> for BucketBaseMut<'b> {
+    fn from(buf: &'b mut [u8]) -> Self {
+        Self {
+            top: 0,
+            bottom: buf.len(),
+            buf,
+        }
+    }
 }
 impl<'b> BucketBaseMut<'b> {
-    fn compact_from(buf: &'b mut [u8], other: Bucket<'b>) -> Self {
+    /// [`BucketBaseMut`] performs it's in place manipulation similar to a typical slotted page,
+    /// meaning it keeps space in the center for growing into/pruning out of.
+    /// this function copies down the top section (header, slots, etc) to meet the bottom section,
+    /// which contains the actual data. this function returns the complete buffer, along with the
+    /// top of the base page
+    pub fn unwrap(self) -> (&'b mut [u8], usize) {
+        self.buf.copy_within(0..self.top, self.bottom - self.top);
+        (self.buf, self.bottom - self.top)
+    }
+    pub fn compact_from(&mut self, other: Bucket<'b>) {
         // PERF: use a thread local scratch allocator for this, might need to use nightly or wait
         // until the allocator api is stable (ugh)
         let mut scratch = HashMap::new();
         let mut deltas = Vec::new();
 
         let mut total_data_len: isize = 0;
-        for chunk in other.iter_chunks() {
+        for chunk in other.iter_chunks().rev() {
             match chunk {
                 BucketChunk::Insup {
                     key: _,
@@ -540,12 +471,6 @@ impl<'b> BucketBaseMut<'b> {
         }
 
         todo!()
-    }
-    pub fn as_base(&self) -> BucketBase {
-        BucketBase::from(&self.buf[self.top..])
-    }
-    pub fn unwrap(self) -> (&'b mut [u8], usize) {
-        (self.buf, self.top)
     }
 }
 
