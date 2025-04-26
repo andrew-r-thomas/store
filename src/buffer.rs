@@ -7,8 +7,8 @@ use std::{
 
 pub struct PageBuffer<const SIZE: usize> {
     ptr: *mut u8,
-    pub read_offset: AtomicUsize,
-    pub write_offset: AtomicIsize,
+    read_offset: AtomicUsize,
+    write_offset: AtomicIsize,
 }
 
 impl<const SIZE: usize> PageBuffer<SIZE> {
@@ -30,10 +30,10 @@ impl<const SIZE: usize> PageBuffer<SIZE> {
             unsafe { slice::from_raw_parts_mut(ptr, SIZE) },
         )
     }
-    pub fn read<'p, P: PageLayout<'p>>(&self) -> Page<'p, P> {
+    pub fn read(&self) -> &[u8] {
         let read_offset = self.read_offset.load(Ordering::Acquire);
         let ptr = unsafe { self.ptr.add(read_offset) };
-        Page::from(unsafe { slice::from_raw_parts(ptr, SIZE - read_offset) })
+        unsafe { slice::from_raw_parts(ptr, SIZE - read_offset) }
     }
     pub fn write_delta<'w, P: PageLayout<'w>>(&self, delta: &P::Delta) -> WriteRes<'w, P> {
         let len = delta.len() + 18;
@@ -68,6 +68,11 @@ impl<const SIZE: usize> PageBuffer<SIZE> {
         ) {}
         WriteRes::Ok
     }
+
+    pub fn set_top(&mut self, top: usize) {
+        self.write_offset.store(top as isize, Ordering::Release);
+        self.read_offset.store(top, Ordering::Release);
+    }
 }
 
 pub enum WriteRes<'r, P: PageLayout<'r>> {
@@ -86,14 +91,14 @@ pub trait PageLayout<'p> {
     type Base: Base<'p>;
     type BaseMut: BaseMut<'p, Self>;
     type Delta: Delta<'p>;
+    type Footer<const FOOTER_SIZE: usize>: From<&'p [u8]>;
 }
 pub trait Delta<'d>: From<(&'d [u8], u8)> {
     fn len(&self) -> usize;
     fn write_to_buf(&self, buf: &mut [u8]);
 }
 pub trait Base<'b>: From<&'b [u8]> {}
-pub trait BaseMut<'b, P: PageLayout<'b> + ?Sized>: From<&'b mut [u8]> {
-    fn apply_base(&mut self, base: P::Base);
+pub trait BaseMut<'b, P: PageLayout<'b> + ?Sized>: From<(&'b mut [u8], P::Base)> {
     fn apply_delta(&mut self, delta: P::Delta) -> Result<(), ()>;
     fn unwrap(self) -> (&'b mut [u8], usize);
     fn split_into(&mut self, to: &mut Self);
@@ -115,13 +120,21 @@ impl<'p, P: PageLayout<'p> + ?Sized> Page<'p, P> {
     pub fn iter_chunks(&self) -> PageChunkIter<'p, P> {
         PageChunkIter::from(self.buf)
     }
-    pub fn compact_into(&self, to: &mut P::BaseMut) {
-        for chunk in self.iter_chunks().rev() {
+    pub fn compact_into(&self, to: &'p mut [u8]) -> P::BaseMut {
+        let mut iter = self.iter_chunks().rev();
+        let mut base_mut = {
+            match iter.next().unwrap() {
+                PageChunk::Base(base) => P::BaseMut::from((to, base)),
+                _ => panic!(),
+            }
+        };
+        for chunk in iter {
             match chunk {
-                PageChunk::Base(base) => to.apply_base(base),
-                PageChunk::Delta(delta) => to.apply_delta(delta).unwrap(),
+                PageChunk::Delta(delta) => base_mut.apply_delta(delta).unwrap(),
+                _ => panic!(),
             }
         }
+        base_mut
     }
 }
 pub struct PageChunkIter<'p, P: PageLayout<'p> + ?Sized> {

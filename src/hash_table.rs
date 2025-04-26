@@ -70,6 +70,17 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
         false
     }
 
+    // ok im making a big ole type mess, so i want to just wrap my head around the logic for a
+    // mutation.
+    //
+    // - first, we find the bucket that we want to do the set on
+    // - then, we try to add the delta to the bucket, if it works, or if it's already sealed, we
+    //   just call it a day
+    // - if we caused the buffer to be sealed, we create a new buffer, and compact the old one into
+    //   it, then we try to apply our delta to the compacted buffer, if that works, we're done
+    // - if it doesn't work, we need to split the compacted page into two
+    //
+
     pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
         let (bucket_id, global_lvl, hash) = self.get_bucket_id(key);
         let bucket_buffer = self.page_dir.get(bucket_id);
@@ -79,20 +90,24 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> HashTable<BLOCK_SIZE, PAGE
             WriteRes::Sealed => Err(()),
             WriteRes::Sealer(old_page) => {
                 // we sealed the buffer and need to compact it,
-                let (new_page, new_buf) = PageBuffer::new();
-                let mut new_base = BucketBaseMut::from(new_buf);
-                old_page.compact_into(&mut new_base);
+                let (mut new_page, new_buf) = PageBuffer::new();
+                let mut new_base = old_page.compact_into(new_buf);
 
                 if let Err(()) = new_base.apply_delta(delta) {
                     // compacted buffer is still too full for our delta, so we need to split it
+                    let (mut to_page, to_buf) = PageBuffer::new();
+                    let mut to_base = BucketBaseMut::from(to_buf);
+                    new_base.split_into(&mut to_base);
+
+                    let (_, to_top) = to_base.unwrap();
+                    to_page.set_top(to_top);
+                    self.page_dir.push(to_page);
+
                     todo!()
                 }
 
                 let (_, new_top) = new_base.unwrap();
-                new_page.read_offset.store(new_top, Ordering::Release);
-                new_page
-                    .write_offset
-                    .store(new_top as isize, Ordering::Release);
+                new_page.set_top(new_top);
                 self.page_dir.set(bucket_id, new_page);
 
                 Ok(())
@@ -330,6 +345,10 @@ impl<'b> BucketBase<'b> {
     pub fn iter_entries(&self) -> BucketBaseEntryIter {
         BucketBaseEntryIter::from(self.buf)
     }
+    #[inline]
+    pub fn num_entries(&self) -> u16 {
+        u16::from_be_bytes(self.buf[1..3].try_into().unwrap())
+    }
 }
 struct BucketBaseEntryIter<'i> {
     buf: &'i [u8],
@@ -392,8 +411,9 @@ struct BucketBaseMut<'b> {
     top: usize,
     bottom: usize,
 }
-impl<'b> From<&'b mut [u8]> for BucketBaseMut<'b> {
-    fn from(buf: &'b mut [u8]) -> Self {
+impl<'b> From<(&'b mut [u8], BucketBase<'b>)> for BucketBaseMut<'b> {
+    fn from((buf, base): (&'b mut [u8], BucketBase<'b>)) -> Self {
+        todo!();
         Self {
             top: 0,
             bottom: buf.len(),
@@ -406,10 +426,11 @@ impl<'b> BaseMut<'b, Bucket> for BucketBaseMut<'b> {
         self.buf.copy_within(0..self.top, self.bottom - self.top);
         (self.buf, self.bottom - self.top)
     }
-    fn apply_base(&mut self, _base: BucketBase) {
-        todo!()
-    }
-    fn apply_delta(&mut self, _delta: BucketDelta) -> Result<(), ()> {
+    fn apply_delta(&mut self, delta: BucketDelta) -> Result<(), ()> {
+        match delta {
+            BucketDelta::Del(key) => {}
+            BucketDelta::Set { key, val, hash } => {}
+        }
         todo!()
     }
     fn split_into(&mut self, _to: &mut Self) {

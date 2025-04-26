@@ -77,6 +77,12 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
         frame.ptr.store(ptr, Ordering::Release);
     }
 
+    pub fn push(&self, buf: PageBuffer<PAGE_SIZE>) -> PageId {
+        let id = self.pop_free();
+        self.set(id, buf);
+        id
+    }
+
     pub fn pop_free(&self) -> PageId {
         loop {
             // load the 0th slot, which points to the head of the free list
