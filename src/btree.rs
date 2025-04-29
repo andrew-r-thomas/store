@@ -596,7 +596,7 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
         match delta {
             LeafDelta::Set { key, val } => {
                 let num_entries = Self::num_entries(buf) as usize;
-                let mut cursor = self.bottom;
+                let mut cursor = PAGE_SIZE - 9;
                 for e in 0..num_entries {
                     let key_len =
                         u32::from_be_bytes(buf[2 + (e * 8)..2 + (e * 8) + 4].try_into().unwrap())
@@ -604,15 +604,62 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
                     let val_len = u32::from_be_bytes(
                         buf[2 + (e * 8) + 4..2 + (e * 8) + 8].try_into().unwrap(),
                     ) as usize;
-                    let k = &buf[cursor..cursor + key_len];
+                    let k = &buf[cursor - (key_len + val_len)..cursor - val_len];
                     if key < k {
                         // insert
-                        todo!()
+
+                        // check if we have room
+                        if self.bottom - self.top < key.len() + val.len() + 8 {
+                            return Err(());
+                        }
+
+                        // move the header and write the new slot data
+                        buf.copy_within(2 + (e * 8)..self.top, 2 + (e * 8) + 8);
+                        buf[2 + (e * 8)..2 + (e * 8) + 4]
+                            .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                        buf[2 + (e * 8) + 4..2 + (e * 8) + 8]
+                            .copy_from_slice(&(val.len() as u32).to_be_bytes());
+                        Self::set_num_entries(buf, (num_entries as u16) + 1);
+                        self.top += 8;
+
+                        // move the actual data and write the new data
+                        buf.copy_within(
+                            cursor - self.bottom..cursor,
+                            self.bottom - (key.len() + val.len()),
+                        );
+                        buf[cursor - (key.len() + val.len())..cursor - val.len()]
+                            .copy_from_slice(key);
+                        buf[cursor - val.len()..cursor].copy_from_slice(val);
+                        self.bottom -= key.len() + val.len();
+
+                        return Ok(());
                     } else if key == k {
                         // update
-                        todo!()
+                        let gap = (key.len() + val.len()) as isize - (key_len + val_len) as isize;
+                        if ((self.bottom - self.top) as isize) < gap {
+                            return Err(());
+                        }
+
+                        // update the slot data
+                        buf[2 + (e * 8)..2 + (e * 8) + 4]
+                            .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                        buf[2 + (e * 8) + 4..2 + (e * 8) + 8]
+                            .copy_from_slice(&(val.len() as u32).to_be_bytes());
+
+                        // update and move the actual data
+                        let new_bottom = (self.bottom as isize - gap) as usize;
+                        buf.copy_within(self.bottom..cursor - (key_len + val_len), new_bottom);
+                        buf[cursor - (key.len() + val.len())..cursor - val.len()]
+                            .copy_from_slice(key);
+                        buf[cursor - val.len()..cursor].copy_from_slice(val);
+                        if let Some(s) = buf.get_mut(self.bottom..new_bottom) {
+                            s.fill(0);
+                        }
+                        self.bottom = new_bottom;
+
+                        return Ok(());
                     }
-                    cursor += key_len + val_len;
+                    cursor -= key_len + val_len;
                 }
 
                 // key is greater than anything existing, so goes at the very end
@@ -620,10 +667,49 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
                     return Err(());
                 }
 
-                todo!()
+                buf[self.top..self.top + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+                buf[self.top + 4..self.top + 8].copy_from_slice(&(val.len() as u32).to_be_bytes());
+                self.top += 8;
+                Self::set_num_entries(buf, (num_entries as u16) + 1);
+
+                buf[self.bottom - (key.len() + val.len())..self.bottom - val.len()]
+                    .copy_from_slice(key);
+                buf[self.bottom - val.len()..self.bottom].copy_from_slice(val);
+                self.bottom -= key.len() + val.len();
+
+                return Ok(());
             }
             LeafDelta::Del(key) => {
-                todo!()
+                let num_entries = Self::num_entries(buf) as usize;
+                let mut cursor = PAGE_SIZE - 9;
+                for e in 0..num_entries {
+                    let key_len =
+                        u32::from_be_bytes(buf[2 + (e * 8)..2 + (e * 8) + 4].try_into().unwrap())
+                            as usize;
+                    let val_len = u32::from_be_bytes(
+                        buf[2 + (e * 8) + 4..2 + (e * 8) + 8].try_into().unwrap(),
+                    ) as usize;
+                    let k = &buf[cursor - (key_len + val_len)..cursor - val_len];
+                    if key == k {
+                        buf.copy_within(2 + (e * 8) + 8..self.top, 2 + (e * 8));
+                        buf[self.top..self.top + 8].fill(0);
+                        Self::set_num_entries(buf, (num_entries as u16) - 1);
+                        self.top -= 8;
+
+                        buf.copy_within(
+                            self.bottom..cursor - (key_len + val_len),
+                            self.bottom + key_len + val_len,
+                        );
+                        buf[self.bottom..self.bottom + key_len + val_len].fill(0);
+                        self.bottom += key_len + val_len;
+
+                        return Ok(());
+                    }
+
+                    cursor -= key_len + val_len;
+                }
+                // we're trying to delete something that isn't in here
+                panic!()
             }
         }
     }
@@ -633,5 +719,9 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
     #[inline]
     fn num_entries(buf: &mut [u8]) -> u16 {
         u16::from_be_bytes(buf[0..2].try_into().unwrap())
+    }
+    #[inline]
+    fn set_num_entries(buf: &mut [u8], num_entries: u16) {
+        buf[0..2].copy_from_slice(&num_entries.to_be_bytes());
     }
 }
