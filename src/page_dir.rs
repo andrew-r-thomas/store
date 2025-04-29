@@ -63,7 +63,7 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
         let frame = self.get_frame(page_id as usize);
         match unsafe { &*frame.ptr.load(Ordering::Acquire) } {
             FrameInner::Mem(page_buffer) => page_buffer,
-            FrameInner::Disk(_) => todo!(),
+            // FrameInner::Disk(_) => todo!(),
             FrameInner::Free(_) => panic!(),
         }
     }
@@ -203,22 +203,22 @@ struct Frame<const PAGE_SIZE: usize> {
 }
 enum FrameInner<const PAGE_SIZE: usize> {
     Mem(PageBuffer<PAGE_SIZE>),
-    Disk(u64),
+    // Disk(u64),
     Free(PageId),
 }
 impl<const PAGE_SIZE: usize> FrameInner<PAGE_SIZE> {
-    pub fn unwrap_as_mem(&self) -> &PageBuffer<PAGE_SIZE> {
-        if let Self::Mem(buf) = self {
-            return buf;
-        }
-        panic!()
-    }
-    pub fn unwrap_as_disk(&self) -> u64 {
-        if let Self::Disk(offset) = self {
-            return *offset;
-        }
-        panic!()
-    }
+    // pub fn unwrap_as_mem(&self) -> &PageBuffer<PAGE_SIZE> {
+    //     if let Self::Mem(buf) = self {
+    //         return buf;
+    //     }
+    //     panic!()
+    // }
+    // pub fn unwrap_as_disk(&self) -> u64 {
+    //     if let Self::Disk(offset) = self {
+    //         return *offset;
+    //     }
+    //     panic!()
+    // }
     pub fn unwrap_as_free(&self) -> PageId {
         if let Self::Free(next) = self {
             return *next;

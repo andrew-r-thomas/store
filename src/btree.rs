@@ -1,4 +1,8 @@
-use crate::{PageId, buffer::PageBuffer, page_dir::PageDirectory};
+use crate::{
+    PageId,
+    buffer::{Delta, PageBuffer, WriteRes},
+    page_dir::PageDirectory,
+};
 
 use std::{
     ops::Range,
@@ -22,24 +26,50 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> BTree<BLOCK_SIZE, PAGE_SIZ
         let leaf = current.unwrap_as_leaf();
         leaf.get(key)
     }
-    pub fn set(
-        &self,
-        key: &[u8],
-        _val: &[u8],
-        path_buf: &mut Vec<(PageId, &PageBuffer<PAGE_SIZE>)>,
-    ) -> bool {
-        // traverse the tree and load up the path_buf with the path
+    pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
         let root_id = self.root_id();
-        let mut current = Page::from(self.page_dir.get(root_id));
-        while let Page::Inner(inner_page) = current {
+        let mut current = self.page_dir.get(root_id);
+
+        // TODO: figure out right way to do this, if we need references, it seems like there's
+        // gonna be a lifetime issue
+        let mut path = Vec::new();
+        path.push((root_id, current));
+
+        while let Page::Inner(inner_page) = Page::from(current) {
             let child_id = inner_page.find_child(key);
-            path_buf.push(child_id);
-            current = Page::from(self.page_dir.get(child_id));
+            current = self.page_dir.get(child_id);
+            path.push((child_id, current));
         }
 
-        todo!()
+        let delta = LeafDelta::Set { key, val };
+        match current.write_delta(&delta) {
+            WriteRes::Ok => Ok(()),
+            WriteRes::Sealed => Err(()),
+            WriteRes::Sealer(old) => {
+                // this part can get pretty hairry, so here's the basic idea
+                //
+                // first we compact the page
+                //
+                // then we try to apply the set in place to the compacted page
+                // if that works, we can just update the page dir and call it a day
+                //
+                // if it doesn't, the page needs to be split, splitting the page may cascade all
+                // the way up to the root, which is what we have path for, this section will need
+                // to be a loop (or maybe recurrsive, but i doubt it). this is the part we know the
+                // least about how it will look, so take your time, and don't be afraid to throw it
+                // away and try again
+
+                // first we compact the page
+                let old_page = LeafPage::from(old);
+                let new_buf = PageBuffer::<PAGE_SIZE>::new();
+                let mut new_page = LeafPageMut::from(new_buf);
+                new_page.compact(old_page);
+
+                Ok(())
+            }
+        }
     }
-    pub fn delete(&self, _key: &[u8]) -> bool {
+    pub fn delete(&self, _key: &[u8]) -> Result<(), ()> {
         todo!()
     }
     pub fn iter_range(&self, _range: Range<&[u8]>) {
@@ -55,6 +85,9 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> BTree<BLOCK_SIZE, PAGE_SIZ
 // ================================================================================================
 // page access types
 // ================================================================================================
+//
+// TODO: pages seem to make the most sense sorted bottom to top, still easy for reads, and makes
+// building the mutable pages much simpler, so i think we need to adjust some of the logic for that
 
 enum Page<'p> {
     Leaf(LeafPage<'p>),
@@ -70,12 +103,12 @@ impl<'p> Page<'p> {
             _ => panic!(),
         }
     }
-    fn unwrap_as_inner(self) -> InnerPage<'p> {
-        match self {
-            Page::Inner(inner) => inner,
-            _ => panic!(),
-        }
-    }
+    // fn unwrap_as_inner(self) -> InnerPage<'p> {
+    //     match self {
+    //         Page::Inner(inner) => inner,
+    //         _ => panic!(),
+    //     }
+    // }
 }
 impl<'p, const PAGE_SIZE: usize> From<&'p PageBuffer<PAGE_SIZE>> for Page<'p> {
     fn from(page_buff: &'p PageBuffer<PAGE_SIZE>) -> Self {
@@ -129,7 +162,6 @@ impl<'p> InnerPage<'p> {
                         }
                     }
                 }
-                _ => panic!(),
             }
         }
         best.unwrap().1
@@ -232,7 +264,7 @@ impl DoubleEndedIterator for InnerChunkIter<'_> {
 
 enum InnerChunk<'c> {
     Set { key: &'c [u8], left_page_id: PageId },
-    Del(&'c [u8]),
+    // Del(&'c [u8]),
     Base(InnerBase<'c>),
 }
 
@@ -290,65 +322,72 @@ impl<'p> From<&'p [u8]> for LeafPage<'p> {
 }
 impl<'p> LeafPage<'p> {
     fn get(self, target: &[u8]) -> Option<&'p [u8]> {
-        for chunk in self.iter_chunks() {
-            match chunk {
-                LeafChunk::Set { key, val } => {
+        for delta in self.iter_deltas() {
+            match delta {
+                LeafDelta::Set { key, val } => {
                     if target == key {
                         return Some(val);
                     }
                 }
-                LeafChunk::Del(key) => {
+                LeafDelta::Del(key) => {
                     if target == key {
                         return None;
                     }
                 }
-                LeafChunk::Base(leaf_base) => return leaf_base.get(target),
             }
         }
-        None
+
+        self.base().get(target)
     }
-    fn iter_chunks(self) -> LeafChunkIter<'p> {
-        self.into()
+    fn iter_deltas(&self) -> LeafDeltaIter<'p> {
+        LeafDeltaIter::from(
+            &self.buf[self.buf.len() - (9 + self.base_len() as usize)..self.buf.len() - 9],
+        )
+    }
+    fn base(&self) -> LeafBase<'p> {
+        let base_len = self.base_len() as usize;
+        LeafBase::from(&self.buf[self.buf.len() - (9 + base_len)..self.buf.len() - 9])
+    }
+    #[inline]
+    fn base_len(&self) -> u64 {
+        u64::from_be_bytes(
+            self.buf[self.buf.len() - 9..self.buf.len() - 1]
+                .try_into()
+                .unwrap(),
+        )
     }
 }
-struct LeafChunkIter<'i> {
+struct LeafDeltaIter<'i> {
     buf: &'i [u8],
     top: usize,
     bottom: usize,
 }
-impl<'i> From<LeafPage<'i>> for LeafChunkIter<'i> {
-    fn from(page: LeafPage<'i>) -> Self {
+impl<'i> From<&'i [u8]> for LeafDeltaIter<'i> {
+    fn from(buf: &'i [u8]) -> Self {
         Self {
-            buf: page.buf,
+            buf,
             top: 0,
-            bottom: page.buf.len(),
+            bottom: buf.len(),
         }
     }
 }
-impl LeafChunkIter<'_> {
+impl LeafDeltaIter<'_> {
     const BASE_ID: u8 = 0;
     const SET_ID: u8 = 1;
     const DEL_ID: u8 = 2;
 
-    fn reset(&mut self) {
-        self.top = 0;
-        self.bottom = self.buf.len();
-    }
+    // fn reset(&mut self) {
+    //     self.top = 0;
+    //     self.bottom = self.buf.len();
+    // }
 }
-impl<'i> Iterator for LeafChunkIter<'i> {
-    type Item = LeafChunk<'i>;
+impl<'i> Iterator for LeafDeltaIter<'i> {
+    type Item = LeafDelta<'i>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.top >= self.bottom {
             return None;
         }
         match self.buf[self.top] {
-            Self::BASE_ID => {
-                let out = Some(LeafChunk::Base(LeafBase::from(
-                    &self.buf[self.top + 1..self.buf.len() - 9],
-                )));
-                self.top = self.buf.len();
-                out
-            }
             Self::SET_ID => {
                 let key_len =
                     u32::from_be_bytes(self.buf[self.top + 1..self.top + 5].try_into().unwrap())
@@ -356,7 +395,7 @@ impl<'i> Iterator for LeafChunkIter<'i> {
                 let val_len =
                     u32::from_be_bytes(self.buf[self.top + 5..self.top + 9].try_into().unwrap())
                         as usize;
-                let out = Some(LeafChunk::Set {
+                let out = Some(LeafDelta::Set {
                     key: &self.buf[self.top + 9..self.top + 9 + key_len],
                     val: &self.buf[self.top + 9 + key_len..self.top + 9 + key_len + val_len],
                 });
@@ -367,7 +406,7 @@ impl<'i> Iterator for LeafChunkIter<'i> {
                 let key_len =
                     u32::from_be_bytes(self.buf[self.top + 1..self.top + 5].try_into().unwrap())
                         as usize;
-                let out = Some(LeafChunk::Del(
+                let out = Some(LeafDelta::Del(
                     &self.buf[self.top + 5..self.top + 5 + key_len],
                 ));
                 self.top += 5 + key_len + 5;
@@ -377,22 +416,10 @@ impl<'i> Iterator for LeafChunkIter<'i> {
         }
     }
 }
-impl<'i> DoubleEndedIterator for LeafChunkIter<'i> {
+impl<'i> DoubleEndedIterator for LeafDeltaIter<'i> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.top >= self.bottom {
             return None;
-        }
-        if self.bottom == self.buf.len() {
-            let base_len = u64::from_be_bytes(
-                self.buf[self.bottom - 9..self.bottom - 1]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let out = Some(LeafChunk::Base(LeafBase::from(
-                &self.buf[self.bottom - (9 + base_len)..self.bottom - 9],
-            )));
-            self.bottom -= base_len + 9 + 1;
-            return out;
         }
         match self.buf[self.bottom - 1] {
             Self::SET_ID => {
@@ -406,7 +433,7 @@ impl<'i> DoubleEndedIterator for LeafChunkIter<'i> {
                         .try_into()
                         .unwrap(),
                 ) as usize;
-                let out = Some(LeafChunk::Set {
+                let out = Some(LeafDelta::Set {
                     key: &self.buf
                         [self.bottom - (9 + key_len + val_len)..self.bottom - (9 + val_len)],
                     val: &self.buf[self.bottom - (9 + val_len)..self.bottom - 9],
@@ -420,7 +447,7 @@ impl<'i> DoubleEndedIterator for LeafChunkIter<'i> {
                         .try_into()
                         .unwrap(),
                 ) as usize;
-                let out = Some(LeafChunk::Del(
+                let out = Some(LeafDelta::Del(
                     &self.buf[self.bottom - (5 + key_len)..self.bottom - 5],
                 ));
                 self.bottom -= 5 + key_len + 5;
@@ -430,11 +457,68 @@ impl<'i> DoubleEndedIterator for LeafChunkIter<'i> {
         }
     }
 }
-enum LeafChunk<'c> {
+enum LeafDelta<'c> {
     Set { key: &'c [u8], val: &'c [u8] },
     Del(&'c [u8]),
-    Base(LeafBase<'c>),
 }
+impl Delta for LeafDelta<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Set { key, val } => key.len() + val.len() + 18,
+            Self::Del(key) => key.len() + 10,
+        }
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        assert!(self.len() == buf.len());
+        let mut cursor = 0;
+        match self {
+            Self::Set { key, val } => {
+                // top delta code
+                buf[cursor] = 1;
+                cursor += 1;
+
+                // top lengths
+                buf[cursor..cursor + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+                buf[cursor + 4..cursor + 8].copy_from_slice(&(val.len() as u32).to_be_bytes());
+                cursor += 8;
+
+                // key and val
+                buf[cursor..cursor + key.len()].copy_from_slice(key);
+                buf[cursor + key.len()..cursor + key.len() + val.len()].copy_from_slice(val);
+                cursor += key.len() + val.len();
+
+                // bottom lengths
+                buf[cursor..cursor + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+                buf[cursor + 4..cursor + 8].copy_from_slice(&(val.len() as u32).to_be_bytes());
+                cursor += 8;
+
+                // bottom delta code
+                buf[cursor] = 1;
+            }
+            Self::Del(key) => {
+                // top delta code
+                buf[cursor] = 2;
+                cursor += 1;
+
+                // top len
+                buf[cursor..cursor + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+                cursor += 4;
+
+                // key
+                buf[cursor..cursor + key.len()].copy_from_slice(key);
+                cursor += key.len();
+
+                // bottom len
+                buf[cursor..cursor + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+                cursor += 4;
+
+                // bottom delta code
+                buf[cursor] = 2;
+            }
+        }
+    }
+}
+
 struct LeafBase<'b> {
     buf: &'b [u8],
 }
@@ -467,5 +551,87 @@ impl<'b> LeafBase<'b> {
     #[inline]
     fn num_entries(&self) -> u16 {
         u16::from_be_bytes(self.buf[1..2].try_into().unwrap())
+    }
+}
+
+struct LeafPageMut<const PAGE_SIZE: usize> {
+    page: PageBuffer<PAGE_SIZE>,
+    top: usize,
+    bottom: usize,
+}
+impl<const PAGE_SIZE: usize> From<PageBuffer<PAGE_SIZE>> for LeafPageMut<PAGE_SIZE> {
+    fn from(page: PageBuffer<PAGE_SIZE>) -> Self {
+        Self {
+            page,
+            top: 2,
+            bottom: PAGE_SIZE - 9,
+        }
+    }
+}
+impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
+    fn compact(&mut self, other: LeafPage) {
+        // we should have a fresh one when we're compacting
+        assert!(self.top == 2 && self.bottom == PAGE_SIZE - 9);
+
+        let base = other.base();
+        let buf = self.page.raw_buffer();
+
+        // copy the header
+        let num_entries = base.num_entries() as usize;
+        buf[0..2 + (num_entries * 8)].copy_from_slice(&base.buf[0..2 + (num_entries * 8)]);
+        self.top = 2 + (num_entries * 8);
+
+        // copy the actual data
+        buf[self.bottom - (base.buf.len() - self.top)..self.bottom]
+            .copy_from_slice(&base.buf[self.top..]);
+        self.bottom -= base.buf.len() - self.top;
+
+        // apply the deltas in reverse order
+        for delta in other.iter_deltas().rev() {
+            self.apply_delta(delta).unwrap();
+        }
+    }
+    fn apply_delta(&mut self, delta: LeafDelta) -> Result<(), ()> {
+        let buf = self.page.raw_buffer();
+        match delta {
+            LeafDelta::Set { key, val } => {
+                let num_entries = Self::num_entries(buf) as usize;
+                let mut cursor = self.bottom;
+                for e in 0..num_entries {
+                    let key_len =
+                        u32::from_be_bytes(buf[2 + (e * 8)..2 + (e * 8) + 4].try_into().unwrap())
+                            as usize;
+                    let val_len = u32::from_be_bytes(
+                        buf[2 + (e * 8) + 4..2 + (e * 8) + 8].try_into().unwrap(),
+                    ) as usize;
+                    let k = &buf[cursor..cursor + key_len];
+                    if key < k {
+                        // insert
+                        todo!()
+                    } else if key == k {
+                        // update
+                        todo!()
+                    }
+                    cursor += key_len + val_len;
+                }
+
+                // key is greater than anything existing, so goes at the very end
+                if self.bottom - self.top < key.len() + val.len() + 8 {
+                    return Err(());
+                }
+
+                todo!()
+            }
+            LeafDelta::Del(key) => {
+                todo!()
+            }
+        }
+    }
+    fn unpack(self) -> PageBuffer<PAGE_SIZE> {
+        todo!()
+    }
+    #[inline]
+    fn num_entries(buf: &mut [u8]) -> u16 {
+        u16::from_be_bytes(buf[0..2].try_into().unwrap())
     }
 }
