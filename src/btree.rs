@@ -47,26 +47,13 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> BTree<BLOCK_SIZE, PAGE_SIZ
             WriteRes::Ok => Ok(()),
             WriteRes::Sealed => Err(()),
             WriteRes::Sealer(old) => {
-                // this part can get pretty hairry, so here's the basic idea
-                //
-                // first we compact the page
-                //
-                // then we try to apply the set in place to the compacted page
-                // if that works, we can just update the page dir and call it a day
-                //
-                // if it doesn't, the page needs to be split, splitting the page may cascade all
-                // the way up to the root, which is what we have path for, this section will need
-                // to be a loop (or maybe recurrsive, but i doubt it). this is the part we know the
-                // least about how it will look, so take your time, and don't be afraid to throw it
-                // away and try again
-
                 // first we compact the page
                 let old_page = LeafPage::from(old);
                 let new_buf = PageBuffer::<PAGE_SIZE>::new();
                 let mut new_page = LeafPageMut::from(new_buf);
                 new_page.compact(old_page);
 
-                if let Err(()) = new_page.apply_delta(delta) {
+                if let Err(()) = new_page.apply_delta(&delta) {
                     // we need to do a split
                     let mut to_page = LeafPageMut::from(PageBuffer::<PAGE_SIZE>::new());
                     let to_page_id = self.page_dir.pop_free();
@@ -74,9 +61,15 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> BTree<BLOCK_SIZE, PAGE_SIZ
                     let mut middle_key = Vec::new();
                     new_page.split_into(&mut to_page, &mut middle_key);
 
+                    if key <= &middle_key {
+                        to_page.apply_delta(&delta).unwrap();
+                    } else {
+                        new_page.apply_delta(&delta).unwrap();
+                    }
+
                     let new_buf = new_page.unpack();
-                    self.page_dir.set(leaf_id, new_buf);
                     let to_buf = to_page.unpack();
+                    self.page_dir.set(leaf_id, new_buf);
                     self.page_dir.set(to_page_id, to_buf);
 
                     let mut delta = InnerDelta::Set {
@@ -86,7 +79,7 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> BTree<BLOCK_SIZE, PAGE_SIZ
 
                     'split: loop {
                         match path.pop() {
-                            Some((_parent_id, parent)) => 'attempt: loop {
+                            Some((parent_id, parent)) => 'attempt: loop {
                                 match parent.write_delta(&delta) {
                                     WriteRes::Ok => break 'split,
                                     WriteRes::Sealed => continue 'attempt,
@@ -95,15 +88,39 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> BTree<BLOCK_SIZE, PAGE_SIZ
                                         let mut new_parent =
                                             InnerPageMut::from(PageBuffer::<PAGE_SIZE>::new());
                                         new_parent.compact(old_parent);
-                                        if let Err(()) = new_parent.apply_delta(delta) {
-                                            todo!()
+                                        if let Err(()) = new_parent.apply_delta(&delta) {
+                                            let mut to_parent =
+                                                InnerPageMut::from(PageBuffer::<PAGE_SIZE>::new());
+                                            let to_parent_id = self.page_dir.pop_free();
+                                            middle_key.clear();
+                                            new_parent.split_into(&mut to_parent, &mut middle_key);
+                                            delta = InnerDelta::Set {
+                                                key: &middle_key,
+                                                left_page_id: to_parent_id,
+                                            };
+                                            let new_parent_buf = new_parent.unpack();
+                                            let to_parent_buf = to_parent.unpack();
+                                            self.page_dir.set(parent_id, new_parent_buf);
+                                            self.page_dir.set(to_parent_id, to_parent_buf);
+                                            continue 'split;
                                         } else {
-                                            todo!()
+                                            let new_parent_buf = new_parent.unpack();
+                                            self.page_dir.set(parent_id, new_parent_buf);
+                                            break 'split;
                                         }
                                     }
                                 }
                             },
-                            None => todo!("we split the root"),
+                            None => {
+                                // we split the root
+                                let new_root_id = self.page_dir.pop_free();
+                                let mut new_root =
+                                    InnerPageMut::from(PageBuffer::<PAGE_SIZE>::new());
+                                new_root.apply_delta(&delta).unwrap();
+                                new_root.set_right_page_id(leaf_id);
+                                self.page_dir.set(new_root_id, new_root.unpack());
+                                self.root.store(new_root_id, Ordering::Release);
+                            }
                         }
                     }
                 } else {
@@ -397,17 +414,126 @@ impl<const PAGE_SIZE: usize> From<PageBuffer<PAGE_SIZE>> for InnerPageMut<PAGE_S
     }
 }
 impl<const PAGE_SIZE: usize> InnerPageMut<PAGE_SIZE> {
-    fn compact(&mut self, _other: InnerPage) {
-        todo!()
+    fn compact(&mut self, other: InnerPage) {
+        assert!(self.top == 2 && self.bottom == PAGE_SIZE - 9);
+
+        let base = other.base();
+        let buf = self.page.raw_buffer();
+        let num_entries = base.num_entries() as usize;
+
+        // copy the header
+        buf[0..2 + 8 + (12 * num_entries)]
+            .copy_from_slice(&base.buf[0..2 + 8 + (12 * num_entries)]);
+        self.top = 2 + 8 + (12 * num_entries);
+
+        // copy the keys
+        let keys = &base.buf[2 + 8 + (12 * num_entries)..];
+        buf[self.bottom - keys.len()..self.bottom].copy_from_slice(keys);
+        self.bottom -= keys.len();
+
+        for delta in other.iter_deltas().rev() {
+            self.apply_delta(&delta).unwrap();
+        }
     }
-    fn apply_delta(&mut self, _delta: InnerDelta) -> Result<(), ()> {
-        todo!()
+    fn apply_delta(&mut self, delta: &InnerDelta) -> Result<(), ()> {
+        let buf = self.page.raw_buffer();
+        match delta {
+            InnerDelta::Set { key, left_page_id } => {
+                // NOTE: pretty sure we never do an update, only insert, and the inserts should be
+                // in the middle of the keys, never at the end, so that should make things simpler
+                if self.bottom - self.top < key.len() + 12 {
+                    return Err(());
+                }
+
+                let num_entries = u16::from_be_bytes(buf[0..2].try_into().unwrap()) as usize;
+                let mut cursor = PAGE_SIZE - 9;
+                for e in 0..num_entries {
+                    let key_len = u32::from_be_bytes(
+                        buf[10 + (e * 12)..10 + (e * 12) + 4].try_into().unwrap(),
+                    ) as usize;
+                    if *key <= &buf[cursor - key_len..cursor] {
+                        buf.copy_within(10 + (e * 12)..self.top, 10 + (e * 12) + 12);
+                        buf[10 + (e * 12)..10 + (e * 12) + 4]
+                            .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                        buf[10 + (e * 12) + 4..10 + (e * 12) + 12]
+                            .copy_from_slice(&left_page_id.to_be_bytes());
+                        self.top += 12;
+
+                        buf.copy_within(self.bottom..cursor, self.bottom - key.len());
+                        buf[cursor - key.len()..cursor].copy_from_slice(key);
+                        self.bottom -= key.len();
+                        buf[0..2].copy_from_slice(&((num_entries + 1) as u16).to_be_bytes());
+                        return Ok(());
+                    }
+                    cursor -= key_len;
+                }
+                // add it to the end
+                buf[self.top..self.top + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
+                buf[self.top + 4..self.top + 12].copy_from_slice(&left_page_id.to_be_bytes());
+                self.top += 12;
+
+                buf[self.bottom - key.len()..self.bottom].copy_from_slice(key);
+                self.bottom -= key.len();
+
+                buf[0..2].copy_from_slice(&((num_entries + 1) as u16).to_be_bytes());
+                return Ok(());
+            }
+        }
     }
-    fn split_into(&mut self, _other: &mut Self, _out: &mut Vec<u8>) {
-        todo!()
+    fn split_into(&mut self, other: &mut Self, out: &mut Vec<u8>) {
+        let buf = self.page.raw_buffer();
+        let num_entries = u16::from_be_bytes(buf[0..2].try_into().unwrap()) as usize;
+        let middle_entry = num_entries / 2;
+
+        let mut cursor = PAGE_SIZE - 9;
+        for e in 0..middle_entry {
+            let key_len =
+                u32::from_be_bytes(buf[10 + (e * 12)..10 + (e * 12) + 4].try_into().unwrap())
+                    as usize;
+            let left_page_id = u64::from_be_bytes(
+                buf[10 + (e * 12) + 4..10 + (e * 12) + 12]
+                    .try_into()
+                    .unwrap(),
+            );
+            let key = &buf[cursor - key_len..cursor];
+            let delta = InnerDelta::Set { key, left_page_id };
+            other.apply_delta(&delta).unwrap();
+            cursor -= key_len;
+        }
+
+        let middle_key_len = u32::from_be_bytes(
+            buf[10 + (middle_entry * 12)..10 + (middle_entry * 12) + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let middle_left_page_id = u64::from_be_bytes(
+            buf[10 + (middle_entry * 12) + 4..10 + (middle_entry * 12) + 12]
+                .try_into()
+                .unwrap(),
+        );
+        let middle_key = &buf[cursor - middle_key_len..cursor];
+        out.extend(middle_key);
+        buf[2..10].copy_from_slice(&middle_left_page_id.to_be_bytes());
+
+        buf.copy_within(10 + (middle_entry * 12) + 12..self.top, 10);
+        self.top -= (middle_entry * 12) + 12;
+        buf.copy_within(
+            self.bottom..cursor - middle_key_len,
+            (PAGE_SIZE - 9) - ((cursor - middle_key_len) - self.bottom),
+        );
+        self.bottom = (PAGE_SIZE - 9) - ((cursor - middle_key_len) - self.bottom);
     }
-    fn unpack(self) -> PageBuffer<PAGE_SIZE> {
-        todo!()
+    fn unpack(mut self) -> PageBuffer<PAGE_SIZE> {
+        let buf = self.page.raw_buffer();
+        buf.copy_within(0..self.top, self.bottom - self.top);
+        let len = (self.top + (PAGE_SIZE - (9 + self.bottom))) as u64;
+        buf[PAGE_SIZE - 9..PAGE_SIZE - 1].copy_from_slice(&len.to_be_bytes());
+        self.page.set_top(self.bottom - self.top);
+        self.page
+    }
+    fn set_right_page_id(&mut self, page_id: PageId) {
+        let buf = self.page.raw_buffer();
+        buf[2..10].copy_from_slice(&page_id.to_be_bytes());
     }
 }
 
@@ -690,10 +816,10 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
 
         // apply the deltas in reverse order
         for delta in other.iter_deltas().rev() {
-            self.apply_delta(delta).unwrap();
+            self.apply_delta(&delta).unwrap();
         }
     }
-    fn apply_delta(&mut self, delta: LeafDelta) -> Result<(), ()> {
+    fn apply_delta(&mut self, delta: &LeafDelta) -> Result<(), ()> {
         let buf = self.page.raw_buffer();
         match delta {
             LeafDelta::Set { key, val } => {
@@ -707,7 +833,7 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
                         buf[2 + (e * 8) + 4..2 + (e * 8) + 8].try_into().unwrap(),
                     ) as usize;
                     let k = &buf[cursor - (key_len + val_len)..cursor - val_len];
-                    if key < k {
+                    if *key < k {
                         // insert
 
                         // check if we have room
@@ -735,7 +861,7 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
                         self.bottom -= key.len() + val.len();
 
                         return Ok(());
-                    } else if key == k {
+                    } else if *key == k {
                         // update
                         let gap = (key.len() + val.len()) as isize - (key_len + val_len) as isize;
                         if ((self.bottom - self.top) as isize) < gap {
@@ -792,7 +918,7 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
                         buf[2 + (e * 8) + 4..2 + (e * 8) + 8].try_into().unwrap(),
                     ) as usize;
                     let k = &buf[cursor - (key_len + val_len)..cursor - val_len];
-                    if key == k {
+                    if *key == k {
                         buf.copy_within(2 + (e * 8) + 8..self.top, 2 + (e * 8));
                         buf[self.top..self.top + 8].fill(0);
                         Self::set_num_entries(buf, (num_entries as u16) - 1);
@@ -835,7 +961,7 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
                 key: &buf[cursor - (key_len + val_len)..cursor - val_len],
                 val: &buf[cursor - val_len..cursor],
             };
-            other.apply_delta(delta).unwrap();
+            other.apply_delta(&delta).unwrap();
             cursor -= key_len + val_len;
         }
 
@@ -853,7 +979,7 @@ impl<const PAGE_SIZE: usize> LeafPageMut<PAGE_SIZE> {
             key: &buf[cursor - (key_len + val_len)..cursor - val_len],
             val: &buf[cursor - val_len..cursor],
         };
-        other.apply_delta(delta).unwrap();
+        other.apply_delta(&delta).unwrap();
         cursor -= key_len + val_len;
         out.extend(&buf[cursor - (key_len + val_len)..cursor - val_len]);
 
