@@ -1,5 +1,6 @@
 use std::{
     alloc::{Layout, alloc_zeroed, handle_alloc_error},
+    ops::Range,
     slice,
     sync::atomic::{AtomicIsize, AtomicUsize, Ordering},
 };
@@ -105,9 +106,14 @@ pub enum Page<'p> {
     Inner(InnerPage<'p>),
 }
 impl<'p> Page<'p> {
+    // footer ids
     const LEAF_ID: u8 = 0;
     const INNER_ID: u8 = 1;
-    const FOOTER_SIZE: usize = 9;
+
+    // sizes
+    const BASE_LEN_SIZE: usize = 8;
+    const ID_SIZE: usize = 1;
+    const FOOTER_SIZE: usize = Self::BASE_LEN_SIZE + Self::ID_SIZE;
 
     pub fn unwrap_as_leaf(self) -> LeafPage<'p> {
         match self {
@@ -125,14 +131,18 @@ impl<'p> Page<'p> {
 impl<'p> From<&'p [u8]> for Page<'p> {
     fn from(buf: &'p [u8]) -> Self {
         let base_len = u64::from_be_bytes(
-            buf[buf.len() - Self::FOOTER_SIZE..buf.len() - 1]
+            buf[buf.len() - Self::FOOTER_SIZE..buf.len() - Self::ID_SIZE]
                 .try_into()
                 .unwrap(),
         ) as usize;
+
         match *buf.last().unwrap() {
-            Self::LEAF_ID => Self::Leaf(LeafPage::from(&buf[0..buf.len() - Self::FOOTER_SIZE])),
+            Self::LEAF_ID => Self::Leaf(LeafPage::from((
+                &buf[..buf.len() - Self::FOOTER_SIZE],
+                base_len,
+            ))),
             Self::INNER_ID => Self::Inner(InnerPage::from((
-                &buf[0..buf.len() - Self::FOOTER_SIZE],
+                &buf[..buf.len() - Self::FOOTER_SIZE],
                 base_len,
             ))),
             _ => panic!(),
@@ -198,9 +208,6 @@ struct InnerDeltaIter<'i> {
     top: usize,
     bottom: usize,
 }
-impl InnerDeltaIter<'_> {
-    const SET_ID: u8 = 1;
-}
 impl<'i> From<&'i [u8]> for InnerDeltaIter<'i> {
     fn from(buf: &'i [u8]) -> Self {
         Self {
@@ -216,24 +223,9 @@ impl<'i> Iterator for InnerDeltaIter<'i> {
         if self.top >= self.bottom {
             return None;
         }
-        match self.buf[self.top] {
-            Self::SET_ID => {
-                let key_len =
-                    u32::from_be_bytes(self.buf[self.top + 1..self.top + 5].try_into().unwrap())
-                        as usize;
-                let out = Some(InnerDelta::Set {
-                    key: &self.buf[self.top + 5..self.top + 5 + key_len],
-                    left_page_id: u64::from_be_bytes(
-                        self.buf[self.top + 5 + key_len..self.top + 5 + key_len + 8]
-                            .try_into()
-                            .unwrap(),
-                    ),
-                });
-                self.top += 5 + key_len + 8 + 5;
-                out
-            }
-            _ => panic!(),
-        }
+        let delta = InnerDelta::from_top(&self.buf[self.top..]);
+        self.top += delta.len();
+        Some(delta)
     }
 }
 impl DoubleEndedIterator for InnerDeltaIter<'_> {
@@ -241,37 +233,85 @@ impl DoubleEndedIterator for InnerDeltaIter<'_> {
         if self.top >= self.bottom {
             return None;
         }
-        match self.buf[self.bottom - 1] {
+        let delta = InnerDelta::from_bottom(&self.buf[..self.bottom]);
+        self.bottom -= delta.len();
+        Some(delta)
+    }
+}
+
+pub enum InnerDelta<'d> {
+    Set { key: &'d [u8], left_page_id: PageId },
+    // Del(&'c [u8]),
+}
+impl<'d> InnerDelta<'d> {
+    const SET_ID: u8 = 1;
+
+    const ID_SIZE: usize = 1;
+    const KEY_LEN_SIZE: usize = 4;
+    const LEFT_PAGE_ID_SIZE: usize = 8;
+
+    fn from_top(buf: &'d [u8]) -> Self {
+        let mut cursor = 0;
+        match buf[cursor] {
             Self::SET_ID => {
+                cursor += Self::ID_SIZE;
+
                 let key_len = u32::from_be_bytes(
-                    self.buf[self.bottom - 5..self.bottom - 1]
+                    buf[cursor..cursor + Self::KEY_LEN_SIZE].try_into().unwrap(),
+                ) as usize;
+                cursor += Self::KEY_LEN_SIZE;
+
+                let left_page_id = u64::from_be_bytes(
+                    buf[cursor..cursor + Self::LEFT_PAGE_ID_SIZE]
                         .try_into()
                         .unwrap(),
+                );
+                cursor += Self::LEFT_PAGE_ID_SIZE;
+
+                let key = &buf[cursor..cursor + key_len];
+
+                Self::Set { key, left_page_id }
+            }
+            _ => panic!(),
+        }
+    }
+    fn from_bottom(buf: &'d [u8]) -> Self {
+        let mut cursor = buf.len();
+        match buf[cursor - Self::ID_SIZE] {
+            Self::SET_ID => {
+                cursor -= Self::ID_SIZE;
+
+                let key_len = u32::from_be_bytes(
+                    buf[cursor - Self::KEY_LEN_SIZE..cursor].try_into().unwrap(),
                 ) as usize;
-                let out = Some(InnerDelta::Set {
-                    key: &self.buf[self.bottom - (key_len + 8 + 5)..self.bottom - (8 + 5)],
-                    left_page_id: u64::from_be_bytes(
-                        self.buf[self.bottom - (8 + 5)..self.bottom - 5]
-                            .try_into()
-                            .unwrap(),
-                    ),
-                });
-                self.bottom -= 5 + key_len + 8 + 5;
-                out
+                cursor -= Self::KEY_LEN_SIZE;
+
+                let key = &buf[cursor - key_len..cursor];
+                cursor -= key_len;
+
+                let left_page_id = u64::from_be_bytes(
+                    buf[cursor - Self::LEFT_PAGE_ID_SIZE..cursor]
+                        .try_into()
+                        .unwrap(),
+                );
+
+                Self::Set { key, left_page_id }
             }
             _ => panic!(),
         }
     }
 }
-
-pub enum InnerDelta<'c> {
-    Set { key: &'c [u8], left_page_id: PageId },
-    // Del(&'c [u8]),
-}
 impl Delta for InnerDelta<'_> {
     fn len(&self) -> usize {
         match self {
-            Self::Set { key, .. } => 5 + 8 + key.len() + 5,
+            Self::Set { key, .. } => {
+                Self::ID_SIZE
+                    + Self::KEY_LEN_SIZE
+                    + Self::LEFT_PAGE_ID_SIZE
+                    + key.len()
+                    + Self::KEY_LEN_SIZE
+                    + Self::ID_SIZE
+            }
         }
     }
     fn write_to_buf(&self, buf: &mut [u8]) {
@@ -281,22 +321,23 @@ impl Delta for InnerDelta<'_> {
                 let key_len = &(key.len() as u32).to_be_bytes();
                 let mut cursor = 0;
 
-                buf[cursor] = 1;
-                cursor += 1;
+                buf[cursor] = Self::SET_ID;
+                cursor += Self::ID_SIZE;
 
-                buf[cursor..cursor + 4].copy_from_slice(key_len);
-                cursor += 4;
+                buf[cursor..cursor + Self::KEY_LEN_SIZE].copy_from_slice(key_len);
+                cursor += Self::KEY_LEN_SIZE;
 
-                buf[cursor..cursor + 8].copy_from_slice(&left_page_id.to_be_bytes());
-                cursor += 8;
+                buf[cursor..cursor + Self::LEFT_PAGE_ID_SIZE]
+                    .copy_from_slice(&left_page_id.to_be_bytes());
+                cursor += Self::LEFT_PAGE_ID_SIZE;
 
                 buf[cursor..cursor + key.len()].copy_from_slice(key);
                 cursor += key.len();
 
-                buf[cursor..cursor + 4].copy_from_slice(key_len);
-                cursor += 4;
+                buf[cursor..cursor + Self::KEY_LEN_SIZE].copy_from_slice(key_len);
+                cursor += Self::KEY_LEN_SIZE;
 
-                buf[cursor] = 1;
+                buf[cursor] = Self::SET_ID;
             }
         }
     }
@@ -311,81 +352,117 @@ impl<'b> From<&'b [u8]> for InnerBase<'b> {
     }
 }
 impl<'b> InnerBase<'b> {
+    const NUM_ENTRIES: Range<usize> = 0..2;
+    const RIGHT_PAGE_ID: Range<usize> = 2..10;
+    const SLOTS_START: usize = 10;
+
+    const KEY_LEN_SIZE: usize = 4;
+    const LEFT_PAGE_ID_SIZE: usize = 8;
+    const SLOT_SIZE: usize = Self::KEY_LEN_SIZE + Self::LEFT_PAGE_ID_SIZE;
+
     fn find_child(self, target: &'b [u8]) -> (&'b [u8], PageId) {
         let num_entries = self.num_entries() as usize;
-        let mut cursor = (12 * num_entries) + 10;
+
+        let mut data_cursor = self.buf.len();
         for e in 0..num_entries {
+            let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
+            let key_len_end = key_len_start + Self::KEY_LEN_SIZE;
             let key_len =
-                u32::from_be_bytes(self.buf[10 + (e * 4)..10 + (e * 4) + 4].try_into().unwrap())
+                u32::from_be_bytes(self.buf[key_len_start..key_len_end].try_into().unwrap())
                     as usize;
-            let key = &self.buf[cursor..cursor + key_len];
+
+            let key = &self.buf[data_cursor - key_len..data_cursor];
+            data_cursor -= key_len;
+
             if target <= key {
-                let left_start = 10 + (num_entries * 4) + (e * 8);
-                let left_end = left_start + 8;
-                let left = u64::from_be_bytes(self.buf[left_start..left_end].try_into().unwrap());
+                let left_page_id_start = key_len_end;
+                let left_page_id_end = left_page_id_start + Self::LEFT_PAGE_ID_SIZE;
+                let left = u64::from_be_bytes(
+                    self.buf[left_page_id_start..left_page_id_end]
+                        .try_into()
+                        .unwrap(),
+                );
                 return (key, left);
             }
-            cursor += key_len;
         }
 
         // NOTE: returning target (or anything for the key) is a bit meaningless here, but at least
         // right now it doesn't seem like it'll mess anything up, but keep and eye out
         (target, self.right_page_id())
     }
+
     #[inline]
     fn num_entries(&self) -> u16 {
-        u16::from_be_bytes(self.buf[0..2].try_into().unwrap())
+        u16::from_be_bytes(self.buf[Self::NUM_ENTRIES].try_into().unwrap())
     }
     #[inline]
     fn right_page_id(&self) -> PageId {
-        u64::from_be_bytes(self.buf[2..10].try_into().unwrap())
+        u64::from_be_bytes(self.buf[Self::RIGHT_PAGE_ID].try_into().unwrap())
+    }
+
+    fn header(&self) -> &[u8] {
+        &self.buf[..Self::SLOTS_START + (Self::SLOT_SIZE * self.num_entries() as usize)]
+    }
+    fn keys(&self) -> &[u8] {
+        &self.buf[Self::SLOTS_START + (Self::SLOT_SIZE * self.num_entries() as usize)..]
     }
 }
 
 pub struct InnerPageMut<'p> {
     buf: &'p mut [u8],
-    top: usize,
     bottom: usize,
 }
 impl<'p> From<&'p mut [u8]> for InnerPageMut<'p> {
     fn from(buf: &'p mut [u8]) -> Self {
+        *buf.last_mut().unwrap() = Self::ID;
         Self {
-            bottom: buf.len() - 9,
-            top: 2,
+            bottom: buf.len() - Self::FOOTER_SIZE,
             buf,
         }
     }
 }
 impl InnerPageMut<'_> {
+    const ID: u8 = 1;
+    const NUM_ENTRIES: Range<usize> = 0..2;
+    const RIGHT_PAGE_ID: Range<usize> = 2..10;
+    const SLOTS_START: usize = 10;
+
+    const FOOTER_SIZE: usize = 9;
+    const KEY_LEN_SIZE: usize = 4;
+    const LEFT_PAGE_ID_SIZE: usize = 8;
+    const SLOT_SIZE: usize = Self::KEY_LEN_SIZE + Self::LEFT_PAGE_ID_SIZE;
+
+    /// NOTE: this fn is temporary until [`crate::pool::Pool`] is finished
     pub fn new(len: usize) -> Self {
         let layout = Layout::array::<u8>(len).unwrap();
+
         let ptr = unsafe { alloc_zeroed(layout) };
         if ptr.is_null() {
             handle_alloc_error(layout)
         }
+
         let buf = unsafe { slice::from_raw_parts_mut(ptr, len) };
+        *buf.last_mut().unwrap() = Self::ID;
+
         Self {
             buf,
-            bottom: len - 9,
-            top: 2,
+            bottom: len - Self::FOOTER_SIZE,
         }
     }
-    pub fn compact(&mut self, other: InnerPage) {
-        assert!(self.top == 2 && self.bottom == self.buf.len() - 9);
 
+    /// NOTE: this should only be called on an empty fresh [`InnerPageMut`]
+    pub fn compact(&mut self, other: InnerPage) {
         let base = other.base();
-        let num_entries = base.num_entries() as usize;
 
         // copy the header
-        self.buf[0..2 + 8 + (12 * num_entries)]
-            .copy_from_slice(&base.buf[0..2 + 8 + (12 * num_entries)]);
-        self.top = 2 + 8 + (12 * num_entries);
+        let base_header = base.header();
+        self.buf[..base_header.len()].copy_from_slice(base_header);
 
         // copy the keys
-        let keys = &base.buf[2 + 8 + (12 * num_entries)..];
-        self.buf[self.bottom - keys.len()..self.bottom].copy_from_slice(keys);
-        self.bottom -= keys.len();
+        let keys = base.keys();
+        self.buf[Self::FOOTER_SIZE - keys.len()..Self::FOOTER_SIZE].copy_from_slice(keys);
 
+        // apply the deltas
         for delta in other.iter_deltas().rev() {
             self.apply_delta(&delta).unwrap();
         }
@@ -393,105 +470,133 @@ impl InnerPageMut<'_> {
     pub fn apply_delta(&mut self, delta: &InnerDelta) -> Result<(), ()> {
         match delta {
             InnerDelta::Set { key, left_page_id } => {
-                // NOTE: pretty sure we never do an update, only insert, and the inserts should be
-                // in the middle of the keys, never at the end, so that should make things simpler
-                if self.bottom - self.top < key.len() + 12 {
+                let num_entries = self.num_entries() as usize;
+                let top = Self::SLOTS_START + (num_entries * Self::SLOT_SIZE);
+                if self.bottom - top < Self::SLOT_SIZE + key.len() {
                     return Err(());
                 }
+                let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
 
-                let num_entries = u16::from_be_bytes(self.buf[0..2].try_into().unwrap()) as usize;
-                let mut cursor = self.buf.len() - 9;
                 for e in 0..num_entries {
+                    let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
+                    let key_len_end = key_len_start + Self::KEY_LEN_SIZE;
                     let key_len = u32::from_be_bytes(
-                        self.buf[10 + (e * 12)..10 + (e * 12) + 4]
-                            .try_into()
-                            .unwrap(),
+                        self.buf[key_len_start..key_len_end].try_into().unwrap(),
                     ) as usize;
-                    if *key <= &self.buf[cursor - key_len..cursor] {
-                        self.buf
-                            .copy_within(10 + (e * 12)..self.top, 10 + (e * 12) + 12);
-                        self.buf[10 + (e * 12)..10 + (e * 12) + 4]
-                            .copy_from_slice(&(key.len() as u32).to_be_bytes());
-                        self.buf[10 + (e * 12) + 4..10 + (e * 12) + 12]
-                            .copy_from_slice(&left_page_id.to_be_bytes());
-                        self.top += 12;
 
+                    if *key <= &self.buf[cursor - key_len..cursor] {
+                        // insert the new slot
+                        self.buf
+                            .copy_within(key_len_start..top, key_len_start + Self::SLOT_SIZE);
+                        self.buf[key_len_start..key_len_end]
+                            .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                        self.buf[key_len_end..key_len_end + Self::LEFT_PAGE_ID_SIZE]
+                            .copy_from_slice(&left_page_id.to_be_bytes());
+                        self.set_num_entries((num_entries + 1) as u16);
+
+                        // insert the new key
                         self.buf
                             .copy_within(self.bottom..cursor, self.bottom - key.len());
                         self.buf[cursor - key.len()..cursor].copy_from_slice(key);
                         self.bottom -= key.len();
-                        self.buf[0..2].copy_from_slice(&((num_entries + 1) as u16).to_be_bytes());
                         return Ok(());
                     }
+
                     cursor -= key_len;
                 }
-                // add it to the end
-                self.buf[self.top..self.top + 4].copy_from_slice(&(key.len() as u32).to_be_bytes());
-                self.buf[self.top + 4..self.top + 12].copy_from_slice(&left_page_id.to_be_bytes());
-                self.top += 12;
+
+                // none of the existing keys were >= to key, so we need to add it at the end
+                self.buf[top..top + Self::KEY_LEN_SIZE]
+                    .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                self.buf[top + Self::KEY_LEN_SIZE..top + Self::SLOT_SIZE]
+                    .copy_from_slice(&left_page_id.to_be_bytes());
+                self.set_num_entries((num_entries + 1) as u16);
 
                 self.buf[self.bottom - key.len()..self.bottom].copy_from_slice(key);
                 self.bottom -= key.len();
 
-                self.buf[0..2].copy_from_slice(&((num_entries + 1) as u16).to_be_bytes());
                 return Ok(());
             }
         }
     }
     pub fn split_into(&mut self, other: &mut Self, out: &mut Vec<u8>) {
-        let num_entries = u16::from_be_bytes(self.buf[0..2].try_into().unwrap()) as usize;
+        let num_entries = self.num_entries() as usize;
         let middle_entry = num_entries / 2;
+        let top = Self::SLOTS_START + (num_entries * Self::SLOT_SIZE);
 
-        let mut cursor = self.buf.len() - 9;
+        let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
         for e in 0..middle_entry {
-            let key_len = u32::from_be_bytes(
-                self.buf[10 + (e * 12)..10 + (e * 12) + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
+            let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
+            let key_len_end = key_len_start + Self::KEY_LEN_SIZE;
+            let key_len =
+                u32::from_be_bytes(self.buf[key_len_start..key_len_end].try_into().unwrap())
+                    as usize;
+
             let left_page_id = u64::from_be_bytes(
-                self.buf[10 + (e * 12) + 4..10 + (e * 12) + 12]
+                self.buf[key_len_end..key_len_end + Self::LEFT_PAGE_ID_SIZE]
                     .try_into()
                     .unwrap(),
             );
+
             let key = &self.buf[cursor - key_len..cursor];
+
             let delta = InnerDelta::Set { key, left_page_id };
             other.apply_delta(&delta).unwrap();
+
             cursor -= key_len;
         }
 
-        let middle_key_len = u32::from_be_bytes(
-            self.buf[10 + (middle_entry * 12)..10 + (middle_entry * 12) + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let key_len_start = Self::SLOTS_START + (middle_entry * Self::SLOT_SIZE);
+        let key_len_end = key_len_start + Self::KEY_LEN_SIZE;
+        let middle_key_len =
+            u32::from_be_bytes(self.buf[key_len_start..key_len_end].try_into().unwrap()) as usize;
+
         let middle_left_page_id = u64::from_be_bytes(
-            self.buf[10 + (middle_entry * 12) + 4..10 + (middle_entry * 12) + 12]
+            self.buf[key_len_end..key_len_end + Self::LEFT_PAGE_ID_SIZE]
                 .try_into()
                 .unwrap(),
         );
+        self.set_right_page_id(middle_left_page_id);
+
         let middle_key = &self.buf[cursor - middle_key_len..cursor];
         out.extend(middle_key);
-        self.buf[2..10].copy_from_slice(&middle_left_page_id.to_be_bytes());
 
-        self.buf
-            .copy_within(10 + (middle_entry * 12) + 12..self.top, 10);
-        self.top -= (middle_entry * 12) + 12;
         self.buf.copy_within(
-            self.bottom..cursor - middle_key_len,
-            (self.buf.len() - 9) - ((cursor - middle_key_len) - self.bottom),
+            key_len_end + Self::LEFT_PAGE_ID_SIZE..top,
+            Self::SLOTS_START,
         );
-        self.bottom = (self.buf.len() - 9) - ((cursor - middle_key_len) - self.bottom);
+        self.set_num_entries((num_entries - (middle_entry + 1)) as u16);
+
+        let new_keys_range = self.bottom..cursor - middle_key_len;
+        self.buf.copy_within(
+            new_keys_range.clone(),
+            Self::FOOTER_SIZE - new_keys_range.len(),
+        );
+        self.bottom = Self::FOOTER_SIZE - new_keys_range.len();
     }
     pub fn unpack<const PAGE_SIZE: usize>(self) -> PageBuffer<PAGE_SIZE> {
         assert!(self.buf.len() == PAGE_SIZE);
-        self.buf.copy_within(0..self.top, self.bottom - self.top);
-        let len = (self.top + (PAGE_SIZE - (9 + self.bottom))) as u64;
-        self.buf[PAGE_SIZE - 9..PAGE_SIZE - 1].copy_from_slice(&len.to_be_bytes());
-        PageBuffer::from_raw_buffer(self.buf, self.bottom - self.top)
+
+        let top = Self::SLOTS_START + (self.num_entries() as usize * Self::SLOT_SIZE);
+        self.buf.copy_within(..top, self.bottom - top);
+
+        let base_len = (PAGE_SIZE - (self.bottom - top)) - Self::FOOTER_SIZE;
+        self.buf[PAGE_SIZE - Self::FOOTER_SIZE..PAGE_SIZE - 1]
+            .copy_from_slice(&(base_len as u64).to_be_bytes());
+
+        PageBuffer::from_raw_buffer(self.buf, self.bottom - top)
     }
     pub fn set_right_page_id(&mut self, page_id: PageId) {
-        self.buf[2..10].copy_from_slice(&page_id.to_be_bytes());
+        self.buf[Self::RIGHT_PAGE_ID].copy_from_slice(&page_id.to_be_bytes());
+    }
+
+    #[inline]
+    fn num_entries(&self) -> u16 {
+        u16::from_be_bytes(self.buf[Self::NUM_ENTRIES].try_into().unwrap())
+    }
+    #[inline]
+    fn set_num_entries(&mut self, num_entries: u16) {
+        self.buf[Self::NUM_ENTRIES].copy_from_slice(&num_entries.to_be_bytes());
     }
 }
 
@@ -501,10 +606,11 @@ impl InnerPageMut<'_> {
 
 pub struct LeafPage<'p> {
     buf: &'p [u8],
+    base_len: usize,
 }
-impl<'p> From<&'p [u8]> for LeafPage<'p> {
-    fn from(buf: &'p [u8]) -> Self {
-        Self { buf }
+impl<'p> From<(&'p [u8], usize)> for LeafPage<'p> {
+    fn from((buf, base_len): (&'p [u8], usize)) -> Self {
+        Self { buf, base_len }
     }
 }
 impl<'p> LeafPage<'p> {
@@ -527,21 +633,10 @@ impl<'p> LeafPage<'p> {
         self.base().get(target)
     }
     fn iter_deltas(&self) -> LeafDeltaIter<'p> {
-        LeafDeltaIter::from(
-            &self.buf[self.buf.len() - (9 + self.base_len() as usize)..self.buf.len() - 9],
-        )
+        LeafDeltaIter::from(&self.buf[..self.buf.len() - self.base_len])
     }
     fn base(&self) -> LeafBase<'p> {
-        let base_len = self.base_len() as usize;
-        LeafBase::from(&self.buf[self.buf.len() - (9 + base_len)..self.buf.len() - 9])
-    }
-    #[inline]
-    fn base_len(&self) -> u64 {
-        u64::from_be_bytes(
-            self.buf[self.buf.len() - 9..self.buf.len() - 1]
-                .try_into()
-                .unwrap(),
-        )
+        LeafBase::from(&self.buf[self.buf.len() - self.base_len..])
     }
 }
 struct LeafDeltaIter<'i> {
