@@ -14,7 +14,7 @@ use std::{
     },
 };
 
-use crate::{PageId, buffer::PageBuffer};
+use crate::{PageId, page::PageBuffer};
 
 pub struct PageDirectory<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> {
     ptr: AtomicPtr<Block<BLOCK_SIZE, PAGE_SIZE>>,
