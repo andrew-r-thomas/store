@@ -198,6 +198,7 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
 }
 
 struct Block<const SIZE: usize, const PAGE_SIZE: usize>(*mut Frame<PAGE_SIZE>);
+
 struct Frame<const PAGE_SIZE: usize> {
     ptr: AtomicPtr<FrameInner<PAGE_SIZE>>,
 }
