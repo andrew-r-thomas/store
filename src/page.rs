@@ -97,23 +97,21 @@ pub trait Delta {
 // ================================================================================================
 // page access types
 // ================================================================================================
-//
-// TODO: pages seem to make the most sense sorted bottom to top, still easy for reads, and makes
-// building the mutable pages much simpler, so i think we need to adjust some of the logic for that
+
+/// constants used by [`Page`], and each XPageMut type respectively ===============================
+const LEAF_ID: u8 = 0;
+const INNER_ID: u8 = 1;
+
+const BASE_LEN_SIZE: usize = 8;
+const ID_SIZE: usize = 1;
+const FOOTER_SIZE: usize = BASE_LEN_SIZE + ID_SIZE;
 
 pub enum Page<'p> {
     Leaf(LeafPage<'p>),
     Inner(InnerPage<'p>),
 }
 impl<'p> Page<'p> {
-    // footer ids
-    const LEAF_ID: u8 = 0;
-    const INNER_ID: u8 = 1;
-
     // sizes
-    const BASE_LEN_SIZE: usize = 8;
-    const ID_SIZE: usize = 1;
-    const FOOTER_SIZE: usize = Self::BASE_LEN_SIZE + Self::ID_SIZE;
 
     pub fn unwrap_as_leaf(self) -> LeafPage<'p> {
         match self {
@@ -131,20 +129,14 @@ impl<'p> Page<'p> {
 impl<'p> From<&'p [u8]> for Page<'p> {
     fn from(buf: &'p [u8]) -> Self {
         let base_len = u64::from_be_bytes(
-            buf[buf.len() - Self::FOOTER_SIZE..buf.len() - Self::ID_SIZE]
+            buf[buf.len() - FOOTER_SIZE..buf.len() - ID_SIZE]
                 .try_into()
                 .unwrap(),
         ) as usize;
 
         match *buf.last().unwrap() {
-            Self::LEAF_ID => Self::Leaf(LeafPage::from((
-                &buf[..buf.len() - Self::FOOTER_SIZE],
-                base_len,
-            ))),
-            Self::INNER_ID => Self::Inner(InnerPage::from((
-                &buf[..buf.len() - Self::FOOTER_SIZE],
-                base_len,
-            ))),
+            LEAF_ID => Self::Leaf(LeafPage::from((&buf[..buf.len() - FOOTER_SIZE], base_len))),
+            INNER_ID => Self::Inner(InnerPage::from((&buf[..buf.len() - FOOTER_SIZE], base_len))),
             _ => panic!(),
         }
     }
@@ -179,15 +171,15 @@ impl<'p> InnerPage<'p> {
         }
         let base_best = self.base().find_child(target);
         match best {
-            None => best = Some(base_best),
-            Some((k, _)) => {
+            None => base_best.1,
+            Some((k, id)) => {
                 if base_best.0 < k {
-                    best = Some(base_best);
+                    base_best.1
+                } else {
+                    id
                 }
             }
         }
-
-        best.unwrap().1
     }
     fn iter_deltas(&self) -> InnerDeltaIter<'p> {
         InnerDeltaIter::from(&self.buf[..self.buf.len() - self.base_len])
@@ -368,10 +360,8 @@ impl<'b> InnerBase<'b> {
             cursor -= key_len;
 
             if target <= key {
-                let left_page_id_start = key_len_end;
-                let left_page_id_end = left_page_id_start + Self::LEFT_PAGE_ID_SIZE;
                 let left = u64::from_be_bytes(
-                    self.buf[left_page_id_start..left_page_id_end]
+                    self.buf[key_len_end..key_len_end + Self::LEFT_PAGE_ID_SIZE]
                         .try_into()
                         .unwrap(),
                 );
@@ -411,12 +401,10 @@ pub struct InnerPageMut<'p> {
     bottom: usize,
 }
 impl InnerPageMut<'_> {
-    const ID: u8 = 1;
     const NUM_ENTRIES: Range<usize> = 0..2;
     const RIGHT_PAGE_ID: Range<usize> = 2..10;
     const SLOTS_START: usize = 10;
 
-    const FOOTER_SIZE: usize = 9;
     const KEY_LEN_SIZE: usize = 4;
     const LEFT_PAGE_ID_SIZE: usize = 8;
     const SLOT_SIZE: usize = Self::KEY_LEN_SIZE + Self::LEFT_PAGE_ID_SIZE;
@@ -431,16 +419,17 @@ impl InnerPageMut<'_> {
         }
 
         let buf = unsafe { slice::from_raw_parts_mut(ptr, len) };
-        *buf.last_mut().unwrap() = Self::ID;
+        *buf.last_mut().unwrap() = INNER_ID;
 
         Self {
             buf,
-            bottom: len - Self::FOOTER_SIZE,
+            bottom: len - FOOTER_SIZE,
         }
     }
 
     /// NOTE: this should only be called on an empty fresh [`InnerPageMut`]
     pub fn compact(&mut self, other: InnerPage) {
+        assert_eq!(self.buf.len() - FOOTER_SIZE, self.bottom);
         let base = other.base();
 
         // copy the header
@@ -449,7 +438,8 @@ impl InnerPageMut<'_> {
 
         // copy the keys
         let keys = base.keys();
-        self.buf[Self::FOOTER_SIZE - keys.len()..Self::FOOTER_SIZE].copy_from_slice(keys);
+        self.buf[self.bottom - keys.len()..self.bottom].copy_from_slice(keys);
+        self.bottom -= keys.len();
 
         // apply the deltas
         for delta in other.iter_deltas().rev() {
@@ -464,7 +454,7 @@ impl InnerPageMut<'_> {
                 if self.bottom - top < Self::SLOT_SIZE + key.len() {
                     return Err(());
                 }
-                let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
+                let mut cursor = self.buf.len() - FOOTER_SIZE;
 
                 for e in 0..num_entries {
                     let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
@@ -513,7 +503,7 @@ impl InnerPageMut<'_> {
         let middle_entry = num_entries / 2;
         let top = Self::SLOTS_START + (num_entries * Self::SLOT_SIZE);
 
-        let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
+        let mut cursor = self.buf.len() - FOOTER_SIZE;
         for e in 0..middle_entry {
             let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
             let key_len_end = key_len_start + Self::KEY_LEN_SIZE;
@@ -559,9 +549,9 @@ impl InnerPageMut<'_> {
         let new_keys_range = self.bottom..cursor - middle_key_len;
         self.buf.copy_within(
             new_keys_range.clone(),
-            Self::FOOTER_SIZE - new_keys_range.len(),
+            (self.buf.len() - FOOTER_SIZE) - new_keys_range.len(),
         );
-        self.bottom = Self::FOOTER_SIZE - new_keys_range.len();
+        self.bottom = (self.buf.len() - FOOTER_SIZE) - new_keys_range.len();
     }
     pub fn unpack<const PAGE_SIZE: usize>(self) -> PageBuffer<PAGE_SIZE> {
         assert!(self.buf.len() == PAGE_SIZE);
@@ -569,8 +559,8 @@ impl InnerPageMut<'_> {
         let top = Self::SLOTS_START + (self.num_entries() as usize * Self::SLOT_SIZE);
         self.buf.copy_within(..top, self.bottom - top);
 
-        let base_len = (PAGE_SIZE - (self.bottom - top)) - Self::FOOTER_SIZE;
-        self.buf[PAGE_SIZE - Self::FOOTER_SIZE..PAGE_SIZE - 1]
+        let base_len = (PAGE_SIZE - (self.bottom - top)) - FOOTER_SIZE;
+        self.buf[PAGE_SIZE - FOOTER_SIZE..PAGE_SIZE - 1]
             .copy_from_slice(&(base_len as u64).to_be_bytes());
 
         PageBuffer::from_raw_buffer(self.buf, self.bottom - top)
@@ -590,9 +580,9 @@ impl InnerPageMut<'_> {
 }
 impl<'p> From<&'p mut [u8]> for InnerPageMut<'p> {
     fn from(buf: &'p mut [u8]) -> Self {
-        *buf.last_mut().unwrap() = Self::ID;
+        *buf.last_mut().unwrap() = INNER_ID;
         Self {
-            bottom: buf.len() - Self::FOOTER_SIZE,
+            bottom: buf.len() - FOOTER_SIZE,
             buf,
         }
     }
@@ -826,8 +816,8 @@ impl<'b> LeafBase<'b> {
     const NUM_ENTRIES: Range<usize> = 0..2;
     const SLOTS_START: usize = 2;
 
-    const SLOT_SIZE: usize = 8;
     const LEN_SIZE: usize = 4;
+    const SLOT_SIZE: usize = Self::LEN_SIZE * 2;
 
     fn get(self, target: &[u8]) -> Option<&'b [u8]> {
         let num_entries = self.num_entries() as usize;
@@ -849,7 +839,7 @@ impl<'b> LeafBase<'b> {
                 return Some(&self.buf[cursor - val_len..cursor]);
             }
 
-            cursor += key_len + val_len;
+            cursor -= key_len + val_len;
         }
         None
     }
@@ -876,10 +866,8 @@ pub struct LeafPageMut<'p> {
     bottom: usize,
 }
 impl LeafPageMut<'_> {
-    const ID: u8 = 0;
     const NUM_ENTRIES: Range<usize> = 0..2;
 
-    const FOOTER_SIZE: usize = 9;
     const SLOTS_START: usize = 2;
     const SLOT_SIZE: usize = 8;
     const LEN_SIZE: usize = 4;
@@ -894,14 +882,15 @@ impl LeafPageMut<'_> {
         }
 
         let buf = unsafe { slice::from_raw_parts_mut(ptr, len) };
-        *buf.last_mut().unwrap() = Self::ID;
+        *buf.last_mut().unwrap() = LEAF_ID;
 
         Self {
             buf,
-            bottom: len - Self::FOOTER_SIZE,
+            bottom: len - FOOTER_SIZE,
         }
     }
     pub fn compact(&mut self, other: LeafPage) {
+        assert_eq!(self.buf.len() - FOOTER_SIZE, self.bottom);
         let base = other.base();
 
         // copy the header
@@ -910,7 +899,8 @@ impl LeafPageMut<'_> {
 
         // copy the actual data
         let entries = base.entries();
-        self.buf[Self::FOOTER_SIZE - entries.len()..Self::FOOTER_SIZE].copy_from_slice(entries);
+        self.buf[self.bottom - entries.len()..self.bottom].copy_from_slice(entries);
+        self.bottom -= entries.len();
 
         // apply the deltas in reverse order
         for delta in other.iter_deltas().rev() {
@@ -920,7 +910,7 @@ impl LeafPageMut<'_> {
     pub fn apply_delta(&mut self, delta: &LeafDelta) -> Result<(), ()> {
         let num_entries = self.num_entries() as usize;
         let top = Self::SLOTS_START + (num_entries * Self::SLOT_SIZE);
-        let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
+        let mut cursor = self.buf.len() - FOOTER_SIZE;
 
         match delta {
             // LeafDelta::Del(key) => {
@@ -1005,51 +995,46 @@ impl LeafPageMut<'_> {
                         return Ok(());
                     } else if *key == k {
                         // update
-                        // TODO: rewrite this to not mess with the key at all (since they're equal)
-                        if key.len() + val.len() <= key_len + val_len {
-                            // guaranteed to have room
-                            let gap = (key_len + val_len) - (key.len() + val.len());
+                        // TODO: probably should get rid of this branch, most of the logic is the
+                        // same, and it's just a difference in + vs -, so we should just use an
+                        // isize
 
-                            // overwrite the lengths
-                            self.buf[key_len_start..key_len_end]
-                                .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                        if val.len() <= val_len {
+                            // guaranteed to have room
+                            let gap = val_len - val.len();
+
+                            // overwrite the val len
                             self.buf[key_len_end..key_len_end + Self::LEN_SIZE]
                                 .copy_from_slice(&(val.len() as u32).to_be_bytes());
 
-                            self.buf.copy_within(
-                                self.bottom..cursor - (key_len + val_len),
-                                self.bottom + gap,
-                            );
+                            // shift down entries and this entry's key
+                            self.buf
+                                .copy_within(self.bottom..cursor - val_len, self.bottom + gap);
                             self.bottom += gap;
 
-                            self.buf[cursor - (key.len() + val.len())..cursor - val.len()]
-                                .copy_from_slice(key);
+                            // copy the new val
                             self.buf[cursor - val.len()..cursor].copy_from_slice(val);
                         } else {
                             // need to check if we have space
-                            let gap = (key.len() + val.len()) - (key_len + val_len);
+                            let gap = val.len() - val_len;
                             if self.bottom - top < gap {
                                 return Err(());
                             }
 
-                            // overwrite the lengths
-                            self.buf[key_len_start..key_len_end]
-                                .copy_from_slice(&(key.len() as u32).to_be_bytes());
+                            // overwrite the val len
                             self.buf[key_len_end..key_len_end + Self::LEN_SIZE]
                                 .copy_from_slice(&(val.len() as u32).to_be_bytes());
 
-                            // shift up the entries above
-                            self.buf.copy_within(
-                                self.bottom..cursor - (key_len + val_len),
-                                self.bottom - gap,
-                            );
+                            // shift up the entries above, and this entry's key
+                            self.buf
+                                .copy_within(self.bottom..cursor - key_len, self.bottom - gap);
                             self.bottom -= gap;
 
-                            // overwrite the entry space
-                            self.buf[cursor - (key.len() + val.len())..cursor - val.len()]
-                                .copy_from_slice(key);
+                            // copy the new val
                             self.buf[cursor - val.len()..cursor].copy_from_slice(val);
                         }
+
+                        return Ok(());
                     }
                     cursor -= key_len + val_len;
                 }
@@ -1081,7 +1066,7 @@ impl LeafPageMut<'_> {
         let top = Self::SLOTS_START + (num_entries * Self::SLOT_SIZE);
 
         // ingest data up to and including middle_entry into other
-        let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
+        let mut cursor = self.buf.len() - FOOTER_SIZE;
         for e in 0..middle_entry {
             let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
             let key_len_end = key_len_start + Self::LEN_SIZE;
@@ -1129,9 +1114,9 @@ impl LeafPageMut<'_> {
         let new_entries_range = self.bottom..cursor - (key_len + val_len);
         self.buf.copy_within(
             new_entries_range.clone(),
-            Self::FOOTER_SIZE - new_entries_range.len(),
+            (self.buf.len() - FOOTER_SIZE) - new_entries_range.len(),
         );
-        self.bottom = Self::FOOTER_SIZE - new_entries_range.len();
+        self.bottom = (self.buf.len() - FOOTER_SIZE) - new_entries_range.len();
     }
     pub fn unpack<const PAGE_SIZE: usize>(self) -> PageBuffer<PAGE_SIZE> {
         assert!(self.buf.len() == PAGE_SIZE);
@@ -1139,8 +1124,8 @@ impl LeafPageMut<'_> {
         let top = Self::SLOTS_START + (self.num_entries() as usize * Self::SLOT_SIZE);
         self.buf.copy_within(..top, self.bottom - top);
 
-        let base_len = (PAGE_SIZE - (self.bottom - top)) - Self::FOOTER_SIZE;
-        self.buf[PAGE_SIZE - Self::FOOTER_SIZE..PAGE_SIZE - 1]
+        let base_len = (PAGE_SIZE - (self.bottom - top)) - FOOTER_SIZE;
+        self.buf[PAGE_SIZE - FOOTER_SIZE..PAGE_SIZE - 1]
             .copy_from_slice(&(base_len as u64).to_be_bytes());
 
         PageBuffer::from_raw_buffer(self.buf, self.bottom - top)
@@ -1157,7 +1142,7 @@ impl LeafPageMut<'_> {
 impl<'p> From<&'p mut [u8]> for LeafPageMut<'p> {
     fn from(buf: &'p mut [u8]) -> Self {
         Self {
-            bottom: buf.len() - Self::FOOTER_SIZE,
+            bottom: buf.len() - FOOTER_SIZE,
             buf,
         }
     }
