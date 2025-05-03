@@ -607,14 +607,14 @@ impl<'p> LeafPage<'p> {
     pub fn get(self, target: &[u8]) -> Option<&'p [u8]> {
         for delta in self.iter_deltas() {
             match delta {
+                // LeafDelta::Del(key) => {
+                //     if target == key {
+                //         return None;
+                //     }
+                // }
                 LeafDelta::Set { key, val } => {
                     if target == key {
                         return Some(val);
-                    }
-                }
-                LeafDelta::Del(key) => {
-                    if target == key {
-                        return None;
                     }
                 }
             }
@@ -672,11 +672,11 @@ impl<'i> DoubleEndedIterator for LeafDeltaIter<'i> {
 }
 pub enum LeafDelta<'d> {
     Set { key: &'d [u8], val: &'d [u8] },
-    Del(&'d [u8]),
+    // Del(&'d [u8]),
 }
 impl<'d> LeafDelta<'d> {
     const SET_ID: u8 = 1;
-    const DEL_ID: u8 = 2;
+    // const DEL_ID: u8 = 2;
 
     const ID_SIZE: usize = 1;
     const LEN_SIZE: usize = 4;
@@ -702,18 +702,18 @@ impl<'d> LeafDelta<'d> {
 
                 Self::Set { key, val }
             }
-            Self::DEL_ID => {
-                cursor += Self::ID_SIZE;
-
-                let key_len =
-                    u32::from_be_bytes(buf[cursor..cursor + Self::LEN_SIZE].try_into().unwrap())
-                        as usize;
-                cursor += Self::LEN_SIZE;
-
-                let key = &buf[cursor..cursor + key_len];
-
-                Self::Del(key)
-            }
+            // Self::DEL_ID => {
+            //     cursor += Self::ID_SIZE;
+            //
+            //     let key_len =
+            //         u32::from_be_bytes(buf[cursor..cursor + Self::LEN_SIZE].try_into().unwrap())
+            //             as usize;
+            //     cursor += Self::LEN_SIZE;
+            //
+            //     let key = &buf[cursor..cursor + key_len];
+            //
+            //     Self::Del(key)
+            // }
             _ => panic!(),
         }
     }
@@ -738,18 +738,18 @@ impl<'d> LeafDelta<'d> {
 
                 Self::Set { key, val }
             }
-            Self::DEL_ID => {
-                cursor -= Self::ID_SIZE;
-
-                let key_len =
-                    u32::from_be_bytes(buf[cursor - Self::LEN_SIZE..cursor].try_into().unwrap())
-                        as usize;
-                cursor -= Self::LEN_SIZE;
-
-                let key = &buf[cursor - key_len..cursor];
-
-                Self::Del(key)
-            }
+            // Self::DEL_ID => {
+            //     cursor -= Self::ID_SIZE;
+            //
+            //     let key_len =
+            //         u32::from_be_bytes(buf[cursor - Self::LEN_SIZE..cursor].try_into().unwrap())
+            //             as usize;
+            //     cursor -= Self::LEN_SIZE;
+            //
+            //     let key = &buf[cursor - key_len..cursor];
+            //
+            //     Self::Del(key)
+            // }
             _ => panic!(),
         }
     }
@@ -757,6 +757,9 @@ impl<'d> LeafDelta<'d> {
 impl Delta for LeafDelta<'_> {
     fn len(&self) -> usize {
         match self {
+            // Self::Del(key) => {
+            //     Self::ID_SIZE + Self::LEN_SIZE + key.len() + Self::LEN_SIZE + Self::ID_SIZE
+            // }
             Self::Set { key, val } => {
                 Self::ID_SIZE
                     + (Self::LEN_SIZE * 2)
@@ -765,15 +768,29 @@ impl Delta for LeafDelta<'_> {
                     + (Self::LEN_SIZE * 2)
                     + Self::ID_SIZE
             }
-            Self::Del(key) => {
-                Self::ID_SIZE + Self::LEN_SIZE + key.len() + Self::LEN_SIZE + Self::ID_SIZE
-            }
         }
     }
     fn write_to_buf(&self, buf: &mut [u8]) {
         assert!(self.len() == buf.len());
         let mut cursor = 0;
         match self {
+            // Self::Del(key) => {
+            //     let key_len = &(key.len() as u32).to_be_bytes();
+            //
+            //     buf[cursor] = Self::DEL_ID;
+            //     cursor += Self::ID_SIZE;
+            //
+            //     buf[cursor..cursor + Self::LEN_SIZE].copy_from_slice(key_len);
+            //     cursor += Self::LEN_SIZE;
+            //
+            //     buf[cursor..cursor + key.len()].copy_from_slice(key);
+            //     cursor += key.len();
+            //
+            //     buf[cursor..cursor + Self::LEN_SIZE].copy_from_slice(key_len);
+            //     cursor += Self::LEN_SIZE;
+            //
+            //     buf[cursor] = Self::DEL_ID;
+            // }
             Self::Set { key, val } => {
                 let key_len = &(key.len() as u32).to_be_bytes();
                 let val_len = &(val.len() as u32).to_be_bytes();
@@ -797,23 +814,6 @@ impl Delta for LeafDelta<'_> {
                 cursor += Self::LEN_SIZE;
 
                 buf[cursor] = Self::SET_ID;
-            }
-            Self::Del(key) => {
-                let key_len = &(key.len() as u32).to_be_bytes();
-
-                buf[cursor] = Self::DEL_ID;
-                cursor += Self::ID_SIZE;
-
-                buf[cursor..cursor + Self::LEN_SIZE].copy_from_slice(key_len);
-                cursor += Self::LEN_SIZE;
-
-                buf[cursor..cursor + key.len()].copy_from_slice(key);
-                cursor += key.len();
-
-                buf[cursor..cursor + Self::LEN_SIZE].copy_from_slice(key_len);
-                cursor += Self::LEN_SIZE;
-
-                buf[cursor] = Self::DEL_ID;
             }
         }
     }
@@ -923,6 +923,45 @@ impl LeafPageMut<'_> {
         let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
 
         match delta {
+            // LeafDelta::Del(key) => {
+            //     let num_entries = self.num_entries() as usize;
+            //     let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
+            //     for e in 0..num_entries {
+            //         let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
+            //         let key_len_end = key_len_start + Self::LEN_SIZE;
+            //         let key_len = u32::from_be_bytes(
+            //             self.buf[key_len_start..key_len_end].try_into().unwrap(),
+            //         ) as usize;
+            //
+            //         let val_len = u32::from_be_bytes(
+            //             self.buf[key_len_end..key_len_end + Self::LEN_SIZE]
+            //                 .try_into()
+            //                 .unwrap(),
+            //         ) as usize;
+            //
+            //         let k = &self.buf[cursor - (key_len + val_len)..cursor - val_len];
+            //         if *key == k {
+            //             self.buf
+            //                 .copy_within(key_len_start + Self::SLOT_SIZE..top, key_len_start);
+            //             self.set_num_entries((num_entries - 1) as u16);
+            //
+            //             self.buf.copy_within(
+            //                 self.bottom..cursor - (key_len + val_len),
+            //                 self.bottom + key_len + val_len,
+            //             );
+            //             self.bottom += key_len + val_len;
+            //
+            //             return Ok(());
+            //         }
+            //
+            //         cursor -= key_len + val_len;
+            //     }
+            //
+            //     // we're trying to delete something that isn't in here, this is legal, but just
+            //     // want to catch it for now in case something weird happens during dev, will delete
+            //     // later
+            //     panic!()
+            // }
             LeafDelta::Set { key, val } => {
                 for e in 0..num_entries {
                     let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
@@ -966,8 +1005,7 @@ impl LeafPageMut<'_> {
                         return Ok(());
                     } else if *key == k {
                         // update
-                        // TODO: could maybe cleanly get rid of this branch (use an isize and let
-                        // stuff be negative, or somethin)
+                        // TODO: rewrite this to not mess with the key at all (since they're equal)
                         if key.len() + val.len() <= key_len + val_len {
                             // guaranteed to have room
                             let gap = (key_len + val_len) - (key.len() + val.len());
@@ -1033,45 +1071,6 @@ impl LeafPageMut<'_> {
                 self.bottom -= key.len() + val.len();
 
                 return Ok(());
-            }
-            LeafDelta::Del(key) => {
-                let num_entries = self.num_entries() as usize;
-                let mut cursor = self.buf.len() - Self::FOOTER_SIZE;
-                for e in 0..num_entries {
-                    let key_len_start = Self::SLOTS_START + (e * Self::SLOT_SIZE);
-                    let key_len_end = key_len_start + Self::LEN_SIZE;
-                    let key_len = u32::from_be_bytes(
-                        self.buf[key_len_start..key_len_end].try_into().unwrap(),
-                    ) as usize;
-
-                    let val_len = u32::from_be_bytes(
-                        self.buf[key_len_end..key_len_end + Self::LEN_SIZE]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize;
-
-                    let k = &self.buf[cursor - (key_len + val_len)..cursor - val_len];
-                    if *key == k {
-                        self.buf
-                            .copy_within(key_len_start + Self::SLOT_SIZE..top, key_len_start);
-                        self.set_num_entries((num_entries - 1) as u16);
-
-                        self.buf.copy_within(
-                            self.bottom..cursor - (key_len + val_len),
-                            self.bottom + key_len + val_len,
-                        );
-                        self.bottom += key_len + val_len;
-
-                        return Ok(());
-                    }
-
-                    cursor -= key_len + val_len;
-                }
-
-                // we're trying to delete something that isn't in here, this is legal, but just
-                // want to catch it for now in case something weird happens during dev, will delete
-                // later
-                panic!()
             }
         }
     }

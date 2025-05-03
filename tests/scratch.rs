@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Write},
     ops::Range,
     sync::Arc,
     thread::{self, JoinHandle},
@@ -15,6 +15,8 @@ use store::index::Index;
 
 #[test]
 fn scratch() {
+    fs::create_dir("sim").unwrap();
+
     let index = Arc::new(Index::<8, { 1024 * 1024 }>::new(64));
 
     let threads: Vec<JoinHandle<()>> = (0..4)
@@ -23,9 +25,9 @@ fn scratch() {
             thread::Builder::new()
                 .name(format!("{t}"))
                 .spawn(move || {
-                    let num_ingest = 32;
-                    let num_ops = 32;
-                    let sim_file_path = format!("sim_{t}");
+                    let num_ingest = 64;
+                    let num_ops = 1024;
+                    let sim_file_path = format!("sim/sim_{t}");
 
                     generate_sim(
                         &sim_file_path,
@@ -36,71 +38,23 @@ fn scratch() {
                         512..1024,
                     );
 
-                    let mut sim_file = File::open(&sim_file_path).unwrap();
-
-                    let mut code_buf = [0];
-                    let mut len_buf = [0; 4];
-                    let mut key = Vec::new();
-                    let mut val = Vec::new();
+                    let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
 
                     for _ in 0..num_ingest {
-                        sim_file.read_exact(&mut len_buf).unwrap();
-                        let key_len =
-                            u32::from_be_bytes((&len_buf[..]).try_into().unwrap()) as usize;
-                        key.resize(key_len, 0);
-                        key.fill(0);
-                        sim_file.read_exact(&mut key).unwrap();
-
-                        sim_file.read_exact(&mut len_buf).unwrap();
-                        let val_len =
-                            u32::from_be_bytes((&len_buf[..]).try_into().unwrap()) as usize;
-                        val.resize(val_len, 0);
-                        val.fill(0);
-                        sim_file.read_exact(&mut val).unwrap();
-
+                        let (key, val): (Vec<u8>, Vec<u8>) =
+                            ciborium::from_reader(&mut sim_reader).unwrap();
                         index.set(&key, &val).unwrap();
                     }
 
                     for _ in 0..num_ops {
-                        sim_file.read_exact(&mut code_buf).unwrap();
-                        match code_buf[0] {
-                            0 => {
-                                // get
-                                sim_file.read_exact(&mut len_buf).unwrap();
-                                let key_len = u32::from_be_bytes(len_buf) as usize;
-                                key.resize(key_len, 0);
-                                key.fill(0);
-                                sim_file.read_exact(&mut key).unwrap();
-
-                                sim_file.read_exact(&mut len_buf).unwrap();
-                                let val_len = u32::from_be_bytes(len_buf) as usize;
-                                val.resize(val_len, 0);
-                                val.fill(0);
-                                sim_file.read_exact(&mut val).unwrap();
-
-                                assert_eq!(&val, index.get(&key).unwrap());
-                            }
-                            1 => {
-                                // set
-                                sim_file.read_exact(&mut len_buf).unwrap();
-                                let key_len = u32::from_be_bytes(len_buf) as usize;
-                                key.resize(key_len, 0);
-                                key.fill(0);
-                                sim_file.read_exact(&mut key).unwrap();
-
-                                sim_file.read_exact(&mut len_buf).unwrap();
-                                let val_len = u32::from_be_bytes(len_buf) as usize;
-                                val.resize(val_len, 0);
-                                val.fill(0);
-                                sim_file.read_exact(&mut val).unwrap();
-
-                                index.set(&key, &val).unwrap();
-                            }
+                        let (op, key, val): (String, Vec<u8>, Vec<u8>) =
+                            ciborium::from_reader(&mut sim_reader).unwrap();
+                        match op.as_str() {
+                            "get" => assert_eq!(&val, index.get(&key).unwrap()),
+                            "set" => while let Err(()) = index.set(&key, &val) {},
                             _ => panic!(),
                         }
                     }
-
-                    fs::remove_file(sim_file_path).unwrap();
                 })
                 .unwrap()
         })
@@ -109,6 +63,8 @@ fn scratch() {
     for t in threads {
         t.join().unwrap()
     }
+
+    fs::remove_dir_all("sim").unwrap();
 }
 
 fn generate_sim(
@@ -119,9 +75,9 @@ fn generate_sim(
     key_len_range: Range<usize>,
     val_len_range: Range<usize>,
 ) {
-    let mut file = File::create(name).unwrap();
+    let mut writer = BufWriter::new(File::create(name).unwrap());
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut table = Vec::new();
+    let mut entries = Vec::new();
 
     for _ in 0..num_ingest {
         let key_len = rng.random_range(key_len_range.clone());
@@ -131,25 +87,16 @@ fn generate_sim(
         rng.fill(&mut key[..]);
         rng.fill(&mut val[..]);
 
-        file.write_all(&(key_len as u32).to_be_bytes()).unwrap();
-        file.write_all(&key).unwrap();
-        file.write_all(&(val_len as u32).to_be_bytes()).unwrap();
-        file.write_all(&val).unwrap();
-
-        table.push((key, val));
+        ciborium::into_writer(&(&key, &val), &mut writer).unwrap();
+        entries.push((key, val));
     }
 
     let ops = ["get", "insert", "update"];
     for _ in 0..num_ops {
         match *ops.choose(&mut rng).unwrap() {
             "get" => {
-                let (key, val) = table.choose(&mut rng).unwrap();
-
-                file.write_all(&[0]).unwrap();
-                file.write_all(&(key.len() as u32).to_be_bytes()).unwrap();
-                file.write_all(key).unwrap();
-                file.write_all(&(val.len() as u32).to_be_bytes()).unwrap();
-                file.write_all(val).unwrap();
+                let (key, val) = entries.choose(&mut rng).unwrap();
+                ciborium::into_writer(&("get", key, val), &mut writer).unwrap();
             }
             "insert" => {
                 let key_len = rng.random_range(key_len_range.clone());
@@ -159,36 +106,22 @@ fn generate_sim(
                 rng.fill(&mut key[..]);
                 rng.fill(&mut val[..]);
 
-                file.write_all(&[1]).unwrap();
-                file.write_all(&(key_len as u32).to_be_bytes()).unwrap();
-                file.write_all(&key).unwrap();
-                file.write_all(&(val_len as u32).to_be_bytes()).unwrap();
-                file.write_all(&val).unwrap();
-
-                table.push((key, val));
+                ciborium::into_writer(&("set", &key, &val), &mut writer).unwrap();
+                entries.push((key, val));
             }
             "update" => {
-                let (key, val) = table.choose_mut(&mut rng).unwrap();
+                let (key, val) = entries.choose_mut(&mut rng).unwrap();
 
-                let key_len = rng.random_range(key_len_range.clone());
                 let val_len = rng.random_range(val_len_range.clone());
-                let mut new_key: Vec<u8> = vec![0; key_len];
                 let mut new_val: Vec<u8> = vec![0; val_len];
-                rng.fill(&mut new_key[..]);
                 rng.fill(&mut new_val[..]);
 
-                file.write_all(&[1]).unwrap();
-                file.write_all(&(key_len as u32).to_be_bytes()).unwrap();
-                file.write_all(&key).unwrap();
-                file.write_all(&(val_len as u32).to_be_bytes()).unwrap();
-                file.write_all(&val).unwrap();
-
-                *key = new_key;
+                ciborium::into_writer(&("set", &key, &new_val), &mut writer).unwrap();
                 *val = new_val;
             }
             _ => panic!(),
         }
     }
 
-    file.flush().unwrap();
+    writer.flush().unwrap();
 }
