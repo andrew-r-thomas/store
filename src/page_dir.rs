@@ -109,29 +109,6 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
         }
     }
 
-    /// this function performs an atomic store on the frame at [`page_id`], so you should have
-    /// exclusive write access to the logical page
-    pub fn push_free(&self, page_id: PageId) {
-        loop {
-            let head = self.get_frame(0);
-            let head_inner = unsafe { &mut *head.ptr.load(Ordering::Acquire) };
-            let head_id = head_inner.unwrap_as_free();
-
-            let next = Box::into_raw(Box::new(FrameInner::Free(head_id)));
-            let frame = self.get_frame(page_id as usize);
-            frame.ptr.store(next, Ordering::Release);
-
-            if let Ok(_) = head.ptr.compare_exchange_weak(
-                head_inner,
-                Box::into_raw(Box::new(FrameInner::Free(page_id))),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                return;
-            }
-        }
-    }
-
     fn grow(&self) {
         if let Ok(mut grow_guard) = self.grow_lock.try_lock() {
             // allocate a new pointer block
