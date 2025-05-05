@@ -333,6 +333,7 @@ impl Delta for InnerDelta<'_> {
     }
 }
 
+#[derive(Copy, Clone)]
 struct InnerBase<'b> {
     buf: &'b [u8],
 }
@@ -809,6 +810,7 @@ impl Delta for LeafDelta<'_> {
     }
 }
 
+#[derive(Copy, Clone)]
 struct LeafBase<'b> {
     buf: &'b [u8],
 }
@@ -1059,6 +1061,7 @@ impl LeafPageMut<'_> {
             }
         }
     }
+    // FIX: deadass don't work
     /// NOTE: we always split left
     pub fn split_into(&mut self, other: &mut Self, out: &mut Vec<u8>) {
         let num_entries = self.num_entries() as usize;
@@ -1144,6 +1147,215 @@ impl<'p> From<&'p mut [u8]> for LeafPageMut<'p> {
         Self {
             bottom: buf.len() - FOOTER_SIZE,
             buf,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn leaf() {
+        const PAGE_SIZE: usize = 1024;
+        let mut leaf_mut = LeafPageMut::new(PAGE_SIZE);
+        let mut key = Vec::new();
+        let mut val = Vec::new();
+
+        for i in 0..10 {
+            key.clear();
+            val.clear();
+            for _ in 0..i {
+                key.push(i);
+                val.push(i);
+            }
+            leaf_mut
+                .apply_delta(&LeafDelta::Set {
+                    key: &key,
+                    val: &val,
+                })
+                .unwrap();
+        }
+
+        let leaf_buf: PageBuffer<PAGE_SIZE> = leaf_mut.unpack();
+        for i in 10..20 {
+            key.clear();
+            val.clear();
+            for _ in 0..i {
+                key.push(i);
+                val.push(i);
+            }
+
+            leaf_buf.write_delta(&LeafDelta::Set {
+                key: &key,
+                val: &val,
+            });
+        }
+
+        let leaf_page = leaf_buf.read().unwrap_as_leaf();
+        for (delta, i) in leaf_page.iter_deltas().zip((10..20).rev()) {
+            key.clear();
+            val.clear();
+            for _ in 0..i {
+                key.push(i);
+                val.push(i);
+            }
+
+            match delta {
+                LeafDelta::Set {
+                    key: d_key,
+                    val: d_val,
+                } => {
+                    assert_eq!(&key, d_key);
+                    assert_eq!(&val, d_val);
+                }
+            }
+        }
+
+        let leaf_base = leaf_page.base();
+        for i in 0..10 {
+            key.clear();
+            val.clear();
+            for _ in 0..i {
+                key.push(i);
+                val.push(i);
+            }
+            assert_eq!(leaf_base.get(&key).unwrap(), &val);
+        }
+
+        let mut compacted_mut = LeafPageMut::new(PAGE_SIZE);
+        compacted_mut.compact(leaf_page);
+
+        let compacted_buf: PageBuffer<PAGE_SIZE> = compacted_mut.unpack();
+        let base = compacted_buf.read().unwrap_as_leaf().base();
+        for i in 0..20 {
+            key.clear();
+            val.clear();
+            for _ in 0..i {
+                key.push(i);
+                val.push(i);
+            }
+
+            assert_eq!(base.get(&key).unwrap(), &val);
+        }
+
+        // let mut to_mut = LeafPageMut::new(PAGE_SIZE);
+        // compacted_mut.split_into(&mut to_mut, &mut key);
+        //
+        // let left_buf: PageBuffer<PAGE_SIZE> = to_mut.unpack();
+        // let right_buf: PageBuffer<PAGE_SIZE> = compacted_mut.unpack();
+        // let left_base = left_buf.read().unwrap_as_leaf().base();
+        // let right_base = right_buf.read().unwrap_as_leaf().base();
+        //
+        // for i in 0..11 {
+        //     key.clear();
+        //     val.clear();
+        //     for _ in 0..i {
+        //         key.push(i);
+        //         val.push(i);
+        //     }
+        //
+        //     assert_eq!(left_base.get(&key).unwrap(), &val);
+        // }
+        // for i in 11..20 {
+        //     key.clear();
+        //     val.clear();
+        //     for _ in 0..i {
+        //         key.push(i);
+        //         val.push(i);
+        //     }
+        //
+        //     match right_base.get(&key) {
+        //         Some(v) => assert_eq!(v, &val),
+        //         None => println!("no {i}!"),
+        //     }
+        // }
+    }
+
+    #[test]
+    fn inner() {
+        const PAGE_SIZE: usize = 1024;
+        let mut inner_mut = InnerPageMut::new(PAGE_SIZE);
+        let mut key = Vec::new();
+
+        for i in 0..10 {
+            key.clear();
+            for _ in 0..i {
+                key.push(i);
+            }
+            inner_mut
+                .apply_delta(&InnerDelta::Set {
+                    key: &key,
+                    left_page_id: i as u64,
+                })
+                .unwrap();
+        }
+
+        let inner_buf: PageBuffer<PAGE_SIZE> = inner_mut.unpack();
+        for i in 10..20 {
+            key.clear();
+            for _ in 0..i {
+                key.push(i);
+            }
+
+            inner_buf.write_delta(&InnerDelta::Set {
+                key: &key,
+                left_page_id: i as u64,
+            });
+        }
+
+        let inner_page = inner_buf.read().unwrap_as_inner();
+        for (delta, i) in inner_page.iter_deltas().zip((10..20).rev()) {
+            key.clear();
+            for _ in 0..i {
+                key.push(i);
+            }
+
+            match delta {
+                InnerDelta::Set {
+                    key: d_key,
+                    left_page_id,
+                } => {
+                    assert_eq!(&key, d_key);
+                    assert_eq!(left_page_id, i as u64);
+                }
+            }
+        }
+
+        let inner_base = inner_page.base();
+        for i in 0..10 {
+            key.clear();
+            for _ in 0..i {
+                key.push(i);
+            }
+            assert_eq!(inner_base.find_child(&key).1, i as u64);
+        }
+
+        let mut compacted_mut = InnerPageMut::new(PAGE_SIZE);
+        compacted_mut.compact(inner_page);
+        let mut to_mut = InnerPageMut::new(PAGE_SIZE);
+        compacted_mut.split_into(&mut to_mut, &mut key);
+
+        let left_buf: PageBuffer<PAGE_SIZE> = to_mut.unpack();
+        let right_buf: PageBuffer<PAGE_SIZE> = compacted_mut.unpack();
+        let left_base = left_buf.read().unwrap_as_inner().base();
+        let right_base = right_buf.read().unwrap_as_inner().base();
+
+        for i in 0..10 {
+            key.clear();
+            for _ in 0..i {
+                key.push(i);
+            }
+
+            assert_eq!(left_base.find_child(&key).1, i as u64);
+        }
+        for i in 11..20 {
+            key.clear();
+            for _ in 0..i {
+                key.push(i);
+            }
+
+            assert_eq!(right_base.find_child(&key).1, i as u64);
         }
     }
 }

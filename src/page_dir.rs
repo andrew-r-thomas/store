@@ -1,10 +1,3 @@
-/*
-
-    TODO:
-    - add a way to check (at compile time ideally) that the block size is a power of 2
-
-*/
-
 use std::{
     alloc::{self, Layout},
     ptr,
@@ -90,14 +83,14 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
             let head_inner = unsafe { &mut *head.ptr.load(Ordering::Acquire) };
             let head_id = head_inner.unwrap_as_free();
 
-            if head_id == self.len() as u64 {
+            if head_id >= self.len() as u64 {
                 // there are no free pages and we need to grow the table
                 self.grow();
                 continue;
             }
 
-            let next_id = unsafe { &*self.get_frame(head_id as usize).ptr.load(Ordering::Acquire) }
-                .unwrap_as_free();
+            let head_frame = self.get_frame(head_id as usize);
+            let next_id = unsafe { &*head_frame.ptr.load(Ordering::Acquire) }.unwrap_as_free();
             if let Ok(_) = head.ptr.compare_exchange_weak(
                 head_inner,
                 Box::into_raw(Box::new(FrameInner::Free(next_id))),
