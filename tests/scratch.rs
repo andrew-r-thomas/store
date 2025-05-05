@@ -13,7 +13,6 @@ use rand::{
 use rand_chacha::ChaCha8Rng;
 use store::index::Index;
 
-#[ignore]
 #[test]
 fn scratch() {
     fs::create_dir("sim").unwrap();

@@ -1108,10 +1108,9 @@ impl LeafPageMut<'_> {
         };
         other.apply_delta(&delta).unwrap();
         out.extend(&self.buf[cursor - (key_len + val_len)..cursor - val_len]);
-        cursor -= key_len + val_len;
 
         self.buf
-            .copy_within(key_len_end + Self::LEN_SIZE..top, key_len_start);
+            .copy_within(key_len_end + Self::LEN_SIZE..top, Self::SLOTS_START);
         self.set_num_entries((num_entries - (middle_entry + 1)) as u16);
 
         let new_entries_range = self.bottom..cursor - (key_len + val_len);
@@ -1226,9 +1225,15 @@ mod test {
         let mut compacted_mut = LeafPageMut::new(PAGE_SIZE);
         compacted_mut.compact(leaf_page);
 
-        let compacted_buf: PageBuffer<PAGE_SIZE> = compacted_mut.unpack();
-        let base = compacted_buf.read().unwrap_as_leaf().base();
-        for i in 0..20 {
+        let mut to_mut = LeafPageMut::new(PAGE_SIZE);
+        compacted_mut.split_into(&mut to_mut, &mut key);
+
+        let left_buf: PageBuffer<PAGE_SIZE> = to_mut.unpack();
+        let right_buf: PageBuffer<PAGE_SIZE> = compacted_mut.unpack();
+        let left_base = left_buf.read().unwrap_as_leaf().base();
+        let right_base = right_buf.read().unwrap_as_leaf().base();
+
+        for i in 0..11 {
             key.clear();
             val.clear();
             for _ in 0..i {
@@ -1236,40 +1241,18 @@ mod test {
                 val.push(i);
             }
 
-            assert_eq!(base.get(&key).unwrap(), &val);
+            assert_eq!(left_base.get(&key).unwrap(), &val);
         }
+        for i in 11..20 {
+            key.clear();
+            val.clear();
+            for _ in 0..i {
+                key.push(i);
+                val.push(i);
+            }
 
-        // let mut to_mut = LeafPageMut::new(PAGE_SIZE);
-        // compacted_mut.split_into(&mut to_mut, &mut key);
-        //
-        // let left_buf: PageBuffer<PAGE_SIZE> = to_mut.unpack();
-        // let right_buf: PageBuffer<PAGE_SIZE> = compacted_mut.unpack();
-        // let left_base = left_buf.read().unwrap_as_leaf().base();
-        // let right_base = right_buf.read().unwrap_as_leaf().base();
-        //
-        // for i in 0..11 {
-        //     key.clear();
-        //     val.clear();
-        //     for _ in 0..i {
-        //         key.push(i);
-        //         val.push(i);
-        //     }
-        //
-        //     assert_eq!(left_base.get(&key).unwrap(), &val);
-        // }
-        // for i in 11..20 {
-        //     key.clear();
-        //     val.clear();
-        //     for _ in 0..i {
-        //         key.push(i);
-        //         val.push(i);
-        //     }
-        //
-        //     match right_base.get(&key) {
-        //         Some(v) => assert_eq!(v, &val),
-        //         None => println!("no {i}!"),
-        //     }
-        // }
+            assert_eq!(right_base.get(&key).unwrap(), &val);
+        }
     }
 
     #[test]
