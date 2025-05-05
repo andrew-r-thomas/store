@@ -61,9 +61,6 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
         }
     }
 
-    /// this function performs an atomic store, not a compare and swap, so you should have
-    /// exclusive write access to the logical page when you call it (i.e. the page is sealed, or
-    /// you just created it, etc)
     pub fn set(&self, page_id: PageId, buf: PageBuffer<PAGE_SIZE>) {
         let frame = self.get_frame(page_id as usize);
         let ptr = Box::into_raw(Box::new(FrameInner::Mem(buf)));
@@ -134,7 +131,7 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> PageDirectory<BLOCK_SIZE, 
                     unsafe { ptr::write(block.add(j), frame) };
                 }
 
-                unsafe { ptr::write(new_blocks.add(i), Block(block)) };
+                unsafe { ptr::write(new_blocks.add(num_blocks + i), Block(block)) };
             }
 
             // add the old pointer block to the garbage list, update to the new pointer, and
@@ -195,5 +192,18 @@ impl<const PAGE_SIZE: usize> FrameInner<PAGE_SIZE> {
             return *next;
         }
         panic!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch() {
+        let page_dir = PageDirectory::<8, 1024>::new(64);
+        for i in 1..128 {
+            assert_eq!(page_dir.pop_free(), i);
+        }
     }
 }

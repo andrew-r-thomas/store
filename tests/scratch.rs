@@ -31,7 +31,7 @@ fn scratch() {
 
                     generate_sim(
                         &sim_file_path,
-                        69 * t,
+                        69 ^ t,
                         num_ingest,
                         num_ops,
                         128..256,
@@ -46,18 +46,12 @@ fn scratch() {
                         index.set(&key, &val).unwrap();
                     }
 
-                    for n in 0..num_ops {
+                    for _ in 0..num_ops {
                         let (op, key, val): (String, Vec<u8>, Vec<u8>) =
                             ciborium::from_reader(&mut sim_reader).unwrap();
                         match op.as_str() {
-                            "get" => {
-                                assert_eq!(&val, index.get(&key).unwrap());
-                                println!("{t} op {n}: successful get");
-                            }
-                            "set" => {
-                                while let Err(()) = index.set(&key, &val) {}
-                                println!("{t} op {n}: successful set");
-                            }
+                            "get" => assert_eq!(&val, index.get(&key).unwrap()),
+                            "set" => while let Err(()) = index.set(&key, &val) {},
                             _ => panic!(),
                         }
                     }
