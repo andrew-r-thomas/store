@@ -19,14 +19,14 @@ fn scratch() {
 
     let index = Arc::new(Index::<8, { 1024 * 1024 }>::new(64));
 
-    let threads: Vec<JoinHandle<()>> = (0..4)
+    let threads: Vec<JoinHandle<()>> = (0..1)
         .map(|t| {
             let index = index.clone();
             thread::Builder::new()
                 .name(format!("{t}"))
                 .spawn(move || {
-                    let num_ingest = 64;
-                    let num_ops = 1024;
+                    let num_ingest = 2048;
+                    let num_ops = 4096;
                     let sim_file_path = format!("sim/sim_{t}");
 
                     generate_sim(
@@ -39,11 +39,12 @@ fn scratch() {
                     );
 
                     let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
-
+                    let mut path_buf = Vec::new();
                     for _ in 0..num_ingest {
                         let (key, val): (Vec<u8>, Vec<u8>) =
                             ciborium::from_reader(&mut sim_reader).unwrap();
-                        index.set(&key, &val).unwrap();
+                        path_buf.clear();
+                        index.set(&key, &val, &mut path_buf).unwrap();
                     }
 
                     for _ in 0..num_ops {
@@ -51,7 +52,12 @@ fn scratch() {
                             ciborium::from_reader(&mut sim_reader).unwrap();
                         match op.as_str() {
                             "get" => assert_eq!(&val, index.get(&key).unwrap()),
-                            "set" => while let Err(()) = index.set(&key, &val) {},
+                            "set" => {
+                                path_buf.clear();
+                                while let Err(()) = index.set(&key, &val, &mut path_buf) {
+                                    path_buf.clear();
+                                }
+                            }
                             _ => panic!(),
                         }
                     }

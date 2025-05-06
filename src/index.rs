@@ -1,4 +1,5 @@
 use crate::{
+    PageId,
     page::{InnerDelta, InnerPageMut, LeafDelta, LeafPageMut, Page, WriteRes},
     page_dir::PageDirectory,
 };
@@ -29,22 +30,20 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> Index<BLOCK_SIZE, PAGE_SIZ
         let leaf = current.unwrap_as_leaf();
         leaf.get(key)
     }
-    pub fn set(&self, key: &[u8], val: &[u8]) -> Result<(), ()> {
+    pub fn set(&self, key: &[u8], val: &[u8], path: &mut Vec<PageId>) -> Result<(), ()> {
         let root_id = self.root.load(Ordering::Acquire);
         let mut current = self.page_dir.get(root_id);
 
-        let mut path = Vec::new(); // PERF:
-        path.push((root_id, current));
-
+        path.push(root_id);
         while let Page::Inner(inner_page) = current.read() {
             let child_id = inner_page.find_child(key);
             current = self.page_dir.get(child_id);
-            path.push((child_id, current));
+            path.push(child_id);
         }
 
         let delta = LeafDelta::Set { key, val };
-        let (leaf_id, leaf) = path.pop().unwrap();
-        match leaf.write_delta(&delta) {
+        let leaf_id = path.pop().unwrap();
+        match self.page_dir.get(leaf_id).write_delta(&delta) {
             WriteRes::Ok => Ok(()),
             WriteRes::Sealed => Err(()),
             WriteRes::Sealer(old) => {
@@ -55,7 +54,7 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> Index<BLOCK_SIZE, PAGE_SIZ
 
                 // then we try to apply the delta to the newly compacted page
                 if let Err(()) = new_page.apply_delta(&delta) {
-                    // if it failes, we need to do a split
+                    // if it fails, we need to do a split
                     let mut to_page = LeafPageMut::new(PAGE_SIZE);
                     let mut middle_key = Vec::new();
                     new_page.split_into(&mut to_page, &mut middle_key);
@@ -79,9 +78,9 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> Index<BLOCK_SIZE, PAGE_SIZ
                     };
                     'split: loop {
                         match path.pop() {
-                            Some((parent_id, parent)) => 'attempt: loop {
+                            Some(parent_id) => 'attempt: loop {
                                 // try to write the delta to the parent
-                                match parent.write_delta(&delta) {
+                                match self.page_dir.get(parent_id).write_delta(&delta) {
                                     // if it succeeds, then we're done
                                     WriteRes::Ok => break 'split,
                                     // if it's sealed we need to keep trying
@@ -97,13 +96,22 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> Index<BLOCK_SIZE, PAGE_SIZ
                                         if let Err(()) = new_parent.apply_delta(&delta) {
                                             // if it fails, we need to split the parent
                                             let mut to_parent = InnerPageMut::new(PAGE_SIZE);
-                                            middle_key.clear();
-                                            new_parent.split_into(&mut to_parent, &mut middle_key);
+                                            // FIX: hot garbage
+                                            let mut temp_key = Vec::new();
+                                            new_parent.split_into(&mut to_parent, &mut temp_key);
+
+                                            if &middle_key <= &temp_key {
+                                                to_parent.apply_delta(&delta).unwrap();
+                                            } else {
+                                                new_parent.apply_delta(&delta).unwrap();
+                                            }
 
                                             self.page_dir.set(parent_id, new_parent.unpack());
                                             let to_parent_id =
                                                 self.page_dir.push(to_parent.unpack());
 
+                                            middle_key.clear();
+                                            middle_key.extend(temp_key);
                                             delta = InnerDelta::Set {
                                                 key: &middle_key,
                                                 left_page_id: to_parent_id,
@@ -125,6 +133,7 @@ impl<const BLOCK_SIZE: usize, const PAGE_SIZE: usize> Index<BLOCK_SIZE, PAGE_SIZ
 
                                 let new_root_id = self.page_dir.push(new_root.unpack());
                                 self.root.store(new_root_id, Ordering::Release);
+                                break 'split;
                             }
                         }
                     }
