@@ -1,9 +1,8 @@
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{BufReader, BufWriter, Write},
     ops::Range,
-    sync::Arc,
-    thread::{self, JoinHandle},
 };
 
 use rand::{
@@ -11,63 +10,75 @@ use rand::{
     seq::{IndexedMutRandom, IndexedRandom},
 };
 use rand_chacha::ChaCha8Rng;
-use store::index::Index;
+use store::{index, page::LeafPageMut};
 
 #[test]
 fn scratch() {
     fs::create_dir("sim").unwrap();
 
-    let index = Arc::new(Index::<8, { 1024 * 1024 }>::new(64));
+    const PAGE_SIZE: usize = 1024 * 1024;
+    let mut buf_pool = vec![LeafPageMut::new(PAGE_SIZE).unpack::<PAGE_SIZE>()];
+    let mut root = 1;
+    let mut next_pid = 2;
+    let mut page_dir = HashMap::from([(root, 0)]);
 
-    let threads: Vec<JoinHandle<()>> = (0..1)
-        .map(|t| {
-            let index = index.clone();
-            thread::Builder::new()
-                .name(format!("{t}"))
-                .spawn(move || {
-                    let num_ingest = 2048;
-                    let num_ops = 4096;
-                    let sim_file_path = format!("sim/sim_{t}");
+    let num_ingest = 2048;
+    let num_ops = 4096;
+    let sim_file_path = "sim/scratch".into();
 
-                    generate_sim(
-                        &sim_file_path,
-                        69 ^ t,
-                        num_ingest,
-                        num_ops,
-                        128..256,
-                        512..1024,
-                    );
+    generate_sim(
+        &sim_file_path,
+        69 ^ 420,
+        num_ingest,
+        num_ops,
+        128..256,
+        512..1024,
+    );
 
-                    let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
-                    let mut path_buf = Vec::new();
-                    for _ in 0..num_ingest {
-                        let (key, val): (Vec<u8>, Vec<u8>) =
-                            ciborium::from_reader(&mut sim_reader).unwrap();
-                        path_buf.clear();
-                        index.set(&key, &val, &mut path_buf).unwrap();
-                    }
+    let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
+    let mut path_buf = Vec::new();
+    for _ in 0..num_ingest {
+        let (key, val): (Vec<u8>, Vec<u8>) = ciborium::from_reader(&mut sim_reader).unwrap();
+        path_buf.clear();
+        index::set(
+            &mut buf_pool,
+            &mut page_dir,
+            &mut root,
+            &mut next_pid,
+            &key,
+            &val,
+            &mut path_buf,
+        );
+    }
 
-                    for _ in 0..num_ops {
-                        let (op, key, val): (String, Vec<u8>, Vec<u8>) =
-                            ciborium::from_reader(&mut sim_reader).unwrap();
-                        match op.as_str() {
-                            "get" => assert_eq!(&val, index.get(&key).unwrap()),
-                            "set" => {
-                                path_buf.clear();
-                                while let Err(()) = index.set(&key, &val, &mut path_buf) {
-                                    path_buf.clear();
-                                }
-                            }
-                            _ => panic!(),
-                        }
-                    }
-                })
-                .unwrap()
-        })
-        .collect();
+    let mut get_buf = Vec::new();
+    for o in 0..num_ops {
+        print!("op {o}:");
 
-    for t in threads {
-        t.join().unwrap()
+        let (op, key, val): (String, Vec<u8>, Vec<u8>) =
+            ciborium::from_reader(&mut sim_reader).unwrap();
+        match op.as_str() {
+            "get" => {
+                println!(" get");
+                get_buf.clear();
+                assert!(index::get(&buf_pool, &page_dir, root, &key, &mut get_buf));
+                assert_eq!(&val, &get_buf);
+            }
+            "set" => {
+                println!(" set");
+                path_buf.clear();
+                index::set(
+                    &mut buf_pool,
+                    &mut page_dir,
+                    &mut root,
+                    &mut next_pid,
+                    &key,
+                    &val,
+                    &mut path_buf,
+                );
+            }
+            _ => panic!(),
+        }
     }
 
     fs::remove_dir_all("sim").unwrap();
