@@ -498,7 +498,7 @@ impl InnerPageMut<'_> {
                 .try_into()
                 .unwrap(),
         );
-        self.set_right_page_id(middle_left_page_id);
+        other.set_right_page_id(middle_left_page_id);
 
         let middle_key = &self.buf[cursor - middle_key_len..cursor];
         out.extend(middle_key);

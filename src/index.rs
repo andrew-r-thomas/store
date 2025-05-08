@@ -6,16 +6,15 @@ use crate::{
 use std::{collections::HashMap, ops::Range};
 
 pub fn get<const PAGE_SIZE: usize>(
-    buf_pool: &Vec<PageBuffer<PAGE_SIZE>>,
-    page_dir: &HashMap<PageId, usize>,
-    root: PageId,
+    page_dir: &PageDir<PAGE_SIZE>,
 
     key: &[u8],
     buf: &mut Vec<u8>,
 ) -> bool {
-    let mut current = buf_pool[*page_dir.get(&root).unwrap()].read();
+    let mut current = page_dir.buf_pool[*page_dir.id_map.get(&page_dir.root).unwrap()].read();
     while let Page::Inner(inner_page) = current {
-        current = buf_pool[*page_dir.get(&inner_page.find_child(key)).unwrap()].read();
+        let child_id = &inner_page.find_child(key);
+        current = page_dir.buf_pool[*page_dir.id_map.get(child_id).unwrap()].read();
     }
 
     let leaf = current.unwrap_as_leaf();
@@ -28,29 +27,26 @@ pub fn get<const PAGE_SIZE: usize>(
     }
 }
 pub fn set<const PAGE_SIZE: usize>(
-    buf_pool: &mut Vec<PageBuffer<PAGE_SIZE>>,
-    page_dir: &mut HashMap<PageId, usize>,
-    root: &mut PageId,
-    next_pid: &mut PageId,
+    page_dir: &mut PageDir<PAGE_SIZE>,
 
     key: &[u8],
     val: &[u8],
     path: &mut Vec<(PageId, usize)>,
 ) {
-    let mut current_idx = *page_dir.get(root).unwrap();
-    path.push((*root, current_idx));
+    let mut current_idx = *page_dir.id_map.get(&page_dir.root).unwrap();
+    path.push((page_dir.root, current_idx));
 
-    while let Page::Inner(inner_page) = buf_pool[current_idx].read() {
+    while let Page::Inner(inner_page) = page_dir.buf_pool[current_idx].read() {
         let child_id = inner_page.find_child(key);
-        current_idx = *page_dir.get(&child_id).unwrap();
+        current_idx = *page_dir.id_map.get(&child_id).unwrap();
         path.push((child_id, current_idx));
     }
 
     let delta = LeafDelta::Set { key, val };
     let (leaf_id, leaf_idx) = path.pop().unwrap();
-    if let Err(()) = buf_pool[leaf_idx].write_delta(&delta) {
+    if let Err(()) = page_dir.buf_pool[leaf_idx].write_delta(&delta) {
         // first we compact the page
-        let old_page = buf_pool[leaf_idx].read().unwrap_as_leaf();
+        let old_page = page_dir.buf_pool[leaf_idx].read().unwrap_as_leaf();
         let mut new_page = LeafPageMut::new(PAGE_SIZE);
         new_page.compact(old_page);
 
@@ -69,16 +65,16 @@ pub fn set<const PAGE_SIZE: usize>(
             }
 
             // then we update the page dir with the new pages
-            let to_page_id = *next_pid;
-            *next_pid += 1;
-            let to_page_idx = buf_pool.len();
-            buf_pool.push(to_page.unpack());
-            page_dir.insert(to_page_id, to_page_idx);
-            buf_pool[leaf_idx] = new_page.unpack();
+            let to_page_id = page_dir.next_pid;
+            page_dir.next_pid += 1;
+            let to_page_idx = page_dir.buf_pool.len();
+            page_dir.buf_pool.push(to_page.unpack());
+            page_dir.id_map.insert(to_page_id, to_page_idx);
+            page_dir.buf_pool[leaf_idx] = new_page.unpack();
 
             // then we need to update the parent with the new key, which may cascade up to
             // the root, so we do it in a loop
-            let mut delta = InnerDelta::Set {
+            let mut parent_delta = InnerDelta::Set {
                 key: &middle_key,
                 left_page_id: to_page_id,
             };
@@ -87,16 +83,17 @@ pub fn set<const PAGE_SIZE: usize>(
                 match path.pop() {
                     Some((parent_id, parent_idx)) => {
                         // try to write the delta to the parent
-                        if let Err(()) =
-                            buf_pool[*page_dir.get(&parent_id).unwrap()].write_delta(&delta)
+                        if let Err(()) = page_dir.buf_pool
+                            [*page_dir.id_map.get(&parent_id).unwrap()]
+                        .write_delta(&parent_delta)
                         {
                             // compact the parent
-                            let old_parent = buf_pool[parent_idx].read().unwrap_as_inner();
+                            let old_parent = page_dir.buf_pool[parent_idx].read().unwrap_as_inner();
                             let mut new_parent = InnerPageMut::new(PAGE_SIZE);
                             new_parent.compact(old_parent);
 
                             // try to apply the delta to the compacted parent
-                            if let Err(()) = new_parent.apply_delta(&delta) {
+                            if let Err(()) = new_parent.apply_delta(&parent_delta) {
                                 // if it fails, we need to split the parent
                                 let mut to_parent = InnerPageMut::new(PAGE_SIZE);
                                 // FIX: hot garbage
@@ -104,21 +101,21 @@ pub fn set<const PAGE_SIZE: usize>(
                                 new_parent.split_into(&mut to_parent, &mut temp_key);
 
                                 if &middle_key <= &temp_key {
-                                    to_parent.apply_delta(&delta).unwrap();
+                                    to_parent.apply_delta(&parent_delta).unwrap();
                                 } else {
-                                    new_parent.apply_delta(&delta).unwrap();
+                                    new_parent.apply_delta(&parent_delta).unwrap();
                                 }
 
-                                let to_parent_id = *next_pid;
-                                *next_pid += 1;
-                                let to_parent_idx = buf_pool.len();
-                                buf_pool.push(to_parent.unpack());
-                                page_dir.insert(to_parent_id, to_parent_idx);
-                                buf_pool[parent_idx] = new_parent.unpack();
+                                let to_parent_id = page_dir.next_pid;
+                                page_dir.next_pid += 1;
+                                let to_parent_idx = page_dir.buf_pool.len();
+                                page_dir.buf_pool.push(to_parent.unpack());
+                                page_dir.id_map.insert(to_parent_id, to_parent_idx);
+                                page_dir.buf_pool[parent_idx] = new_parent.unpack();
 
                                 middle_key.clear();
                                 middle_key.extend(temp_key);
-                                delta = InnerDelta::Set {
+                                parent_delta = InnerDelta::Set {
                                     key: &middle_key,
                                     left_page_id: to_parent_id,
                                 };
@@ -126,30 +123,32 @@ pub fn set<const PAGE_SIZE: usize>(
 
                                 continue 'split;
                             } else {
-                                buf_pool[parent_idx] = new_parent.unpack();
+                                page_dir.buf_pool[parent_idx] = new_parent.unpack();
                                 break 'split;
                             }
+                        } else {
+                            break 'split;
                         }
                     }
                     None => {
                         // we split the root
                         let mut new_root = InnerPageMut::new(PAGE_SIZE);
-                        new_root.apply_delta(&delta).unwrap();
+                        new_root.apply_delta(&parent_delta).unwrap();
                         new_root.set_right_page_id(right);
 
-                        let new_root_id = *next_pid;
-                        *next_pid += 1;
-                        let new_root_idx = buf_pool.len();
-                        buf_pool.push(new_root.unpack());
-                        page_dir.insert(new_root_id, new_root_idx);
-                        *root = new_root_id;
+                        let new_root_id = page_dir.next_pid;
+                        page_dir.next_pid += 1;
+                        let new_root_idx = page_dir.buf_pool.len();
+                        page_dir.buf_pool.push(new_root.unpack());
+                        page_dir.id_map.insert(new_root_id, new_root_idx);
+                        page_dir.root = new_root_id;
 
                         break 'split;
                     }
                 }
             }
         } else {
-            buf_pool[leaf_idx] = new_page.unpack();
+            page_dir.buf_pool[leaf_idx] = new_page.unpack();
         }
     }
 }
@@ -162,3 +161,10 @@ pub fn iter_range(_range: Range<&[u8]>) -> RangeIter {
 }
 
 pub struct RangeIter {}
+
+pub struct PageDir<const PAGE_SIZE: usize> {
+    pub buf_pool: Vec<PageBuffer<PAGE_SIZE>>,
+    pub id_map: HashMap<PageId, usize>,
+    pub root: PageId,
+    pub next_pid: PageId,
+}

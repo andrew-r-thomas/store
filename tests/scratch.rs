@@ -10,7 +10,10 @@ use rand::{
     seq::{IndexedMutRandom, IndexedRandom},
 };
 use rand_chacha::ChaCha8Rng;
-use store::{index, page::LeafPageMut};
+use store::{
+    index::{self, PageDir},
+    page::LeafPageMut,
+};
 
 #[test]
 fn scratch() {
@@ -20,59 +23,46 @@ fn scratch() {
 fn get_set_sim() {
     fs::create_dir("sim").unwrap();
 
-    const PAGE_SIZE: usize = 1024 * 1024;
-    let mut buf_pool = vec![LeafPageMut::new(PAGE_SIZE).unpack::<PAGE_SIZE>()];
-    let mut root = 1;
-    let mut next_pid = 2;
-    let mut page_dir = HashMap::from([(root, 0)]);
+    const PAGE_SIZE: usize = 1024;
+    let mut page_dir = PageDir::<PAGE_SIZE> {
+        buf_pool: vec![LeafPageMut::new(PAGE_SIZE).unpack::<PAGE_SIZE>()],
+        root: 1,
+        next_pid: 2,
+        id_map: HashMap::from([(1, 0)]),
+    };
 
-    let num_ingest = 2048;
-    let num_ops = 4096;
+    let num_ingest = 4096;
+    let num_ops = 2048;
     let sim_file_path = "sim/scratch".into();
 
-    generate_sim(&sim_file_path, 42, num_ingest, num_ops, 64..128, 512..1024);
+    generate_sim(&sim_file_path, 42, num_ingest, num_ops, 8..9, 64..65);
 
     let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
     let mut path_buf = Vec::new();
     for _ in 0..num_ingest {
         let (key, val): (Vec<u8>, Vec<u8>) = ciborium::from_reader(&mut sim_reader).unwrap();
         path_buf.clear();
-        index::set(
-            &mut buf_pool,
-            &mut page_dir,
-            &mut root,
-            &mut next_pid,
-            &key,
-            &val,
-            &mut path_buf,
-        );
+        index::set(&mut page_dir, &key, &val, &mut path_buf);
     }
 
     let mut get_buf = Vec::new();
     for o in 0..num_ops {
-        print!("op {o}:");
+        println!("op {o}");
+        if o == 9 {
+            //
+        }
 
         let (op, key, val): (String, Vec<u8>, Vec<u8>) =
             ciborium::from_reader(&mut sim_reader).unwrap();
         match op.as_str() {
             "get" => {
-                println!(" get");
                 get_buf.clear();
-                assert!(index::get(&buf_pool, &page_dir, root, &key, &mut get_buf));
+                assert!(index::get(&page_dir, &key, &mut get_buf));
                 assert_eq!(&val, &get_buf);
             }
             "set" => {
-                println!(" set");
                 path_buf.clear();
-                index::set(
-                    &mut buf_pool,
-                    &mut page_dir,
-                    &mut root,
-                    &mut next_pid,
-                    &key,
-                    &val,
-                    &mut path_buf,
-                );
+                index::set(&mut page_dir, &key, &val, &mut path_buf);
             }
             _ => panic!(),
         }
@@ -105,7 +95,7 @@ fn generate_sim(
         entries.push((key, val));
     }
 
-    let ops = ["get", "insert"];
+    let ops = ["get"];
     for _ in 0..num_ops {
         match *ops.choose(&mut rng).unwrap() {
             "get" => {
