@@ -82,6 +82,7 @@ pub fn set<const PAGE_SIZE: usize>(
                 key: &middle_key,
                 left_page_id: to_page_id,
             };
+            let mut right = leaf_id;
             'split: loop {
                 match path.pop() {
                     Some((parent_id, parent_idx)) => {
@@ -121,6 +122,7 @@ pub fn set<const PAGE_SIZE: usize>(
                                     key: &middle_key,
                                     left_page_id: to_parent_id,
                                 };
+                                right = parent_id;
 
                                 continue 'split;
                             } else {
@@ -133,7 +135,7 @@ pub fn set<const PAGE_SIZE: usize>(
                         // we split the root
                         let mut new_root = InnerPageMut::new(PAGE_SIZE);
                         new_root.apply_delta(&delta).unwrap();
-                        new_root.set_right_page_id(leaf_id);
+                        new_root.set_right_page_id(right);
 
                         let new_root_id = *next_pid;
                         *next_pid += 1;
@@ -155,6 +157,8 @@ pub fn set<const PAGE_SIZE: usize>(
 pub fn delete(_key: &[u8]) -> Result<(), ()> {
     todo!()
 }
-pub fn iter_range(_range: Range<&[u8]>) {
+pub fn iter_range(_range: Range<&[u8]>) -> RangeIter {
     todo!()
 }
+
+pub struct RangeIter {}

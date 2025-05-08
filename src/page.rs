@@ -1023,7 +1023,6 @@ impl LeafPageMut<'_> {
             }
         }
     }
-    // FIX: deadass don't work
     /// NOTE: we always split left
     pub fn split_into(&mut self, other: &mut Self, out: &mut Vec<u8>) {
         let num_entries = self.num_entries() as usize;

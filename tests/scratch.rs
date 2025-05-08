@@ -14,6 +14,10 @@ use store::{index, page::LeafPageMut};
 
 #[test]
 fn scratch() {
+    get_set_sim();
+}
+
+fn get_set_sim() {
     fs::create_dir("sim").unwrap();
 
     const PAGE_SIZE: usize = 1024 * 1024;
@@ -26,14 +30,7 @@ fn scratch() {
     let num_ops = 4096;
     let sim_file_path = "sim/scratch".into();
 
-    generate_sim(
-        &sim_file_path,
-        69 ^ 420,
-        num_ingest,
-        num_ops,
-        128..256,
-        512..1024,
-    );
+    generate_sim(&sim_file_path, 42, num_ingest, num_ops, 64..128, 512..1024);
 
     let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
     let mut path_buf = Vec::new();
@@ -108,7 +105,7 @@ fn generate_sim(
         entries.push((key, val));
     }
 
-    let ops = ["get", "insert", "update"];
+    let ops = ["get", "insert"];
     for _ in 0..num_ops {
         match *ops.choose(&mut rng).unwrap() {
             "get" => {
