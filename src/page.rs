@@ -69,8 +69,11 @@ impl PageMut<'_> {
 pub mod inner {
     use crate::PageId;
 
-    use super::{CODE_SIZE, Delta, LEN_SIZE, PID_SIZE};
+    use super::{CODE_SIZE, Delta, LEN_SIZE, PID_SIZE, PageMut};
 
+    pub enum InnerDelta<'d> {
+        Split(&'d SplitDelta<'d>),
+    }
     pub struct SplitDelta<'d> {
         pub middle_key: &'d [u8],
         pub left_page_id: PageId,
@@ -107,13 +110,29 @@ pub mod inner {
     pub fn find_child(_page: &[u8], _key: &[u8]) -> PageId {
         todo!()
     }
+    pub fn compact<'p>(_old: &[u8], _new: &mut [u8]) -> PageMut<'p> {
+        todo!()
+    }
+    pub fn apply_delta(_page: &mut PageMut, _delta: InnerDelta) -> bool {
+        todo!()
+    }
+    pub fn split<'p>(
+        _from: &mut PageMut,
+        _to: &mut [u8],
+        _middle_key_buf: &mut Vec<u8>,
+    ) -> PageMut<'p> {
+        todo!()
+    }
+    pub fn set_right_pid(_buf: &mut [u8], _page_id: PageId) {
+        todo!()
+    }
 }
 
 pub mod leaf {
     use super::{CODE_SIZE, Delta, LEN_SIZE, PageMut};
 
     pub enum LeafDelta<'d> {
-        Set(SetDelta<'d>),
+        Set(&'d SetDelta<'d>),
     }
     pub struct SetDelta<'d> {
         pub key: &'d [u8],
@@ -164,7 +183,7 @@ pub mod leaf {
     pub fn compact<'p>(_old: &[u8], _new: &mut [u8]) -> PageMut<'p> {
         todo!()
     }
-    pub fn apply_delta(_page: &mut PageMut, _delta: &LeafDelta) -> bool {
+    pub fn apply_delta(_page: &mut PageMut, _delta: LeafDelta) -> bool {
         todo!()
     }
     pub fn split<'p>(
