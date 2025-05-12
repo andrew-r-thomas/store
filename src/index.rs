@@ -1,10 +1,6 @@
 use crate::{
     PageId,
-    page::{
-        self, PageBuffer, PageMut,
-        inner::{self, InnerDelta, SplitDelta},
-        leaf::{self, LeafDelta, SetDelta},
-    },
+    page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta},
 };
 
 use std::{collections::HashMap, ops::Range};
@@ -20,12 +16,12 @@ pub struct Index {
 impl Index {
     pub fn get(&self, key: &[u8], buf: &mut Vec<u8>) -> bool {
         let mut current = self.buf_pool[*self.id_map.get(&self.root).unwrap()].read();
-        while page::is_inner(current) {
-            let child_id = inner::find_child(current, key);
+        while current.is_inner() {
+            let child_id = current.search_inner(key);
             current = self.buf_pool[*self.id_map.get(&child_id).unwrap()].read();
         }
 
-        match leaf::get(current, key) {
+        match current.search_leaf(key) {
             Some(val) => {
                 buf.extend(val);
                 true
@@ -35,11 +31,11 @@ impl Index {
     }
     pub fn set(&mut self, key: &[u8], val: &[u8], path: &mut Vec<(PageId, usize)>) {
         let mut current_idx = *self.id_map.get(&self.root).unwrap();
-        let mut current = self.buf_pool[current_idx].read();
         path.push((self.root, current_idx));
+        let mut current = self.buf_pool[current_idx].read();
 
-        while page::is_inner(current) {
-            let child_id = inner::find_child(current, key);
+        while current.is_inner() {
+            let child_id = current.search_inner(key);
 
             current_idx = *self.id_map.get(&child_id).unwrap();
             current = self.buf_pool[current_idx].read();
@@ -48,25 +44,26 @@ impl Index {
 
         let delta = SetDelta { key, val };
         let (leaf_id, leaf_idx) = path.pop().unwrap();
-        if !self.buf_pool[leaf_idx].write_delta(&delta) {
+        if !self.buf_pool[leaf_idx].write_delta(&Delta::Set(delta)) {
             // first we compact the page
             let old_page = self.buf_pool[leaf_idx].read();
             let mut new_page = PageBuffer::new(self.page_size);
-            let mut new_page_mut = leaf::compact(old_page, new_page.raw_buffer());
+            let mut new_page_mut = PageMut::from(new_page.raw_buffer());
+            new_page_mut.compact(old_page);
 
             // then we try to apply the delta to the newly compacted page
-            if !leaf::apply_delta(&mut new_page_mut, LeafDelta::Set(&delta)) {
+            if !new_page_mut.apply_delta(&Delta::Set(delta)) {
                 // if it fails, we need to do a split
                 let mut to_page = PageBuffer::new(self.page_size);
+                let mut to_page_mut = PageMut::from(to_page.raw_buffer());
                 let mut middle_key = Vec::new();
-                let mut to_page_mut =
-                    leaf::split(&mut new_page_mut, to_page.raw_buffer(), &mut middle_key);
+                new_page_mut.split_into(&mut to_page_mut, &mut middle_key);
 
                 // then we apply the delta to the correct split page
                 if key <= &middle_key {
-                    leaf::apply_delta(&mut to_page_mut, LeafDelta::Set(&delta));
+                    to_page_mut.apply_delta(&Delta::Set(delta));
                 } else {
-                    leaf::apply_delta(&mut new_page_mut, LeafDelta::Set(&delta));
+                    new_page_mut.apply_delta(&Delta::Set(delta));
                 }
 
                 // then we update the page dir with the new pages
@@ -85,7 +82,7 @@ impl Index {
                 // the root, so we do it in a loop
                 let mut parent_delta = SplitDelta {
                     middle_key: &middle_key,
-                    left_page_id: to_page_id,
+                    left_pid: to_page_id,
                 };
                 let mut right = leaf_id;
                 'split: loop {
@@ -93,39 +90,27 @@ impl Index {
                         Some((parent_id, parent_idx)) => {
                             // try to write the delta to the parent
                             if !self.buf_pool[*self.id_map.get(&parent_id).unwrap()]
-                                .write_delta(&parent_delta)
+                                .write_delta(&Delta::Split(parent_delta))
                             {
                                 // compact the parent
                                 let old_parent = self.buf_pool[parent_idx].read();
                                 let mut new_parent = PageBuffer::new(self.page_size);
-                                let mut new_parent_mut =
-                                    inner::compact(old_parent, new_parent.raw_buffer());
+                                let mut new_parent_mut = PageMut::from(new_parent.raw_buffer());
+                                new_parent_mut.compact(old_parent);
 
                                 // try to apply the delta to the compacted parent
-                                if !inner::apply_delta(
-                                    &mut new_parent_mut,
-                                    InnerDelta::Split(&parent_delta),
-                                ) {
+                                if !new_parent_mut.apply_delta(&Delta::Split(parent_delta)) {
                                     // if it fails, we need to split the parent
                                     let mut to_parent = PageBuffer::new(self.page_size);
+                                    let mut to_parent_mut = PageMut::from(to_parent.raw_buffer());
                                     // FIX: hot garbage
                                     let mut temp_key = Vec::new();
-                                    let mut to_parent_mut = inner::split(
-                                        &mut new_parent_mut,
-                                        to_parent.raw_buffer(),
-                                        &mut temp_key,
-                                    );
+                                    new_parent_mut.split_into(&mut to_parent_mut, &mut temp_key);
 
                                     if &middle_key <= &temp_key {
-                                        inner::apply_delta(
-                                            &mut to_parent_mut,
-                                            InnerDelta::Split(&parent_delta),
-                                        );
+                                        to_parent_mut.apply_delta(&Delta::Split(parent_delta));
                                     } else {
-                                        inner::apply_delta(
-                                            &mut new_parent_mut,
-                                            InnerDelta::Split(&parent_delta),
-                                        );
+                                        new_parent_mut.apply_delta(&Delta::Split(parent_delta));
                                     }
 
                                     let to_parent_id = self.next_pid;
@@ -141,7 +126,7 @@ impl Index {
                                     middle_key.extend(temp_key);
                                     parent_delta = SplitDelta {
                                         middle_key: &middle_key,
-                                        left_page_id: to_parent_id,
+                                        left_pid: to_parent_id,
                                     };
                                     right = parent_id;
 
@@ -158,12 +143,9 @@ impl Index {
                         None => {
                             // we split the root
                             let mut new_root = PageBuffer::new(self.page_size);
-                            let mut new_root_mut = PageMut {
-                                buf: new_root.raw_buffer(),
-                                bottom: self.page_size, // FIX:
-                            };
-                            inner::apply_delta(&mut new_root_mut, InnerDelta::Split(&parent_delta));
-                            inner::set_right_pid(new_root_mut.buf, right);
+                            let mut new_root_mut = PageMut::from(new_root.raw_buffer());
+                            new_root_mut.apply_delta(&Delta::Split(parent_delta));
+                            new_root_mut.set_right_pid(right);
 
                             let new_root_id = self.next_pid;
                             self.next_pid += 1;
