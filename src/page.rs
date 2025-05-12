@@ -3,6 +3,8 @@ use std::{
     slice,
 };
 
+use crate::PageId;
+
 pub struct PageBuffer {
     ptr: *mut u8,
     top: usize,
@@ -41,6 +43,8 @@ impl PageBuffer {
 const CODE_SIZE: usize = 1;
 const LEN_SIZE: usize = 4;
 const PID_SIZE: usize = 8;
+const FOOTER_SIZE: usize = 9;
+
 pub trait Delta {
     const CODE: u8;
 
@@ -49,7 +53,7 @@ pub trait Delta {
 }
 
 const INNER_CODE: u8 = 1;
-const LEAF_CODE: u8 = 0;
+// const LEAF_CODE: u8 = 0;
 #[inline]
 pub fn is_inner(buf: &[u8]) -> bool {
     *buf.last().unwrap() == INNER_CODE
@@ -58,7 +62,6 @@ pub fn is_inner(buf: &[u8]) -> bool {
 pub struct PageMut<'p> {
     pub buf: &'p mut [u8],
     pub bottom: usize,
-    pub top: usize,
 }
 impl PageMut<'_> {
     pub fn pack(self) {
@@ -67,9 +70,11 @@ impl PageMut<'_> {
 }
 
 pub mod inner {
+    use super::{CODE_SIZE, Delta, LEN_SIZE, PID_SIZE, PageMut};
+
     use crate::PageId;
 
-    use super::{CODE_SIZE, Delta, LEN_SIZE, PID_SIZE, PageMut};
+    use std::ops::Range;
 
     pub enum InnerDelta<'d> {
         Split(&'d SplitDelta<'d>),
@@ -123,13 +128,19 @@ pub mod inner {
     ) -> PageMut<'p> {
         todo!()
     }
-    pub fn set_right_pid(_buf: &mut [u8], _page_id: PageId) {
-        todo!()
+    const RIGHT_PID_RANGE: Range<usize> = 2..10;
+    #[inline]
+    pub fn set_right_pid(page: &mut [u8], page_id: PageId) {
+        page[RIGHT_PID_RANGE].copy_from_slice(&page_id.to_be_bytes());
     }
 }
 
 pub mod leaf {
+    use crate::page::{FOOTER_SIZE, PID_SIZE};
+
     use super::{CODE_SIZE, Delta, LEN_SIZE, PageMut};
+
+    use std::ops::Range;
 
     pub enum LeafDelta<'d> {
         Set(&'d SetDelta<'d>),
@@ -183,7 +194,23 @@ pub mod leaf {
     pub fn compact<'p>(_old: &[u8], _new: &mut [u8]) -> PageMut<'p> {
         todo!()
     }
-    pub fn apply_delta(_page: &mut PageMut, _delta: LeafDelta) -> bool {
+    const NUM_ENTRIES_RANGE: Range<usize> = 0..2;
+    const SLOTS_START: usize = 2;
+    pub fn apply_delta(page: &mut PageMut, delta: LeafDelta) -> bool {
+        match delta {
+            LeafDelta::Set(set_delta) => {
+                let num_entries =
+                    u16::from_be_bytes(page.buf[NUM_ENTRIES_RANGE].try_into().unwrap()) as usize;
+                let mut cursor = page.buf.len() - FOOTER_SIZE;
+                for e in 0..num_entries {
+                    let key_len_start = SLOTS_START + ((LEN_SIZE * 2) * e);
+                    let key_len_end = key_len_start + LEN_SIZE;
+                    let key_len = u32::from_be_bytes(
+                        page.buf[key_len_start..key_len_end].try_into().unwrap(),
+                    ) as usize;
+                }
+            }
+        }
         todo!()
     }
     pub fn split<'p>(
@@ -191,6 +218,31 @@ pub mod leaf {
         _to: &mut [u8],
         _middle_key_buf: &mut Vec<u8>,
     ) -> PageMut<'p> {
+        todo!()
+    }
+}
+
+pub struct Page<'p> {
+    pub deltas: DeltaIter<'p>,
+    pub base: BasePage<'p>,
+}
+pub struct DeltaIter<'i> {
+    pub buf: &'i [u8],
+    pub top: usize,
+    pub bottom: usize,
+}
+// TODO: maybe we want slotted pages?
+pub struct BasePage<'b> {
+    pub entries: &'b [u8],
+    pub num_entries: usize,
+    pub left_pid: PageId,
+    pub right_pid: PageId,
+}
+impl Page<'_> {
+    pub fn get_eq(&self, _target: &[u8]) -> Option<&[u8]> {
+        todo!()
+    }
+    pub fn get_lte(&self, _target: &[u8]) -> Option<&[u8]> {
         todo!()
     }
 }
