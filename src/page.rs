@@ -35,8 +35,14 @@ impl PageBuffer {
 
         true
     }
-    pub fn raw_buffer(&mut self) -> &mut [u8] {
+
+    #[inline]
+    pub fn raw_buffer_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.ptr, self.cap) }
+    }
+    #[inline]
+    pub fn raw_buffer(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.ptr, self.cap) }
     }
 }
 
@@ -106,12 +112,11 @@ impl Page<'_> {
 impl<'p> From<&'p [u8]> for Page<'p> {
     fn from(buf: &'p [u8]) -> Self {
         let base_len =
-            u64::from_be_bytes(buf[buf.len() - Self::BASE_LEN_SIZE..].try_into().unwrap()) as usize;
+            u64::from_be_bytes(buf[buf.len() - BASE_LEN_SIZE..].try_into().unwrap()) as usize;
 
-        let deltas = DeltaIter::from(&buf[..buf.len() - (Self::BASE_LEN_SIZE + base_len)]);
-        let base = BasePage::from(
-            &buf[buf.len() - (Self::BASE_LEN_SIZE + base_len)..buf.len() - Self::BASE_LEN_SIZE],
-        );
+        let deltas = DeltaIter::from(&buf[..buf.len() - (BASE_LEN_SIZE + base_len)]);
+        let base =
+            BasePage::from(&buf[buf.len() - (BASE_LEN_SIZE + base_len)..buf.len() - BASE_LEN_SIZE]);
 
         Self { deltas, base }
     }
@@ -354,13 +359,13 @@ pub struct BasePage<'b> {
     pub entries: &'b [u8],
 }
 impl BasePage<'_> {
-    const NUM_ENTRIES_RANGE: Range<usize> = 0..2;
-    const LEFT_PID_RANGE: Range<usize> = 2..10;
-    const RIGHT_PID_RANGE: Range<usize> = 10..18;
+    pub const NUM_ENTRIES_RANGE: Range<usize> = 0..2;
+    pub const LEFT_PID_RANGE: Range<usize> = 2..10;
+    pub const RIGHT_PID_RANGE: Range<usize> = 10..18;
 
-    const OFFSETS_START: usize = 18;
+    pub const OFFSETS_START: usize = 18;
 
-    const OFFSET_SIZE: usize = 2;
+    pub const OFFSET_SIZE: usize = 2;
 
     // TODO: binary search
     //
@@ -453,33 +458,128 @@ pub struct InnerEntry<'e> {
     left_pid: PageId,
 }
 
-pub struct PageMut<'p> {
-    pub buf: &'p mut [u8],
-    pub bottom: usize,
+pub struct PageMut {
+    page: PageBuffer,
 }
-impl PageMut<'_> {
-    pub fn split_into(&mut self, _other: &mut Self, _middle_key_buf: &mut Vec<u8>) {
-        todo!()
-    }
-    pub fn compact(&mut self, _page: Page) {
-        todo!()
-    }
-    pub fn apply_delta(&mut self, _delta: &Delta) -> bool {
-        todo!()
-    }
-    pub fn pack(self) {
-        todo!()
-    }
-    pub fn set_right_pid(&mut self, _page_id: PageId) {
-        todo!()
-    }
-}
-impl<'p> From<&'p mut [u8]> for PageMut<'p> {
-    fn from(buf: &'p mut [u8]) -> Self {
-        buf.fill(0);
-        Self {
-            bottom: buf.len() - BASE_LEN_SIZE,
-            buf,
+impl PageMut {
+    pub fn split(&mut self, mut other: PageBuffer, middle_key_buf: &mut Vec<u8>) -> Self {
+        let buf = self.page.raw_buffer_mut();
+        let other_buf = other.raw_buffer_mut();
+
+        let num_entries = Self::num_entries(buf);
+        let middle_entry = num_entries / 2;
+
+        // in general, we copy everything over *including* the middle entry/offset, but if it's an
+        // inner page, we set the num_entries to one less, so it's not seen, and will be
+        // overwritten eventually, keeps things more simple
+
+        // first copy header info
+        let me_off_start = BasePage::OFFSETS_START + (middle_entry * BasePage::OFFSET_SIZE);
+        let me_off_end = me_off_start + BasePage::OFFSET_SIZE;
+        other_buf[..me_off_end].copy_from_slice(&buf[..me_off_end]);
+
+        // get the middle key, and copy it to the buf
+        let me_off = u16::from_be_bytes(buf[me_off_start..me_off_end].try_into().unwrap()) as usize;
+        let me_start = buf.len() - (BASE_LEN_SIZE + me_off);
+        let me_key_len =
+            u32::from_be_bytes(buf[me_start..me_start + LEN_SIZE].try_into().unwrap()) as usize;
+        let middle_key = &buf[me_start + LEN_SIZE..me_start + LEN_SIZE + me_key_len];
+        middle_key_buf.extend(middle_key);
+
+        // copy the entries over
+        other_buf[me_start..].copy_from_slice(&buf[me_start..]);
+
+        // set the num entries on the other page
+        if Self::left_pid(buf) == u64::MAX {
+            // inner
+            Self::set_num_entries(other_buf, middle_entry as u16);
+        } else {
+            // leaf
+            Self::set_num_entries(other_buf, (middle_entry + 1) as u16);
         }
+
+        // fix up this page
+        // first we move the offsets
+        let top = BasePage::OFFSETS_START + (num_entries * BasePage::OFFSET_SIZE);
+        buf.copy_within(me_off_end..top, BasePage::OFFSETS_START);
+
+        // then for each entry we're keeping, move the entry down, and update the offset
+        // (we could move the entries in one go, but this is more simple for now)
+        let new_num_entries = middle_entry - 1;
+        let mut entry_end = buf.len() - BASE_LEN_SIZE;
+        for e in 0..new_num_entries {
+            let off_start = BasePage::OFFSETS_START + (e * BasePage::OFFSET_SIZE);
+            let off_end = off_start + BasePage::OFFSET_SIZE;
+            let offset = u16::from_be_bytes(buf[off_start..off_end].try_into().unwrap()) as usize;
+            let entry_start = buf.len() - (BASE_LEN_SIZE + offset);
+            todo!()
+        }
+
+        todo!()
+    }
+    pub fn compact(mut page_buf: PageBuffer, page: Page) -> Self {
+        let buf = page_buf.raw_buffer_mut();
+
+        buf[BasePage::NUM_ENTRIES_RANGE]
+            .copy_from_slice(&(page.base.num_entries as u16).to_be_bytes());
+        buf[BasePage::LEFT_PID_RANGE].copy_from_slice(&page.base.left_pid.to_be_bytes());
+        buf[BasePage::RIGHT_PID_RANGE].copy_from_slice(&page.base.right_pid.to_be_bytes());
+        buf[BasePage::OFFSETS_START..BasePage::OFFSETS_START + page.base.offsets.len()]
+            .copy_from_slice(page.base.offsets);
+
+        let entries_start = buf.len() - (BASE_LEN_SIZE + page.base.entries.len());
+        let entries_end = entries_start + page.base.entries.len();
+        buf[entries_start..entries_end].copy_from_slice(page.base.entries);
+
+        let mut out = Self { page: page_buf };
+
+        for delta in page.deltas.rev() {
+            out.apply_delta(&delta);
+        }
+
+        out
+    }
+    pub fn apply_delta(&mut self, delta: &Delta) -> bool {
+        todo!()
+    }
+    pub fn pack(mut self) -> PageBuffer {
+        let buf = self.page.raw_buffer_mut();
+        let buf_len = buf.len();
+
+        let num_entries = Self::num_entries(buf);
+        let top = BasePage::OFFSETS_START + (BasePage::OFFSET_SIZE * num_entries);
+
+        buf.copy_within(..top, self.bottom - top);
+        let base_len = (buf_len - (self.bottom - top)) - BASE_LEN_SIZE;
+        buf[buf_len - BASE_LEN_SIZE..].copy_from_slice(&(base_len as u64).to_be_bytes());
+
+        self.page.cap = buf_len;
+        self.page.top = self.bottom - top;
+
+        self.page
+    }
+
+    pub fn set_right_pid(&mut self, page_id: PageId) {
+        let buf = self.page.raw_buffer_mut();
+        buf[BasePage::RIGHT_PID_RANGE].copy_from_slice(&page_id.to_be_bytes());
+    }
+
+    #[inline]
+    pub fn set_num_entries(buf: &mut [u8], num_entries: u16) {
+        buf[BasePage::NUM_ENTRIES_RANGE].copy_from_slice(&num_entries.to_be_bytes());
+    }
+
+    #[inline]
+    pub fn left_pid(buf: &[u8]) -> PageId {
+        u64::from_be_bytes(buf[BasePage::LEFT_PID_RANGE].try_into().unwrap())
+    }
+    #[inline]
+    pub fn num_entries(buf: &[u8]) -> usize {
+        u16::from_be_bytes(buf[BasePage::NUM_ENTRIES_RANGE].try_into().unwrap()) as usize
+    }
+}
+impl From<PageBuffer> for PageMut {
+    fn from(page: PageBuffer) -> Self {
+        Self { page }
     }
 }
