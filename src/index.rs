@@ -12,6 +12,8 @@ pub struct Index {
     pub root: PageId,
     pub next_pid: PageId,
     pub page_size: usize,
+
+    pub page_mut: PageMut,
 }
 impl Index {
     pub fn get(&self, key: &[u8], buf: &mut Vec<u8>) -> bool {
@@ -47,13 +49,15 @@ impl Index {
         if !self.buf_pool[leaf_idx].write_delta(&Delta::Set(delta)) {
             // first we compact the page
             let old_page = self.buf_pool[leaf_idx].read();
-            let mut new_page = PageMut::compact(PageBuffer::new(self.page_size), old_page);
+            let new_page = &mut self.page_mut;
+            new_page.clear();
+            new_page.compact(old_page);
 
             // then we try to apply the delta to the newly compacted page
             if !new_page.apply_delta(&Delta::Set(delta)) {
                 // if it fails, we need to do a split
                 let mut middle_key = Vec::new();
-                let mut to_page = new_page.split(PageBuffer::new(self.page_size), &mut middle_key);
+                let mut to_page = new_page.split_leaf(&mut middle_key);
 
                 // then we apply the delta to the correct split page
                 if key <= &middle_key {
@@ -66,9 +70,14 @@ impl Index {
                 let to_page_id = self.next_pid;
                 self.next_pid += 1;
                 let to_page_idx = self.buf_pool.len();
-                self.buf_pool.push(to_page.pack());
+                let mut to_page_buf = PageBuffer::new(self.page_size);
+                to_page.pack(&mut to_page_buf);
+                self.buf_pool.push(to_page_buf);
                 self.id_map.insert(to_page_id, to_page_idx);
-                self.buf_pool[leaf_idx] = new_page.pack();
+                // TODO: we could probably just reuse the old page buf here
+                let mut new_page_buf = PageBuffer::new(self.page_size);
+                new_page.pack(&mut new_page_buf);
+                self.buf_pool[leaf_idx] = new_page_buf;
 
                 // then we need to update the parent with the new key, which may cascade up to
                 // the root, so we do it in a loop
@@ -86,16 +95,16 @@ impl Index {
                             {
                                 // compact the parent
                                 let old_parent = self.buf_pool[parent_idx].read();
-                                let mut new_parent =
-                                    PageMut::compact(PageBuffer::new(self.page_size), old_parent);
+                                let new_parent = &mut self.page_mut;
+                                new_parent.clear();
+                                new_parent.compact(old_parent);
 
                                 // try to apply the delta to the compacted parent
                                 if !new_parent.apply_delta(&Delta::Split(parent_delta)) {
                                     // if it fails, we need to split the parent
                                     // FIX: hot garbage
                                     let mut temp_key = Vec::new();
-                                    let mut to_parent = new_parent
-                                        .split(PageBuffer::new(self.page_size), &mut temp_key);
+                                    let mut to_parent = new_parent.split_inner(&mut temp_key);
 
                                     if &middle_key <= &temp_key {
                                         to_parent.apply_delta(&Delta::Split(parent_delta));
@@ -106,9 +115,13 @@ impl Index {
                                     let to_parent_id = self.next_pid;
                                     self.next_pid += 1;
                                     let to_parent_idx = self.buf_pool.len();
-                                    self.buf_pool.push(to_parent.pack());
+                                    let mut to_parent_buf = PageBuffer::new(self.page_size);
+                                    to_parent.pack(&mut to_parent_buf);
+                                    self.buf_pool.push(to_parent_buf);
                                     self.id_map.insert(to_parent_id, to_parent_idx);
-                                    self.buf_pool[parent_idx] = new_parent.pack();
+                                    let mut new_parent_buf = PageBuffer::new(self.page_size);
+                                    new_parent.pack(&mut new_parent_buf);
+                                    self.buf_pool[parent_idx] = new_parent_buf;
 
                                     middle_key.clear();
                                     middle_key.extend(temp_key);
@@ -120,7 +133,9 @@ impl Index {
 
                                     continue 'split;
                                 } else {
-                                    self.buf_pool[parent_idx] = new_parent.pack();
+                                    let mut new_parent_buf = PageBuffer::new(self.page_size);
+                                    new_parent.pack(&mut new_parent_buf);
+                                    self.buf_pool[parent_idx] = new_parent_buf;
                                     break 'split;
                                 }
                             } else {
@@ -129,14 +144,18 @@ impl Index {
                         }
                         None => {
                             // we split the root
-                            let mut new_root = PageMut::from(PageBuffer::new(self.page_size));
+                            let new_root = &mut self.page_mut;
+                            new_root.clear();
                             new_root.apply_delta(&Delta::Split(parent_delta));
                             new_root.set_right_pid(right);
+                            new_root.set_left_pid(u64::MAX);
 
                             let new_root_id = self.next_pid;
                             self.next_pid += 1;
                             let new_root_idx = self.buf_pool.len();
-                            self.buf_pool.push(new_root.pack());
+                            let mut new_root_buf = PageBuffer::new(self.page_size);
+                            new_root.pack(&mut new_root_buf);
+                            self.buf_pool.push(new_root_buf);
                             self.id_map.insert(new_root_id, new_root_idx);
                             self.root = new_root_id;
 
@@ -145,7 +164,9 @@ impl Index {
                     }
                 }
             } else {
-                self.buf_pool[leaf_idx] = new_page.pack();
+                let mut new_page_buf = PageBuffer::new(self.page_size);
+                new_page.pack(&mut new_page_buf);
+                self.buf_pool[leaf_idx] = new_page_buf;
             }
         }
     }

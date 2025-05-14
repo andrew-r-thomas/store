@@ -1,5 +1,6 @@
 use std::{
     alloc::{self, Layout},
+    collections::BTreeMap,
     ops::Range,
     slice,
 };
@@ -82,14 +83,14 @@ impl Page<'_> {
         }
 
         match (self.base.search_inner(target), best) {
-            (Some(inner_entry), Some((key, pid))) => {
-                if inner_entry.key < key {
-                    inner_entry.left_pid
+            (Some((base_key, base_pid)), Some((best_key, best_pid))) => {
+                if base_key < best_key {
+                    base_pid
                 } else {
-                    pid
+                    best_pid
                 }
             }
-            (Some(inner_entry), None) => inner_entry.left_pid,
+            (Some((_, pid)), None) => pid,
             (None, Some((_, pid))) => pid,
             (None, None) => self.base.right_pid,
         }
@@ -355,30 +356,17 @@ pub struct BasePage<'b> {
     pub num_entries: usize,
     pub left_pid: PageId,
     pub right_pid: PageId,
-    pub offsets: &'b [u8],
     pub entries: &'b [u8],
 }
 impl BasePage<'_> {
     pub const NUM_ENTRIES_RANGE: Range<usize> = 0..2;
     pub const LEFT_PID_RANGE: Range<usize> = 2..10;
     pub const RIGHT_PID_RANGE: Range<usize> = 10..18;
+    pub const ENTRIES_START: usize = 18;
 
-    pub const OFFSETS_START: usize = 18;
-
-    pub const OFFSET_SIZE: usize = 2;
-
-    // TODO: binary search
-    //
-    /// returns the leftmost entry where the key is <= target, if it exists
-    pub fn search_inner(&self, target: &[u8]) -> Option<InnerEntry> {
-        for e in 0..self.num_entries {
-            let off_start = e * Self::OFFSET_SIZE;
-            let off_end = off_start + Self::OFFSET_SIZE;
-            let offset =
-                u16::from_be_bytes(self.offsets[off_start..off_end].try_into().unwrap()) as usize;
-
-            let mut cursor = self.entries.len() - offset;
-
+    pub fn search_inner(&self, target: &[u8]) -> Option<(&[u8], PageId)> {
+        let mut cursor = Self::ENTRIES_START;
+        for _ in 0..self.num_entries {
             let key_len =
                 u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
                     as usize;
@@ -387,24 +375,20 @@ impl BasePage<'_> {
             let key = &self.entries[cursor..cursor + key_len];
             cursor += key_len;
 
+            let left_pid =
+                u64::from_be_bytes(self.entries[cursor..cursor + PID_SIZE].try_into().unwrap());
+            cursor += PID_SIZE;
+
             if target <= key {
-                let left_pid =
-                    u64::from_be_bytes(self.entries[cursor..cursor + PID_SIZE].try_into().unwrap());
-                return Some(InnerEntry { key, left_pid });
+                return Some((key, left_pid));
             }
         }
 
         None
     }
     pub fn search_leaf(&self, target: &[u8]) -> Option<&[u8]> {
-        for e in 0..self.num_entries {
-            let off_start = e * Self::OFFSET_SIZE;
-            let off_end = off_start + Self::OFFSET_SIZE;
-            let offset =
-                u16::from_be_bytes(self.offsets[off_start..off_end].try_into().unwrap()) as usize;
-
-            let mut cursor = self.entries.len() - offset;
-
+        let mut cursor = Self::ENTRIES_START;
+        for _ in 0..self.num_entries {
             let key_len =
                 u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
                     as usize;
@@ -413,17 +397,60 @@ impl BasePage<'_> {
             let key = &self.entries[cursor..cursor + key_len];
             cursor += key_len;
 
+            let val_len =
+                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
+                    as usize;
+            cursor += LEN_SIZE;
+
+            let val = &self.entries[cursor..cursor + val_len];
+            cursor += val_len;
+
             if target == key {
-                let val_len =
-                    u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
-                        as usize;
-                cursor += LEN_SIZE;
-                let val = &self.entries[cursor..cursor + val_len];
                 return Some(val);
             }
         }
 
         None
+    }
+
+    pub fn iter_entries_inner(&self) -> impl Iterator<Item = (&[u8], PageId)> {
+        let mut cursor = Self::ENTRIES_START;
+        (0..self.num_entries).map(move |_| {
+            let key_len =
+                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
+                    as usize;
+            cursor += LEN_SIZE;
+
+            let key = &self.entries[cursor..cursor + key_len];
+            cursor += key_len;
+
+            let pid =
+                u64::from_be_bytes(self.entries[cursor..cursor + PID_SIZE].try_into().unwrap());
+            cursor += PID_SIZE;
+
+            (key, pid)
+        })
+    }
+    pub fn iter_entries_leaf(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let mut cursor = Self::ENTRIES_START;
+        (0..self.num_entries).map(move |_| {
+            let key_len =
+                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
+                    as usize;
+            cursor += LEN_SIZE;
+
+            let key = &self.entries[cursor..cursor + key_len];
+            cursor += key_len;
+
+            let val_len =
+                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
+                    as usize;
+            cursor += LEN_SIZE;
+            let val = &self.entries[cursor..cursor + val_len];
+            cursor += val_len;
+
+            (key, val)
+        })
     }
 
     #[inline]
@@ -438,148 +465,204 @@ impl<'b> From<&'b [u8]> for BasePage<'b> {
         let left_pid = u64::from_be_bytes(buf[Self::LEFT_PID_RANGE].try_into().unwrap());
         let right_pid = u64::from_be_bytes(buf[Self::RIGHT_PID_RANGE].try_into().unwrap());
 
-        let offsets_end = Self::OFFSETS_START + (Self::OFFSET_SIZE * num_entries);
-        let offsets = &buf[Self::OFFSETS_START..offsets_end];
-
-        let entries = &buf[offsets_end..];
+        let entries = &buf[Self::ENTRIES_START..];
 
         Self {
             num_entries,
             left_pid,
             right_pid,
-            offsets,
             entries,
         }
     }
 }
 
-pub struct InnerEntry<'e> {
-    key: &'e [u8],
-    left_pid: PageId,
-}
-
+// PERF: im just gonna be sloppy and allocate/free all over the place here, for some reason this
+// piece keeps tripping me up, so im just gonna make it easy for now. in general, this data is
+// pretty ephemeral, and the space can definitely be reused, since it's basically just scratch
+// space for doing compactions/splits/merges (eventually), it should be pretty straightforward to
+// make this better once i get a better sense of how it'll be used, and it definietly doesn't need
+// to be treated as a "page"
 pub struct PageMut {
-    page: PageBuffer,
+    entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    left_pid: PageId,
+    right_pid: PageId,
+    total_size: usize,
+    page_size: usize,
 }
 impl PageMut {
-    pub fn split(&mut self, mut other: PageBuffer, middle_key_buf: &mut Vec<u8>) -> Self {
-        let buf = self.page.raw_buffer_mut();
-        let other_buf = other.raw_buffer_mut();
-
-        let num_entries = Self::num_entries(buf);
-        let middle_entry = num_entries / 2;
-
-        // in general, we copy everything over *including* the middle entry/offset, but if it's an
-        // inner page, we set the num_entries to one less, so it's not seen, and will be
-        // overwritten eventually, keeps things more simple
-
-        // first copy header info
-        let me_off_start = BasePage::OFFSETS_START + (middle_entry * BasePage::OFFSET_SIZE);
-        let me_off_end = me_off_start + BasePage::OFFSET_SIZE;
-        other_buf[..me_off_end].copy_from_slice(&buf[..me_off_end]);
-
-        // get the middle key, and copy it to the buf
-        let me_off = u16::from_be_bytes(buf[me_off_start..me_off_end].try_into().unwrap()) as usize;
-        let me_start = buf.len() - (BASE_LEN_SIZE + me_off);
-        let me_key_len =
-            u32::from_be_bytes(buf[me_start..me_start + LEN_SIZE].try_into().unwrap()) as usize;
-        let middle_key = &buf[me_start + LEN_SIZE..me_start + LEN_SIZE + me_key_len];
-        middle_key_buf.extend(middle_key);
-
-        // copy the entries over
-        other_buf[me_start..].copy_from_slice(&buf[me_start..]);
-
-        // set the num entries on the other page
-        if Self::left_pid(buf) == u64::MAX {
-            // inner
-            Self::set_num_entries(other_buf, middle_entry as u16);
-        } else {
-            // leaf
-            Self::set_num_entries(other_buf, (middle_entry + 1) as u16);
+    pub fn new(page_size: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            left_pid: 0,
+            right_pid: 0,
+            total_size: BasePage::ENTRIES_START + BASE_LEN_SIZE,
+            page_size,
         }
-
-        // fix up this page
-        // first we move the offsets
-        let top = BasePage::OFFSETS_START + (num_entries * BasePage::OFFSET_SIZE);
-        buf.copy_within(me_off_end..top, BasePage::OFFSETS_START);
-
-        // then for each entry we're keeping, move the entry down, and update the offset
-        // (we could move the entries in one go, but this is more simple for now)
-        let new_num_entries = middle_entry - 1;
-        let mut entry_end = buf.len() - BASE_LEN_SIZE;
-        for e in 0..new_num_entries {
-            let off_start = BasePage::OFFSETS_START + (e * BasePage::OFFSET_SIZE);
-            let off_end = off_start + BasePage::OFFSET_SIZE;
-            let offset = u16::from_be_bytes(buf[off_start..off_end].try_into().unwrap()) as usize;
-            let entry_start = buf.len() - (BASE_LEN_SIZE + offset);
-            todo!()
-        }
-
-        todo!()
     }
-    pub fn compact(mut page_buf: PageBuffer, page: Page) -> Self {
-        let buf = page_buf.raw_buffer_mut();
-
-        buf[BasePage::NUM_ENTRIES_RANGE]
-            .copy_from_slice(&(page.base.num_entries as u16).to_be_bytes());
-        buf[BasePage::LEFT_PID_RANGE].copy_from_slice(&page.base.left_pid.to_be_bytes());
-        buf[BasePage::RIGHT_PID_RANGE].copy_from_slice(&page.base.right_pid.to_be_bytes());
-        buf[BasePage::OFFSETS_START..BasePage::OFFSETS_START + page.base.offsets.len()]
-            .copy_from_slice(page.base.offsets);
-
-        let entries_start = buf.len() - (BASE_LEN_SIZE + page.base.entries.len());
-        let entries_end = entries_start + page.base.entries.len();
-        buf[entries_start..entries_end].copy_from_slice(page.base.entries);
-
-        let mut out = Self { page: page_buf };
-
-        for delta in page.deltas.rev() {
-            out.apply_delta(&delta);
+    pub fn compact(&mut self, page: Page) {
+        // build up the base page
+        self.left_pid = page.base.left_pid;
+        self.right_pid = page.base.right_pid;
+        match page.is_inner() {
+            true => {
+                for (key, pid) in page.base.iter_entries_inner() {
+                    self.entries
+                        .insert(Vec::from(key), Vec::from(&pid.to_be_bytes()));
+                    self.total_size += LEN_SIZE + key.len() + PID_SIZE;
+                }
+            }
+            false => {
+                for (key, val) in page.base.iter_entries_leaf() {
+                    self.entries.insert(Vec::from(key), Vec::from(val));
+                    self.total_size += (2 * LEN_SIZE) + key.len() + val.len();
+                }
+            }
         }
 
-        out
+        // apply the deltas
+        for delta in page.deltas.rev() {
+            self.apply_delta(&delta);
+        }
     }
     pub fn apply_delta(&mut self, delta: &Delta) -> bool {
-        todo!()
+        match delta {
+            Delta::Set(set_delta) => {
+                assert_ne!(self.left_pid, u64::MAX);
+                match self
+                    .entries
+                    .insert(Vec::from(set_delta.key), Vec::from(set_delta.val))
+                {
+                    Some(old_val) => {
+                        if old_val.len() < set_delta.val.len()
+                            && set_delta.val.len() - old_val.len()
+                                > self.page_size - self.total_size
+                        {
+                            // not enough space within the logical page size
+                            self.entries.insert(Vec::from(set_delta.key), old_val);
+                            return false;
+                        }
+                        self.total_size -= old_val.len();
+                        self.total_size += set_delta.val.len();
+                    }
+                    None => {
+                        if (LEN_SIZE * 2) + set_delta.key.len() + set_delta.val.len()
+                            > self.page_size - self.total_size
+                        {
+                            self.entries.remove(set_delta.key);
+                            return false;
+                        }
+                        self.total_size +=
+                            (LEN_SIZE * 2) + set_delta.key.len() + set_delta.val.len()
+                    }
+                }
+            }
+            Delta::Split(split_delta) => {
+                assert_eq!(self.left_pid, u64::MAX);
+                // splits are always inserts, not updates
+                if LEN_SIZE + split_delta.middle_key.len() + PID_SIZE
+                    > self.page_size - self.total_size
+                {
+                    return false;
+                }
+                self.entries.insert(
+                    Vec::from(split_delta.middle_key),
+                    Vec::from(&split_delta.left_pid.to_be_bytes()),
+                );
+                self.total_size += LEN_SIZE + split_delta.middle_key.len() + PID_SIZE;
+            }
+        }
+
+        true
     }
-    pub fn pack(mut self) -> PageBuffer {
-        let buf = self.page.raw_buffer_mut();
-        let buf_len = buf.len();
+    pub fn split_inner(&mut self, middle_key_buf: &mut Vec<u8>) -> Self {
+        assert_eq!(self.left_pid, u64::MAX);
 
-        let num_entries = Self::num_entries(buf);
-        let top = BasePage::OFFSETS_START + (BasePage::OFFSET_SIZE * num_entries);
+        let mut other = Self::new(self.page_size);
+        other.left_pid = self.left_pid;
+        other.right_pid = self.right_pid;
 
-        buf.copy_within(..top, self.bottom - top);
-        let base_len = (buf_len - (self.bottom - top)) - BASE_LEN_SIZE;
-        buf[buf_len - BASE_LEN_SIZE..].copy_from_slice(&(base_len as u64).to_be_bytes());
+        // this is so dumb
+        let middle_entry_i = self.entries.len() / 2;
+        let mut i = 0;
+        while i < middle_entry_i {
+            let entry = self.entries.pop_first().unwrap();
+            self.total_size -= LEN_SIZE + entry.0.len() + PID_SIZE;
+            other.total_size += LEN_SIZE + entry.0.len() + PID_SIZE;
+            other.entries.insert(entry.0, entry.1);
+            i += 1;
+        }
+        let middle_entry = self.entries.pop_first().unwrap();
+        self.total_size -= LEN_SIZE + middle_entry.0.len() + PID_SIZE;
+        middle_key_buf.extend(middle_entry.0);
 
-        self.page.cap = buf_len;
-        self.page.top = self.bottom - top;
-
-        self.page
+        other
     }
+    pub fn split_leaf(&mut self, middle_key_buf: &mut Vec<u8>) -> Self {
+        assert_ne!(self.left_pid, u64::MAX);
 
+        let mut other = Self::new(self.page_size);
+        other.left_pid = self.left_pid;
+        other.right_pid = self.right_pid;
+
+        let middle_entry_i = self.entries.len() / 2;
+        let mut i = 0;
+        while i < middle_entry_i {
+            let entry = self.entries.pop_first().unwrap();
+            self.total_size -= LEN_SIZE + entry.0.len() + LEN_SIZE + entry.1.len();
+            other.total_size += LEN_SIZE + entry.0.len() + LEN_SIZE + entry.1.len();
+            other.entries.insert(entry.0, entry.1);
+            i += 1;
+        }
+        let middle_entry = self.entries.pop_first().unwrap();
+        middle_key_buf.extend(&middle_entry.0);
+        self.total_size -= LEN_SIZE + middle_entry.0.len() + PID_SIZE;
+        other.total_size += LEN_SIZE + middle_entry.0.len() + PID_SIZE;
+        other.entries.insert(middle_entry.0, middle_entry.1);
+
+        other
+    }
+    #[inline]
     pub fn set_right_pid(&mut self, page_id: PageId) {
-        let buf = self.page.raw_buffer_mut();
-        buf[BasePage::RIGHT_PID_RANGE].copy_from_slice(&page_id.to_be_bytes());
+        self.right_pid = page_id;
     }
+    #[inline]
+    pub fn set_left_pid(&mut self, page_id: PageId) {
+        self.left_pid = page_id;
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.left_pid = 0;
+        self.right_pid = 0;
+        self.total_size = BasePage::ENTRIES_START + BASE_LEN_SIZE;
+    }
+    pub fn pack(&mut self, page_buf: &mut PageBuffer) {
+        assert_eq!(page_buf.cap, self.page_size);
 
-    #[inline]
-    pub fn set_num_entries(buf: &mut [u8], num_entries: u16) {
-        buf[BasePage::NUM_ENTRIES_RANGE].copy_from_slice(&num_entries.to_be_bytes());
-    }
+        let top = page_buf.cap - (self.total_size + BASE_LEN_SIZE);
+        page_buf.top = top;
+        let buf = &mut page_buf.raw_buffer_mut()[top..];
 
-    #[inline]
-    pub fn left_pid(buf: &[u8]) -> PageId {
-        u64::from_be_bytes(buf[BasePage::LEFT_PID_RANGE].try_into().unwrap())
-    }
-    #[inline]
-    pub fn num_entries(buf: &[u8]) -> usize {
-        u16::from_be_bytes(buf[BasePage::NUM_ENTRIES_RANGE].try_into().unwrap()) as usize
-    }
-}
-impl From<PageBuffer> for PageMut {
-    fn from(page: PageBuffer) -> Self {
-        Self { page }
+        buf[BasePage::NUM_ENTRIES_RANGE]
+            .copy_from_slice(&(self.entries.len() as u16).to_be_bytes());
+        buf[BasePage::LEFT_PID_RANGE].copy_from_slice(&self.left_pid.to_be_bytes());
+        buf[BasePage::RIGHT_PID_RANGE].copy_from_slice(&self.right_pid.to_be_bytes());
+
+        let mut cursor = BasePage::ENTRIES_START;
+        for entry in self.entries.iter() {
+            buf[cursor..cursor + LEN_SIZE].copy_from_slice(&(entry.0.len() as u32).to_be_bytes());
+            cursor += LEN_SIZE;
+            buf[cursor..cursor + entry.0.len()].copy_from_slice(entry.0);
+            cursor += entry.0.len();
+
+            if self.left_pid == u64::MAX {
+                buf[cursor..cursor + PID_SIZE].copy_from_slice(entry.1);
+            } else {
+                buf[cursor..cursor + LEN_SIZE]
+                    .copy_from_slice(&(entry.1.len() as u32).to_be_bytes());
+                cursor += LEN_SIZE;
+                buf[cursor..cursor + entry.1.len()].copy_from_slice(entry.1);
+                cursor += entry.1.len();
+            }
+        }
     }
 }
