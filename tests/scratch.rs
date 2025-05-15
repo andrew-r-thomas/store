@@ -13,37 +13,20 @@ use store::index::Index;
 
 #[test]
 fn scratch() {
-    const PAGE_SIZE: usize = 1024;
-    let mut index = Index::new(PAGE_SIZE);
-
-    for i in 0_u64..4096 {
-        println!("set {i}");
-        let bytes = &i.to_be_bytes();
-        index.set(bytes, bytes);
-    }
-    let mut val_buf = Vec::new();
-    for i in 0_u64..4096 {
-        println!("get {i}");
-        let bytes = &i.to_be_bytes();
-        val_buf.clear();
-        assert!(index.get(bytes, &mut val_buf));
-        assert_eq!(val_buf, bytes);
-    }
+    get_set_sim()
 }
 
 fn get_set_sim() {
     fs::create_dir("sim").unwrap();
 
-    const PAGE_SIZE: usize = 1024;
+    const PAGE_SIZE: usize = 1024 * 1024;
     let mut index = Index::new(PAGE_SIZE);
 
-    let num_ingest = 64;
+    let num_ingest = 1024;
     let num_ops = 2048;
     let sim_file_path = "sim/scratch".into();
 
-    // TODO: let's try to make this ordered and with actual numbers for the keys instead of random
-    // values, should give us an easier way to see what's going on
-    generate_sim(&sim_file_path, 42, num_ingest, num_ops, 8..9, 64..65);
+    generate_sim(&sim_file_path, 42, num_ingest, num_ops, 128..256, 512..1024);
 
     let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
     for i in 0..num_ingest {
@@ -97,7 +80,7 @@ fn generate_sim(
         entries.push((key, val));
     }
 
-    let ops = ["get"];
+    let ops = ["get", "insert", "update"];
     for _ in 0..num_ops {
         match *ops.choose(&mut rng).unwrap() {
             "get" => {
