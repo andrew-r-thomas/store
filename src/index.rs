@@ -14,8 +14,29 @@ pub struct Index {
     pub page_size: usize,
 
     pub page_mut: PageMut,
+    pub path: Vec<(PageId, usize)>,
 }
 impl Index {
+    pub fn new(page_size: usize) -> Self {
+        let mut root_page = PageMut::new(page_size);
+        let mut root_buf = PageBuffer::new(page_size);
+        root_page.pack(&mut root_buf);
+        root_page.clear();
+
+        let buf_pool = vec![root_buf];
+        let root = 1;
+        let id_map = HashMap::from([(root, 0)]);
+
+        Self {
+            buf_pool,
+            id_map,
+            root,
+            next_pid: 2,
+            page_size,
+            page_mut: root_page,
+            path: Vec::new(),
+        }
+    }
     pub fn get(&self, key: &[u8], buf: &mut Vec<u8>) -> bool {
         let mut current = self.buf_pool[*self.id_map.get(&self.root).unwrap()].read();
         while current.is_inner() {
@@ -31,9 +52,10 @@ impl Index {
             None => false,
         }
     }
-    pub fn set(&mut self, key: &[u8], val: &[u8], path: &mut Vec<(PageId, usize)>) {
+    pub fn set(&mut self, key: &[u8], val: &[u8]) {
         let mut current_idx = *self.id_map.get(&self.root).unwrap();
-        path.push((self.root, current_idx));
+        self.path.clear();
+        self.path.push((self.root, current_idx));
         let mut current = self.buf_pool[current_idx].read();
 
         while current.is_inner() {
@@ -41,11 +63,11 @@ impl Index {
 
             current_idx = *self.id_map.get(&child_id).unwrap();
             current = self.buf_pool[current_idx].read();
-            path.push((child_id, current_idx));
+            self.path.push((child_id, current_idx));
         }
 
         let delta = SetDelta { key, val };
-        let (leaf_id, leaf_idx) = path.pop().unwrap();
+        let (leaf_id, leaf_idx) = self.path.pop().unwrap();
         if !self.buf_pool[leaf_idx].write_delta(&Delta::Set(delta)) {
             // first we compact the page
             let old_page = self.buf_pool[leaf_idx].read();
@@ -87,7 +109,7 @@ impl Index {
                 };
                 let mut right = leaf_id;
                 'split: loop {
-                    match path.pop() {
+                    match self.path.pop() {
                         Some((parent_id, parent_idx)) => {
                             // try to write the delta to the parent
                             if !self.buf_pool[*self.id_map.get(&parent_id).unwrap()]
@@ -146,9 +168,9 @@ impl Index {
                             // we split the root
                             let new_root = &mut self.page_mut;
                             new_root.clear();
-                            new_root.apply_delta(&Delta::Split(parent_delta));
                             new_root.set_right_pid(right);
                             new_root.set_left_pid(u64::MAX);
+                            new_root.apply_delta(&Delta::Split(parent_delta));
 
                             let new_root_id = self.next_pid;
                             self.next_pid += 1;

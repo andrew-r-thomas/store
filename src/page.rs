@@ -71,7 +71,7 @@ impl Page<'_> {
                         match best {
                             Some((key, _)) => {
                                 if split_delta.middle_key < key {
-                                    Some((split_delta.middle_key, split_delta.left_pid));
+                                    best = Some((split_delta.middle_key, split_delta.left_pid));
                                 }
                             }
                             None => best = Some((split_delta.middle_key, split_delta.left_pid)),
@@ -365,56 +365,24 @@ impl BasePage<'_> {
     pub const ENTRIES_START: usize = 18;
 
     pub fn search_inner(&self, target: &[u8]) -> Option<(&[u8], PageId)> {
-        let mut cursor = Self::ENTRIES_START;
-        for _ in 0..self.num_entries {
-            let key_len =
-                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
-                    as usize;
-            cursor += LEN_SIZE;
-
-            let key = &self.entries[cursor..cursor + key_len];
-            cursor += key_len;
-
-            let left_pid =
-                u64::from_be_bytes(self.entries[cursor..cursor + PID_SIZE].try_into().unwrap());
-            cursor += PID_SIZE;
-
-            if target <= key {
-                return Some((key, left_pid));
+        for entry in self.iter_entries_inner() {
+            if target <= entry.0 {
+                return Some(entry);
             }
         }
-
         None
     }
     pub fn search_leaf(&self, target: &[u8]) -> Option<&[u8]> {
-        let mut cursor = Self::ENTRIES_START;
-        for _ in 0..self.num_entries {
-            let key_len =
-                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
-                    as usize;
-            cursor += LEN_SIZE;
-
-            let key = &self.entries[cursor..cursor + key_len];
-            cursor += key_len;
-
-            let val_len =
-                u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
-                    as usize;
-            cursor += LEN_SIZE;
-
-            let val = &self.entries[cursor..cursor + val_len];
-            cursor += val_len;
-
-            if target == key {
-                return Some(val);
+        for entry in self.iter_entries_leaf() {
+            if target == entry.0 {
+                return Some(entry.1);
             }
         }
-
         None
     }
 
     pub fn iter_entries_inner(&self) -> impl Iterator<Item = (&[u8], PageId)> {
-        let mut cursor = Self::ENTRIES_START;
+        let mut cursor = 0;
         (0..self.num_entries).map(move |_| {
             let key_len =
                 u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
@@ -432,7 +400,7 @@ impl BasePage<'_> {
         })
     }
     pub fn iter_entries_leaf(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        let mut cursor = Self::ENTRIES_START;
+        let mut cursor = 0;
         (0..self.num_entries).map(move |_| {
             let key_len =
                 u32::from_be_bytes(self.entries[cursor..cursor + LEN_SIZE].try_into().unwrap())
@@ -579,7 +547,6 @@ impl PageMut {
 
         let mut other = Self::new(self.page_size);
         other.left_pid = self.left_pid;
-        other.right_pid = self.right_pid;
 
         // this is so dumb
         let middle_entry_i = self.entries.len() / 2;
@@ -594,6 +561,7 @@ impl PageMut {
         let middle_entry = self.entries.pop_first().unwrap();
         self.total_size -= LEN_SIZE + middle_entry.0.len() + PID_SIZE;
         middle_key_buf.extend(middle_entry.0);
+        other.right_pid = u64::from_be_bytes(middle_entry.1.try_into().unwrap());
 
         other
     }
@@ -602,7 +570,7 @@ impl PageMut {
 
         let mut other = Self::new(self.page_size);
         other.left_pid = self.left_pid;
-        other.right_pid = self.right_pid;
+        // other.right_pid = self.right_pid;
 
         let middle_entry_i = self.entries.len() / 2;
         let mut i = 0;
@@ -615,8 +583,8 @@ impl PageMut {
         }
         let middle_entry = self.entries.pop_first().unwrap();
         middle_key_buf.extend(&middle_entry.0);
-        self.total_size -= LEN_SIZE + middle_entry.0.len() + PID_SIZE;
-        other.total_size += LEN_SIZE + middle_entry.0.len() + PID_SIZE;
+        self.total_size -= LEN_SIZE + middle_entry.0.len() + LEN_SIZE + middle_entry.1.len();
+        other.total_size += LEN_SIZE + middle_entry.0.len() + LEN_SIZE + middle_entry.1.len();
         other.entries.insert(middle_entry.0, middle_entry.1);
 
         other
@@ -638,7 +606,7 @@ impl PageMut {
     pub fn pack(&mut self, page_buf: &mut PageBuffer) {
         assert_eq!(page_buf.cap, self.page_size);
 
-        let top = page_buf.cap - (self.total_size + BASE_LEN_SIZE);
+        let top = page_buf.cap - self.total_size;
         page_buf.top = top;
         let buf = &mut page_buf.raw_buffer_mut()[top..];
 
@@ -656,6 +624,7 @@ impl PageMut {
 
             if self.left_pid == u64::MAX {
                 buf[cursor..cursor + PID_SIZE].copy_from_slice(entry.1);
+                cursor += PID_SIZE;
             } else {
                 buf[cursor..cursor + LEN_SIZE]
                     .copy_from_slice(&(entry.1.len() as u32).to_be_bytes());
@@ -664,5 +633,9 @@ impl PageMut {
                 cursor += entry.1.len();
             }
         }
+
+        let buf_len = buf.len();
+        buf[buf_len - BASE_LEN_SIZE..]
+            .copy_from_slice(&((buf_len - BASE_LEN_SIZE) as u64).to_be_bytes());
     }
 }

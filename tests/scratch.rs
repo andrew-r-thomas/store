@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs::{self, File},
     io::{BufReader, BufWriter, Write},
     ops::Range,
@@ -10,62 +9,68 @@ use rand::{
     seq::{IndexedMutRandom, IndexedRandom},
 };
 use rand_chacha::ChaCha8Rng;
-use store::index::{self, Index};
+use store::index::Index;
 
 #[test]
 fn scratch() {
-    get_set_sim();
+    const PAGE_SIZE: usize = 1024;
+    let mut index = Index::new(PAGE_SIZE);
+
+    for i in 0_u64..4096 {
+        println!("set {i}");
+        let bytes = &i.to_be_bytes();
+        index.set(bytes, bytes);
+    }
+    let mut val_buf = Vec::new();
+    for i in 0_u64..4096 {
+        println!("get {i}");
+        let bytes = &i.to_be_bytes();
+        val_buf.clear();
+        assert!(index.get(bytes, &mut val_buf));
+        assert_eq!(val_buf, bytes);
+    }
 }
 
 fn get_set_sim() {
-    // fs::create_dir("sim").unwrap();
-    //
-    // const PAGE_SIZE: usize = 1024;
-    // let mut page_dir = PageDir {
-    //     buf_pool: vec![LeafPageMut::new(PAGE_SIZE).unpack::<PAGE_SIZE>()],
-    //     root: 1,
-    //     next_pid: 2,
-    //     id_map: HashMap::from([(1, 0)]),
-    // };
-    //
-    // let num_ingest = 4096;
-    // let num_ops = 2048;
-    // let sim_file_path = "sim/scratch".into();
-    //
-    // generate_sim(&sim_file_path, 42, num_ingest, num_ops, 8..9, 64..65);
-    //
-    // let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
-    // let mut path_buf = Vec::new();
-    // for _ in 0..num_ingest {
-    //     let (key, val): (Vec<u8>, Vec<u8>) = ciborium::from_reader(&mut sim_reader).unwrap();
-    //     path_buf.clear();
-    //     index::set(&mut page_dir, &key, &val, &mut path_buf);
-    // }
-    //
-    // let mut get_buf = Vec::new();
-    // for o in 0..num_ops {
-    //     println!("op {o}");
-    //     if o == 9 {
-    //         //
-    //     }
-    //
-    //     let (op, key, val): (String, Vec<u8>, Vec<u8>) =
-    //         ciborium::from_reader(&mut sim_reader).unwrap();
-    //     match op.as_str() {
-    //         "get" => {
-    //             get_buf.clear();
-    //             assert!(index::get(&page_dir, &key, &mut get_buf));
-    //             assert_eq!(&val, &get_buf);
-    //         }
-    //         "set" => {
-    //             path_buf.clear();
-    //             index::set(&mut page_dir, &key, &val, &mut path_buf);
-    //         }
-    //         _ => panic!(),
-    //     }
-    // }
-    //
-    // fs::remove_dir_all("sim").unwrap();
+    fs::create_dir("sim").unwrap();
+
+    const PAGE_SIZE: usize = 1024;
+    let mut index = Index::new(PAGE_SIZE);
+
+    let num_ingest = 64;
+    let num_ops = 2048;
+    let sim_file_path = "sim/scratch".into();
+
+    // TODO: let's try to make this ordered and with actual numbers for the keys instead of random
+    // values, should give us an easier way to see what's going on
+    generate_sim(&sim_file_path, 42, num_ingest, num_ops, 8..9, 64..65);
+
+    let mut sim_reader = BufReader::new(File::open(&sim_file_path).unwrap());
+    for i in 0..num_ingest {
+        println!("ingest {i}");
+        let (key, val): (Vec<u8>, Vec<u8>) = ciborium::from_reader(&mut sim_reader).unwrap();
+        index.set(&key, &val);
+    }
+
+    let mut get_buf = Vec::new();
+    for o in 0..num_ops {
+        println!("op {o}");
+        let (op, key, val): (String, Vec<u8>, Vec<u8>) =
+            ciborium::from_reader(&mut sim_reader).unwrap();
+        match op.as_str() {
+            "get" => {
+                get_buf.clear();
+                assert!(index.get(&key, &mut get_buf));
+                assert_eq!(&val, &get_buf);
+            }
+            "set" => {
+                index.set(&key, &val);
+            }
+            _ => panic!(),
+        }
+    }
+
+    fs::remove_dir_all("sim").unwrap();
 }
 
 fn generate_sim(
