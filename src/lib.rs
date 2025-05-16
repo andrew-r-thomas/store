@@ -1,3 +1,4 @@
+pub mod client;
 pub mod index;
 pub mod log;
 pub mod page;

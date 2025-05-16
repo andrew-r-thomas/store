@@ -5,6 +5,11 @@ use crate::{
 
 use std::{collections::HashMap, ops::Range};
 
+pub enum PageLoc {
+    Mem(usize),
+    Disk(u64),
+}
+
 pub struct Index {
     pub buf_pool: Vec<PageBuffer>,
     pub id_map: HashMap<PageId, usize>,
