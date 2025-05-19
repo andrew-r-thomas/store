@@ -7,6 +7,7 @@ use std::{
 
 use crate::PageId;
 
+#[derive(Clone)]
 pub struct PageBuffer {
     ptr: *mut u8,
     top: usize,
