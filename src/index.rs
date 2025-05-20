@@ -1,17 +1,17 @@
 use crate::{
     PageId,
     log::PageDir,
-    page::{Delta, PageMut, SetDelta, SplitDelta},
+    page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta},
 };
 
 use std::ops::Range;
 
-pub struct Index {
+pub struct Index<'i> {
     pub page_dir: PageDir,
     pub page_mut: PageMut,
-    pub path: Vec<PageId>,
+    pub path: Vec<(PageId, &'i mut PageBuffer)>,
 }
-impl Index {
+impl Index<'_> {
     pub fn get(&mut self, key: &[u8], buf: &mut Vec<u8>) -> bool {
         let mut current = self.page_dir.get_root().read();
         while current.is_inner() {
@@ -28,24 +28,26 @@ impl Index {
         }
     }
     // FIX: lots of messy with constantly calling into the page dir to get pages, should save them
-    // locally when we first read them
+    // locally when we first read them, might need move semantics for this to work
     pub fn set(&mut self, key: &[u8], val: &[u8]) {
-        let mut current_id = self.page_dir.root;
         self.path.clear();
-        self.path.push(current_id);
-        let mut current = self.page_dir.get(current_id).read();
-
-        while current.is_inner() {
-            current_id = current.search_inner(key);
-            current = self.page_dir.get(current_id).read();
-            self.path.push(current_id);
+        self.path
+            .push((self.page_dir.root, self.page_dir.get_root()));
+        loop {
+            let current = self.path.last().unwrap().1.read();
+            if current.is_inner() {
+                let id = current.search_inner(key);
+                self.path.push((id, self.page_dir.get(id)));
+            } else {
+                break;
+            }
         }
 
         let delta = SetDelta { key, val };
-        let leaf_id = self.path.pop().unwrap();
-        if self.page_dir.get(leaf_id).write_delta(&Delta::Set(delta)) {
+        let (leaf_id, leaf) = self.path.pop().unwrap();
+        if leaf.write_delta(&Delta::Set(delta)) {
             // first we compact the page
-            let old_page = self.page_dir.get(leaf_id).read();
+            let old_page = leaf.read();
             let new_page = &mut self.page_mut;
             new_page.clear();
             new_page.compact(old_page);
@@ -66,8 +68,7 @@ impl Index {
                 // then we update the page dir with the new pages
                 let (to_page_id, to_page_buf) = self.page_dir.new_page();
                 to_page.pack(to_page_buf);
-                // TODO: might be an issue with reusing the same page buf here
-                new_page.pack(self.page_dir.get(leaf_id));
+                new_page.pack(leaf);
 
                 // then we need to update the parent with the new key, which may cascade up to
                 // the root, so we do it in a loop
@@ -78,13 +79,9 @@ impl Index {
                 let mut right = leaf_id;
                 'split: loop {
                     match self.path.pop() {
-                        Some(parent_id) => {
+                        Some((parent_id, parent)) => {
                             // try to write the delta to the parent
-                            if !self
-                                .page_dir
-                                .get(parent_id)
-                                .write_delta(&Delta::Split(parent_delta))
-                            {
+                            if !parent.write_delta(&Delta::Split(parent_delta)) {
                                 // compact the parent
                                 let old_parent = self.page_dir.get(parent_id).read();
                                 let new_parent = &mut self.page_mut;
