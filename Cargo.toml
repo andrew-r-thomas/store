@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.172"
-rtrb = "0.3.2" # temporary, to simulate network connections
+
+# temporary, to simulate network connections
+rtrb = "0.3.2" 
+rand = "0.9.0"
+rand_chacha = "0.9.0"
 
 [dev-dependencies]
 ciborium = "0.2.2"
-rand = "0.9.0"
-rand_chacha = "0.9.0"
 serde = "1.0.219"
