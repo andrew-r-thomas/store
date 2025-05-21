@@ -1,22 +1,23 @@
 use crate::{
     PageId,
     log::PageDir,
-    page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta},
+    page::{Delta, PageMut, SetDelta, SplitDelta},
 };
 
 use std::ops::Range;
 
-pub struct Index<'i> {
+pub struct Index {
     pub page_dir: PageDir,
     pub page_mut: PageMut,
-    pub path: Vec<(PageId, &'i mut PageBuffer)>,
+    pub path: Vec<(PageId, usize)>,
 }
-impl Index<'_> {
+impl Index {
     pub fn get(&mut self, key: &[u8], buf: &mut Vec<u8>) -> bool {
-        let mut current = self.page_dir.get_root().read();
+        let root_idx = self.page_dir.get_root();
+        let mut current = self.page_dir.buf_pool[root_idx].read();
         while current.is_inner() {
-            let child_id = current.search_inner(key);
-            current = self.page_dir.get(child_id).read();
+            let idx = self.page_dir.get(current.search_inner(key));
+            current = self.page_dir.buf_pool[idx].read();
         }
 
         match current.search_leaf(key) {
@@ -34,7 +35,7 @@ impl Index<'_> {
         self.path
             .push((self.page_dir.root, self.page_dir.get_root()));
         loop {
-            let current = self.path.last().unwrap().1.read();
+            let mut current = self.page_dir.buf_pool[self.path.last().unwrap().1].read();
             if current.is_inner() {
                 let id = current.search_inner(key);
                 self.path.push((id, self.page_dir.get(id)));
@@ -44,10 +45,10 @@ impl Index<'_> {
         }
 
         let delta = SetDelta { key, val };
-        let (leaf_id, leaf) = self.path.pop().unwrap();
-        if leaf.write_delta(&Delta::Set(delta)) {
+        let (leaf_id, leaf_idx) = self.path.pop().unwrap();
+        if !self.page_dir.buf_pool[leaf_idx].write_delta(&Delta::Set(delta)) {
             // first we compact the page
-            let old_page = leaf.read();
+            let old_page = self.page_dir.buf_pool[leaf_idx].read();
             let new_page = &mut self.page_mut;
             new_page.clear();
             new_page.compact(old_page);
@@ -68,7 +69,7 @@ impl Index<'_> {
                 // then we update the page dir with the new pages
                 let (to_page_id, to_page_buf) = self.page_dir.new_page();
                 to_page.pack(to_page_buf);
-                new_page.pack(leaf);
+                new_page.pack(&mut self.page_dir.buf_pool[leaf_idx]);
 
                 // then we need to update the parent with the new key, which may cascade up to
                 // the root, so we do it in a loop
@@ -79,11 +80,13 @@ impl Index<'_> {
                 let mut right = leaf_id;
                 'split: loop {
                     match self.path.pop() {
-                        Some((parent_id, parent)) => {
+                        Some((parent_id, parent_idx)) => {
                             // try to write the delta to the parent
-                            if !parent.write_delta(&Delta::Split(parent_delta)) {
+                            if !self.page_dir.buf_pool[parent_idx]
+                                .write_delta(&Delta::Split(parent_delta))
+                            {
                                 // compact the parent
-                                let old_parent = self.page_dir.get(parent_id).read();
+                                let old_parent = self.page_dir.buf_pool[parent_idx].read();
                                 let new_parent = &mut self.page_mut;
                                 new_parent.clear();
                                 new_parent.compact(old_parent);
@@ -104,7 +107,7 @@ impl Index<'_> {
                                     let (to_parent_id, to_parent_buf) = self.page_dir.new_page();
                                     to_parent.pack(to_parent_buf);
                                     // TODO: same here
-                                    new_parent.pack(self.page_dir.get(parent_id));
+                                    new_parent.pack(&mut self.page_dir.buf_pool[parent_idx]);
 
                                     middle_key.clear();
                                     middle_key.extend(temp_key);
@@ -116,7 +119,7 @@ impl Index<'_> {
 
                                     continue 'split;
                                 } else {
-                                    new_parent.pack(self.page_dir.get(parent_id));
+                                    new_parent.pack(&mut self.page_dir.buf_pool[parent_idx]);
                                     break 'split;
                                 }
                             } else {
@@ -139,7 +142,7 @@ impl Index<'_> {
                     }
                 }
             } else {
-                new_page.pack(self.page_dir.get(leaf_id));
+                new_page.pack(&mut self.page_dir.buf_pool[leaf_idx]);
             }
         }
     }
@@ -153,3 +156,7 @@ impl Index<'_> {
 }
 
 pub struct RangeIter {}
+
+pub fn get(key: &[u8], val_buf: &mut Vec<u8>) -> bool {
+    todo!()
+}

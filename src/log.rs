@@ -39,7 +39,7 @@ pub struct PageDir {
     data_region_start: u64,
     read_buf: Vec<u8>,
 
-    buf_pool: Vec<PageBuffer>,
+    pub buf_pool: Vec<PageBuffer>,
     free_list: Vec<usize>,
     mapping_table: HashMap<PageId, PageLoc>,
 
@@ -148,25 +148,24 @@ impl PageDir {
             read_buf: vec![0; page_size],
         }
     }
-    pub fn get(&mut self, page_id: PageId) -> &mut PageBuffer {
+    pub fn get(&mut self, page_id: PageId) -> usize {
         match self.mapping_table.get(&page_id).unwrap() {
-            PageLoc::Mem(idx) => &mut self.buf_pool[*idx],
+            PageLoc::Mem(idx) => *idx,
             PageLoc::Disk(offset) => match self.free_list.pop() {
                 Some(idx) => {
                     self.read_page(*offset, idx);
                     self.mapping_table.insert(page_id, PageLoc::Mem(idx));
-                    &mut self.buf_pool[idx]
+                    idx
                 }
                 None => todo!("need to evict something"),
             },
         }
     }
     #[inline]
-    pub fn get_root(&mut self) -> &mut PageBuffer {
+    pub fn get_root(&mut self) -> usize {
         self.get(self.root)
     }
 
-    // TODO: may need to allocate space in file
     pub fn new_page(&mut self) -> (PageId, &mut PageBuffer) {
         let page_id = self.next_pid;
         self.next_pid += 1;
