@@ -6,8 +6,7 @@ edition = "2024"
 [dependencies]
 libc = "0.2.172"
 
-# temporary, to simulate network connections
-rtrb = "0.3.2" 
+# temporary, for simulating
 rand = "0.9.0"
 rand_chacha = "0.9.0"
 

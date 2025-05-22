@@ -1,29 +1,37 @@
-use std::{collections::HashMap, ops::Range, thread};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::OpenOptions,
+    ops::Range,
+    path::Path,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    thread,
+};
 
 use rand::{
     Rng, SeedableRng,
     seq::{IndexedMutRandom, IndexedRandom},
 };
 use rand_chacha::ChaCha8Rng;
-use rtrb::{Consumer, Producer, RingBuffer};
 use store::{
     PageId,
     page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta},
 };
 
 const PAGE_SIZE: usize = 1024 * 1024;
+const BUF_POOL_SIZE: usize = 1024;
 const NUM_INGEST: usize = 1024;
 const NUM_OPS: usize = 2048;
-const NUM_CONNS: usize = 64;
+const NUM_CONNS: usize = 128;
 const KEY_LEN_RANGE: Range<usize> = 128..256;
 const VAL_LEN_RANGE: Range<usize> = 512..1024;
+const MAX_NEW_CONNS_PER_LOOP: usize = 4;
 
 fn main() {
-    let (mut conn_send, conn_recv) = RingBuffer::new(64);
+    let (conn_send, conn_recv) = mpsc::channel();
     thread::Builder::new()
         .name("shard".into())
         .spawn(|| {
-            shard(conn_recv, PAGE_SIZE);
+            shard(conn_recv, PAGE_SIZE, BUF_POOL_SIZE);
         })
         .unwrap();
 
@@ -31,8 +39,8 @@ fn main() {
     let mut conns = Vec::new();
     loop {
         if rng.random() {
-            let (c_send, s_recv) = RingBuffer::new(8);
-            let (s_send, c_recv) = RingBuffer::new(8);
+            let (c_send, s_recv) = mpsc::channel();
+            let (s_send, c_recv) = mpsc::channel();
             let seed = conns.len() as u64 ^ 69;
             conns.push(
                 thread::Builder::new()
@@ -51,9 +59,10 @@ fn main() {
                     .unwrap(),
             );
             conn_send
-                .push(Conn {
+                .send(Conn {
                     send: s_send,
                     recv: s_recv,
+                    pending_req: None,
                 })
                 .unwrap();
 
@@ -75,8 +84,8 @@ fn conn(
     key_len_range: Range<usize>,
     val_len_range: Range<usize>,
 
-    mut send: Producer<ConnReq>,
-    mut recv: Consumer<ConnResp>,
+    send: Sender<ConnReq>,
+    recv: Receiver<ConnResp>,
 ) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut entries = Vec::new();
@@ -91,52 +100,50 @@ fn conn(
 
         entries.push((key.clone(), val.clone()));
 
-        send.push(ConnReq::Set {
+        send.send(ConnReq::Set {
             id: i as u64,
             key,
             val,
         })
         .unwrap();
 
-        loop {
-            match recv.pop() {
-                Ok(resp) => match resp {
-                    ConnResp::Set { id } => {
-                        assert_eq!(id, i as u64);
-                        break;
-                    }
-                    _ => panic!(),
-                },
-                _ => {}
-            }
+        match recv.recv() {
+            Ok(resp) => match resp {
+                ConnResp::Set { id } => {
+                    assert_eq!(id, i as u64);
+                    break;
+                }
+                _ => panic!(),
+            },
+            _ => {}
         }
     }
 
     let ops = ["get", "insert", "update"];
     for i in 0..num_ops {
+        if rng.random_bool(0.05) {
+            return;
+        }
         match *ops.choose(&mut rng).unwrap() {
             "get" => {
                 let (k, v) = entries.choose(&mut rng).unwrap();
-                send.push(ConnReq::Get {
+                send.send(ConnReq::Get {
                     id: i as u64,
                     key: k.clone(),
-                    val_buf: Vec::new(),
                 })
                 .unwrap();
 
-                loop {
-                    match recv.pop() {
-                        Ok(resp) => match resp {
-                            ConnResp::Get { id, val, succ } => {
-                                assert_eq!(id, i as u64);
-                                assert!(succ);
-                                assert_eq!(&val, v);
-                                break;
-                            }
-                            _ => panic!(),
-                        },
-                        _ => {}
-                    }
+                match recv.recv() {
+                    Ok(resp) => match resp {
+                        ConnResp::Get { id, val, succ } => {
+                            assert_eq!(id, i as u64);
+                            assert!(succ);
+                            assert_eq!(&val, v);
+                            break;
+                        }
+                        _ => panic!(),
+                    },
+                    _ => {}
                 }
             }
             "insert" => {
@@ -147,7 +154,7 @@ fn conn(
                 rng.fill(&mut k[..]);
                 rng.fill(&mut v[..]);
 
-                send.push(ConnReq::Set {
+                send.send(ConnReq::Set {
                     id: i as u64,
                     key: k.clone(),
                     val: v.clone(),
@@ -156,17 +163,15 @@ fn conn(
 
                 entries.push((k, v));
 
-                loop {
-                    match recv.pop() {
-                        Ok(resp) => match resp {
-                            ConnResp::Set { id } => {
-                                assert_eq!(id, i as u64);
-                                break;
-                            }
-                            _ => panic!(),
-                        },
-                        _ => {}
-                    }
+                match recv.recv() {
+                    Ok(resp) => match resp {
+                        ConnResp::Set { id } => {
+                            assert_eq!(id, i as u64);
+                            break;
+                        }
+                        _ => panic!(),
+                    },
+                    _ => {}
                 }
             }
             "update" => {
@@ -176,24 +181,22 @@ fn conn(
                 rng.fill(&mut new_val[..]);
                 *v = new_val;
 
-                send.push(ConnReq::Set {
+                send.send(ConnReq::Set {
                     id: i as u64,
                     key: k.clone(),
                     val: v.clone(),
                 })
                 .unwrap();
 
-                loop {
-                    match recv.pop() {
-                        Ok(resp) => match resp {
-                            ConnResp::Set { id } => {
-                                assert_eq!(id, i as u64);
-                                break;
-                            }
-                            _ => panic!(),
-                        },
-                        _ => {}
-                    }
+                match recv.recv() {
+                    Ok(resp) => match resp {
+                        ConnResp::Set { id } => {
+                            assert_eq!(id, i as u64);
+                            break;
+                        }
+                        _ => panic!(),
+                    },
+                    _ => {}
                 }
             }
             _ => panic!(),
@@ -201,12 +204,19 @@ fn conn(
     }
 }
 
-// just gonna do stuff in memory first
-fn shard(mut conn_recv: Consumer<Conn>, page_size: usize) {
-    let mut buf_pool = Vec::<PageBuffer>::new();
-    let mut mapping_table = HashMap::<PageId, usize>::new();
+// NOTE:
+// - for now, we're just gonna have one op per connection at a time, this will keep things simple,
+//  but obviously we'll want to adjust this later as it's pretty inefficient
+// - WE READ/WRITE ONE BLOCK AT A TIME
+fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
+    let mut buf_pool = vec![PageBuffer::new(page_size); buf_pool_size];
+    let mut cache_tracker = Vec::from_iter((0..buf_pool_size).map(|_| [0_u64; 2]));
+    let mut free_list = Vec::from_iter(0..buf_pool_size);
+    let mut mapping_table = HashMap::new();
+
     let mut root = 1;
     let mut next_pid = 2;
+
     let mut page_mut = PageMut::new(page_size);
     let mut path = Vec::new();
 
@@ -217,144 +227,206 @@ fn shard(mut conn_recv: Consumer<Conn>, page_size: usize) {
 
     let mut next_conn_id: u64 = 0;
     let mut conns = HashMap::new();
-    let mut ops = Vec::new();
+    let mut disconns = Vec::new();
+    let mut pending_ios = HashSet::new();
+    let mut new_ios = HashSet::new();
 
     loop {
         // add any new conns to our list
-        for _ in 0..conn_recv.slots() {
-            conns.insert(next_conn_id, conn_recv.pop().unwrap());
-            next_conn_id += 1;
+        for _ in 0..MAX_NEW_CONNS_PER_LOOP {
+            match conn_recv.try_recv() {
+                Ok(conn) => {
+                    conns.insert(next_conn_id, conn);
+                    next_conn_id += 1;
+                }
+                Err(_) => break,
+            }
         }
 
-        // load up our ops
+        // iterate over conns and try to make progress towards their requests
         for (conn_id, conn) in conns.iter_mut() {
-            for _ in 0..conn.recv.slots() {
-                ops.push(Op {
-                    conn_id: *conn_id,
-                    req: conn.recv.pop().unwrap(),
-                });
+            if conn.pending_req.is_none() {
+                match conn.recv.try_recv() {
+                    Ok(req) => conn.pending_req = Some(req),
+                    Err(e) => {
+                        if let TryRecvError::Disconnected = e {
+                            disconns.push(*conn_id);
+                        }
+                    }
+                }
+            }
+
+            if let Some(req) = &conn.pending_req {
+                match req {
+                    ConnReq::Get { id, key } => {
+                        let mut val_buf = Vec::new();
+                        match get(&key, &mut val_buf, root, &mapping_table, &buf_pool) {
+                            OpRes::Ok => {
+                                conn.send
+                                    .send(ConnResp::Get {
+                                        id: *id,
+                                        val: val_buf,
+                                        succ: true,
+                                    })
+                                    .unwrap();
+                                conn.pending_req = None;
+                            }
+                            OpRes::Err => {
+                                conn.send
+                                    .send(ConnResp::Get {
+                                        id: *id,
+                                        val: val_buf,
+                                        succ: false,
+                                    })
+                                    .unwrap();
+                                conn.pending_req = None;
+                            }
+                            OpRes::NeedsIO(pid) => {
+                                new_ios.insert(pid);
+                            }
+                        }
+                    }
+                    ConnReq::Set { id, key, val } => {
+                        path.clear();
+                        match set(
+                            &mut root,
+                            &mut next_pid,
+                            &mut mapping_table,
+                            &mut buf_pool,
+                            &mut free_list,
+                            &mut path,
+                            &mut page_mut,
+                            &key,
+                            &val,
+                        ) {
+                            OpRes::Ok => {
+                                conn.send.send(ConnResp::Set { id: *id }).unwrap();
+                                conn.pending_req = None;
+                            }
+                            OpRes::NeedsIO(pid) => {
+                                new_ios.insert(pid);
+                            }
+                            OpRes::Err => panic!(),
+                        }
+                    }
+                }
             }
         }
 
-        // execute ops
-        while let Some(op) = ops.pop() {
-            match op.req {
-                ConnReq::Get {
-                    id,
-                    key,
-                    mut val_buf,
-                } => {
-                    let succ = get(root, &mapping_table, &buf_pool, &key, &mut val_buf);
-                    conns
-                        .get_mut(&op.conn_id)
-                        .unwrap()
-                        .send
-                        .push(ConnResp::Get {
-                            id,
-                            val: val_buf,
-                            succ,
-                        })
-                        .unwrap();
-                }
-                ConnReq::Set { id, key, val } => {
-                    path.clear();
-                    set(
-                        &mut root,
-                        &mut mapping_table,
-                        &mut buf_pool,
-                        &mut next_pid,
-                        page_size,
-                        &mut path,
-                        &mut page_mut,
-                        &key,
-                        &val,
-                    );
-                    conns
-                        .get_mut(&op.conn_id)
-                        .unwrap()
-                        .send
-                        .push(ConnResp::Set { id })
-                        .unwrap();
-                }
-                ConnReq::DisConn => {
-                    conns.remove(&op.conn_id);
-                }
-            }
+        // remove any disconnected conns
+        while let Some(conn_id) = disconns.pop() {
+            conns.remove(&conn_id);
         }
+
+        // figure out if/how much we need to evict
+        // we have
     }
 }
 
+fn io_manager(path: &Path) {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap();
+}
+
+struct IOResp {
+    id: u64,
+    buf: Vec<u8>,
+}
+struct IOReq {
+    buf: Vec<u8>,
+    id: u64,
+    block: u64,
+    read: bool,
+}
+
 struct Conn {
-    send: Producer<ConnResp>,
-    recv: Consumer<ConnReq>,
+    send: Sender<ConnResp>,
+    recv: Receiver<ConnReq>,
+    pending_req: Option<ConnReq>,
 }
 enum ConnReq {
-    Get {
-        id: u64,
-        key: Vec<u8>,
-        val_buf: Vec<u8>,
-    },
-    Set {
-        id: u64,
-        key: Vec<u8>,
-        val: Vec<u8>,
-    },
-    DisConn,
+    Get { id: u64, key: Vec<u8> },
+    Set { id: u64, key: Vec<u8>, val: Vec<u8> },
 }
 enum ConnResp {
     Get { id: u64, val: Vec<u8>, succ: bool },
     Set { id: u64 },
 }
 
-struct Op {
-    conn_id: u64,
-    req: ConnReq,
+enum OpRes {
+    NeedsIO(PageId),
+    Ok,
+    Err,
 }
 
 fn get(
+    target: &[u8],
+    val_buf: &mut Vec<u8>,
+
     root: PageId,
     mapping_table: &HashMap<PageId, usize>,
     buf_pool: &Vec<PageBuffer>,
-    key: &[u8],
-    val_buf: &mut Vec<u8>,
-) -> bool {
-    let mut current = buf_pool[*mapping_table.get(&root).unwrap()].read();
+) -> OpRes {
+    let mut current = match mapping_table.get(&root) {
+        Some(idx) => buf_pool[*idx].read(),
+        None => return OpRes::NeedsIO(root),
+    };
+
     while current.is_inner() {
-        current = buf_pool[*mapping_table.get(&current.search_inner(key)).unwrap()].read();
+        let next = current.search_inner(target);
+        current = match mapping_table.get(&next) {
+            Some(idx) => buf_pool[*idx].read(),
+            None => return OpRes::NeedsIO(next),
+        };
     }
-    match current.search_leaf(key) {
+
+    match current.search_leaf(target) {
         Some(val) => {
             val_buf.extend(val);
-            true
+            OpRes::Ok
         }
-        None => false,
+        None => OpRes::Err,
     }
 }
 
+// NOTE: we will assume for now that our free list will *always* have enough space to allocate new
+// pages for splits etc, and it will be the cache management logic's job to make sure that this is
+// true
 fn set(
     root: &mut PageId,
+    next_pid: &mut PageId,
     mapping_table: &mut HashMap<PageId, usize>,
     buf_pool: &mut Vec<PageBuffer>,
-    next_pid: &mut PageId,
-    page_size: usize,
+    free_list: &mut Vec<usize>,
 
     path: &mut Vec<(PageId, usize)>,
     page_mut: &mut PageMut,
 
     key: &[u8],
     val: &[u8],
-) {
-    path.push((*root, *mapping_table.get(root).unwrap()));
+) -> OpRes {
+    match mapping_table.get(root) {
+        Some(idx) => path.push((*root, *idx)),
+        None => return OpRes::NeedsIO(*root),
+    }
     loop {
         let mut current = buf_pool[path.last().unwrap().1].read();
         if current.is_inner() {
             let id = current.search_inner(key);
-            path.push((id, *mapping_table.get(&id).unwrap()));
+            match mapping_table.get(&id) {
+                Some(idx) => path.push((id, *idx)),
+                None => return OpRes::NeedsIO(id),
+            }
         } else {
             break;
         }
     }
 
+    // ok so everything in our path at this point we know is in memory
     let delta = SetDelta { key, val };
     let (leaf_id, leaf_idx) = path.pop().unwrap();
     if !buf_pool[leaf_idx].write_delta(&Delta::Set(delta)) {
@@ -375,10 +447,8 @@ fn set(
 
             let to_page_id = *next_pid;
             *next_pid += 1;
-            let mut to_page_buf = PageBuffer::new(page_size);
-            to_page.pack(&mut to_page_buf);
-            let to_page_idx = buf_pool.len();
-            buf_pool.push(to_page_buf);
+            let to_page_idx = free_list.pop().unwrap();
+            to_page.pack(&mut buf_pool[to_page_idx]);
             mapping_table.insert(to_page_id, to_page_idx);
 
             new_page.pack(&mut buf_pool[leaf_idx]);
@@ -410,10 +480,8 @@ fn set(
 
                                 let to_parent_id = *next_pid;
                                 *next_pid += 1;
-                                let mut to_parent_buf = PageBuffer::new(page_size);
-                                to_parent.pack(&mut to_parent_buf);
-                                let to_parent_idx = buf_pool.len();
-                                buf_pool.push(to_parent_buf);
+                                let to_parent_idx = free_list.pop().unwrap();
+                                to_parent.pack(&mut buf_pool[to_parent_idx]);
                                 mapping_table.insert(to_parent_id, to_parent_idx);
 
                                 new_parent.pack(&mut buf_pool[parent_idx]);
@@ -446,10 +514,8 @@ fn set(
                         *next_pid += 1;
                         *root = new_root_id;
 
-                        let mut new_root_buf = PageBuffer::new(page_size);
-                        new_root.pack(&mut new_root_buf);
-                        let new_root_idx = buf_pool.len();
-                        buf_pool.push(new_root_buf);
+                        let new_root_idx = free_list.pop().unwrap();
+                        new_root.pack(&mut buf_pool[new_root_idx]);
                         mapping_table.insert(new_root_id, new_root_idx);
 
                         break 'split;
@@ -460,4 +526,6 @@ fn set(
             new_page.pack(&mut buf_pool[leaf_idx]);
         }
     }
+
+    OpRes::Ok
 }
