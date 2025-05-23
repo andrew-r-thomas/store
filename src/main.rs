@@ -1,3 +1,6 @@
+pub mod cache;
+pub mod page;
+
 use std::{
     collections::{HashMap, HashSet},
     fs::OpenOptions,
@@ -7,31 +10,44 @@ use std::{
     thread,
 };
 
+use cache::Cache;
+use itertools::Itertools;
+use page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta};
 use rand::{
     Rng, SeedableRng,
     seq::{IndexedMutRandom, IndexedRandom},
 };
 use rand_chacha::ChaCha8Rng;
-use store::{
-    PageId,
-    page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta},
-};
+
+type PageId = u64;
 
 const PAGE_SIZE: usize = 1024 * 1024;
+const BLOCK_SIZE: usize = 4 * 1024 * 1024;
+
 const BUF_POOL_SIZE: usize = 1024;
+const FREE_CAP_TARGET: usize = 256;
+
 const NUM_INGEST: usize = 1024;
 const NUM_OPS: usize = 2048;
+
 const NUM_CONNS: usize = 128;
+const MAX_NEW_CONNS_PER_LOOP: usize = 4;
+
 const KEY_LEN_RANGE: Range<usize> = 128..256;
 const VAL_LEN_RANGE: Range<usize> = 512..1024;
-const MAX_NEW_CONNS_PER_LOOP: usize = 4;
 
 fn main() {
     let (conn_send, conn_recv) = mpsc::channel();
     thread::Builder::new()
         .name("shard".into())
         .spawn(|| {
-            shard(conn_recv, PAGE_SIZE, BUF_POOL_SIZE);
+            shard(
+                conn_recv,
+                PAGE_SIZE,
+                BUF_POOL_SIZE,
+                BLOCK_SIZE,
+                FREE_CAP_TARGET,
+            )
         })
         .unwrap();
 
@@ -54,7 +70,7 @@ fn main() {
                             VAL_LEN_RANGE,
                             c_send,
                             c_recv,
-                        );
+                        )
                     })
                     .unwrap(),
             );
@@ -204,33 +220,66 @@ fn conn(
     }
 }
 
+enum HitLoc {
+    A1(usize),
+    Am(usize),
+}
+struct PageMeta {
+    buf_loc: usize,
+    hit_loc: HitLoc,
+}
+
 // NOTE:
 // - for now, we're just gonna have one op per connection at a time, this will keep things simple,
 //  but obviously we'll want to adjust this later as it's pretty inefficient
-// - WE READ/WRITE ONE BLOCK AT A TIME
-fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
+// - WE READ/WRITE ONE BLOCK AT A TIME, blocks are by definition the io granularity of our system,
+//   also for now, only reading one page at a time
+fn shard(
+    conn_recv: Receiver<Conn>,
+    page_size: usize,
+    buf_pool_size: usize,
+    block_size: usize,
+    free_cap_target: usize,
+) {
+    // tracking for pages and cache
     let mut buf_pool = vec![PageBuffer::new(page_size); buf_pool_size];
-    let mut cache_tracker = Vec::from_iter((0..buf_pool_size).map(|_| [0_u64; 2]));
     let mut free_list = Vec::from_iter(0..buf_pool_size);
-    let mut mapping_table = HashMap::new();
-
+    let mut cache = Cache::new(buf_pool_size);
+    let mut offset_table = HashMap::<PageId, usize>::new();
     let mut root = 1;
     let mut next_pid = 2;
 
+    // scratch space for writes
     let mut page_mut = PageMut::new(page_size);
     let mut path = Vec::new();
 
-    let mut root_buf = PageBuffer::new(page_size);
-    page_mut.pack(&mut root_buf);
-    buf_pool.push(root_buf);
-    mapping_table.insert(root, 0);
-
+    // tracking for connections
     let mut next_conn_id: u64 = 0;
     let mut conns = HashMap::new();
     let mut disconns = Vec::new();
-    let mut pending_ios = HashSet::new();
-    let mut new_ios = HashSet::new();
 
+    // tracking for ios
+    let mut pending_ios = HashMap::<PageId, u32>::new();
+    let mut current_read = None;
+    let mut read_buf = Some(vec![0; block_size]);
+    let mut write_buf = vec![0; block_size];
+
+    // make the root
+    {
+        let root_idx = free_list.pop().unwrap();
+        page_mut.pack(&mut buf_pool[root_idx]);
+        cache.insert(root, root_idx);
+    }
+
+    // start the io thread
+    let (io_send, io_recv_) = mpsc::channel();
+    let (io_send_, io_recv) = mpsc::channel();
+    thread::Builder::new()
+        .name("io".into())
+        .spawn(move || io_manager(Path::new("temp.store"), block_size, io_send_, io_recv_))
+        .unwrap();
+
+    // main pipeline
     loop {
         // add any new conns to our list
         for _ in 0..MAX_NEW_CONNS_PER_LOOP {
@@ -260,7 +309,7 @@ fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
                 match req {
                     ConnReq::Get { id, key } => {
                         let mut val_buf = Vec::new();
-                        match get(&key, &mut val_buf, root, &mapping_table, &buf_pool) {
+                        match get(&key, &mut val_buf, root, &buf_pool, &mut cache) {
                             OpRes::Ok => {
                                 conn.send
                                     .send(ConnResp::Get {
@@ -282,7 +331,7 @@ fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
                                 conn.pending_req = None;
                             }
                             OpRes::NeedsIO(pid) => {
-                                new_ios.insert(pid);
+                                *pending_ios.entry(pid).or_insert(0) += 1;
                             }
                         }
                     }
@@ -291,9 +340,9 @@ fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
                         match set(
                             &mut root,
                             &mut next_pid,
-                            &mut mapping_table,
                             &mut buf_pool,
                             &mut free_list,
+                            &mut cache,
                             &mut path,
                             &mut page_mut,
                             &key,
@@ -304,7 +353,7 @@ fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
                                 conn.pending_req = None;
                             }
                             OpRes::NeedsIO(pid) => {
-                                new_ios.insert(pid);
+                                *pending_ios.entry(pid).or_insert(0) += 1;
                             }
                             OpRes::Err => panic!(),
                         }
@@ -318,12 +367,37 @@ fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
             conns.remove(&conn_id);
         }
 
-        // figure out if/how much we need to evict
-        // we have
+        // issue a read if we can/need to
+        if current_read.is_none() && !pending_ios.is_empty() {
+            let to_read = pending_ios.iter().max_by(|a, b| a.1.cmp(b.1)).unwrap().0;
+            let offset = *offset_table.get(to_read).unwrap();
+            let block = offset / block_size;
+            current_read = Some((free_list.pop().unwrap(), offset));
+            io_send
+                .send(IOReq {
+                    block: Some(block),
+                    buf: read_buf.take().unwrap(),
+                })
+                .unwrap();
+        }
+
+        // figure out if/what we need to evict to keep the free list nice and full
+        if free_list.len() < free_cap_target {
+            let num_evictions = free_cap_target - free_list.len();
+            for ((_, idx), _) in cache_tracker
+                .iter()
+                .zip(0_usize..)
+                .map(|(hits, i)| (hits[0] - hits[1], i))
+                .sorted_unstable_by(|a, b| a.0.cmp(&b.0))
+                .zip(0..num_evictions)
+            {
+                todo!()
+            }
+        }
     }
 }
 
-fn io_manager(path: &Path) {
+fn io_manager(path: &Path, block_size: usize, send: Sender<IOResp>, recv: Receiver<IOReq>) {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -333,14 +407,12 @@ fn io_manager(path: &Path) {
 }
 
 struct IOResp {
-    id: u64,
     buf: Vec<u8>,
+    read: bool,
 }
 struct IOReq {
     buf: Vec<u8>,
-    id: u64,
-    block: u64,
-    read: bool,
+    block: Option<usize>,
 }
 
 struct Conn {
@@ -366,20 +438,19 @@ enum OpRes {
 fn get(
     target: &[u8],
     val_buf: &mut Vec<u8>,
-
     root: PageId,
-    mapping_table: &HashMap<PageId, usize>,
     buf_pool: &Vec<PageBuffer>,
+    cache: &mut Cache,
 ) -> OpRes {
-    let mut current = match mapping_table.get(&root) {
-        Some(idx) => buf_pool[*idx].read(),
+    let mut current = match cache.get(root) {
+        Some(idx) => buf_pool[idx].read(),
         None => return OpRes::NeedsIO(root),
     };
 
     while current.is_inner() {
         let next = current.search_inner(target);
-        current = match mapping_table.get(&next) {
-            Some(idx) => buf_pool[*idx].read(),
+        current = match cache.get(next) {
+            Some(idx) => buf_pool[idx].read(),
             None => return OpRes::NeedsIO(next),
         };
     }
@@ -399,9 +470,9 @@ fn get(
 fn set(
     root: &mut PageId,
     next_pid: &mut PageId,
-    mapping_table: &mut HashMap<PageId, usize>,
     buf_pool: &mut Vec<PageBuffer>,
     free_list: &mut Vec<usize>,
+    cache: &mut Cache,
 
     path: &mut Vec<(PageId, usize)>,
     page_mut: &mut PageMut,
@@ -409,16 +480,16 @@ fn set(
     key: &[u8],
     val: &[u8],
 ) -> OpRes {
-    match mapping_table.get(root) {
-        Some(idx) => path.push((*root, *idx)),
+    match cache.get(*root) {
+        Some(idx) => path.push((*root, idx)),
         None => return OpRes::NeedsIO(*root),
     }
     loop {
         let mut current = buf_pool[path.last().unwrap().1].read();
         if current.is_inner() {
             let id = current.search_inner(key);
-            match mapping_table.get(&id) {
-                Some(idx) => path.push((id, *idx)),
+            match cache.get(id) {
+                Some(idx) => path.push((id, idx)),
                 None => return OpRes::NeedsIO(id),
             }
         } else {
@@ -449,7 +520,7 @@ fn set(
             *next_pid += 1;
             let to_page_idx = free_list.pop().unwrap();
             to_page.pack(&mut buf_pool[to_page_idx]);
-            mapping_table.insert(to_page_id, to_page_idx);
+            cache.insert(to_page_id, to_page_idx);
 
             new_page.pack(&mut buf_pool[leaf_idx]);
 
@@ -482,7 +553,7 @@ fn set(
                                 *next_pid += 1;
                                 let to_parent_idx = free_list.pop().unwrap();
                                 to_parent.pack(&mut buf_pool[to_parent_idx]);
-                                mapping_table.insert(to_parent_id, to_parent_idx);
+                                cache.insert(to_parent_id, to_parent_idx);
 
                                 new_parent.pack(&mut buf_pool[parent_idx]);
 
@@ -516,7 +587,7 @@ fn set(
 
                         let new_root_idx = free_list.pop().unwrap();
                         new_root.pack(&mut buf_pool[new_root_idx]);
-                        mapping_table.insert(new_root_id, new_root_idx);
+                        cache.insert(new_root_id, new_root_idx);
 
                         break 'split;
                     }
