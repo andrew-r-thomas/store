@@ -36,6 +36,9 @@ const MAX_NEW_CONNS_PER_LOOP: usize = 4;
 const KEY_LEN_RANGE: Range<usize> = 128..256;
 const VAL_LEN_RANGE: Range<usize> = 512..1024;
 
+const OFFSET_SIZE: usize = 8;
+const CHUNK_LEN_SIZE: usize = 8;
+
 fn main() {
     let (conn_send, conn_recv) = mpsc::channel();
     thread::Builder::new()
@@ -220,20 +223,14 @@ fn conn(
     }
 }
 
-enum HitLoc {
-    A1(usize),
-    Am(usize),
-}
-struct PageMeta {
-    buf_loc: usize,
-    hit_loc: HitLoc,
-}
-
 // NOTE:
 // - for now, we're just gonna have one op per connection at a time, this will keep things simple,
 //  but obviously we'll want to adjust this later as it's pretty inefficient
 // - WE READ/WRITE ONE BLOCK AT A TIME, blocks are by definition the io granularity of our system,
 //   also for now, only reading one page at a time
+//
+// TODO:
+// - stuff may temporarily be in the write buffer
 fn shard(
     conn_recv: Receiver<Conn>,
     page_size: usize,
@@ -245,6 +242,7 @@ fn shard(
     let mut buf_pool = vec![PageBuffer::new(page_size); buf_pool_size];
     let mut free_list = Vec::from_iter(0..buf_pool_size);
     let mut cache = Cache::new(buf_pool_size);
+    let mut evict_list = Vec::new();
     let mut offset_table = HashMap::<PageId, usize>::new();
     let mut root = 1;
     let mut next_pid = 2;
@@ -260,9 +258,11 @@ fn shard(
 
     // tracking for ios
     let mut pending_ios = HashMap::<PageId, u32>::new();
-    let mut current_read = None;
+    let mut current_read: Option<PendingRead> = None;
     let mut read_buf = Some(vec![0; block_size]);
-    let mut write_buf = vec![0; block_size];
+    let mut write_bufs = vec![vec![0; block_size]; 4];
+    let mut write_buf_pos = 0;
+    let mut current_write_block = 0;
 
     // make the root
     {
@@ -289,6 +289,66 @@ fn shard(
                     next_conn_id += 1;
                 }
                 Err(_) => break,
+            }
+        }
+
+        // check for any io results
+        while let Ok(mut res) = io_recv.try_recv() {
+            if res.read {
+                let pending = current_read.as_mut().unwrap();
+                let page_buf = buf_pool[pending.buf_pool_idx].raw_buffer_mut();
+
+                let mut block_cursor = pending.block_offset;
+                let next = u64::from_be_bytes(
+                    res.buf[block_cursor..block_cursor + OFFSET_SIZE]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                block_cursor += OFFSET_SIZE;
+                let chunk_len = u64::from_be_bytes(
+                    res.buf[block_cursor..block_cursor + CHUNK_LEN_SIZE]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                block_cursor += CHUNK_LEN_SIZE;
+
+                page_buf[pending.buffer_offset..pending.buffer_offset + chunk_len]
+                    .copy_from_slice(&res.buf[block_cursor..block_cursor + chunk_len]);
+                pending.buffer_offset += chunk_len;
+
+                if next == 0 {
+                    // no more to read for this page
+                    page_buf.copy_within(
+                        0..pending.buffer_offset,
+                        page_buf.len() - pending.buffer_offset,
+                    );
+                    let top = page_buf.len() - pending.buffer_offset;
+                    buf_pool[pending.buf_pool_idx].top = top;
+                    buf_pool[pending.buf_pool_idx].flush = top;
+
+                    pending_ios.remove(&pending.page_id).unwrap();
+                    cache.insert(pending.page_id, pending.buf_pool_idx);
+
+                    res.buf.fill(0);
+                    read_buf = Some(res.buf);
+                    current_read = None;
+                } else {
+                    // need to keep reading
+                    let next_block = next / block_size;
+                    pending.block_offset = next % block_size;
+                    res.buf.fill(0);
+                    io_send
+                        .send(IOReq {
+                            buf: res.buf,
+                            block: Some(next_block),
+                        })
+                        .unwrap();
+                }
+            } else {
+                let current = write_bufs.pop().unwrap();
+                res.buf.fill(0);
+                write_bufs.push(res.buf);
+                write_bufs.push(current);
             }
         }
 
@@ -361,8 +421,6 @@ fn shard(
                 }
             }
         }
-
-        // remove any disconnected conns
         while let Some(conn_id) = disconns.pop() {
             conns.remove(&conn_id);
         }
@@ -370,9 +428,15 @@ fn shard(
         // issue a read if we can/need to
         if current_read.is_none() && !pending_ios.is_empty() {
             let to_read = pending_ios.iter().max_by(|a, b| a.1.cmp(b.1)).unwrap().0;
-            let offset = *offset_table.get(to_read).unwrap();
-            let block = offset / block_size;
-            current_read = Some((free_list.pop().unwrap(), offset));
+            let file_offset = *offset_table.get(to_read).unwrap();
+            let block = file_offset / block_size;
+            let block_offset = file_offset % block_size;
+            current_read = Some(PendingRead {
+                page_id: *to_read,
+                buf_pool_idx: free_list.pop().unwrap(),
+                block_offset,
+                buffer_offset: 0,
+            });
             io_send
                 .send(IOReq {
                     block: Some(block),
@@ -382,19 +446,59 @@ fn shard(
         }
 
         // figure out if/what we need to evict to keep the free list nice and full
-        if free_list.len() < free_cap_target {
-            let num_evictions = free_cap_target - free_list.len();
-            for ((_, idx), _) in cache_tracker
-                .iter()
-                .zip(0_usize..)
-                .map(|(hits, i)| (hits[0] - hits[1], i))
-                .sorted_unstable_by(|a, b| a.0.cmp(&b.0))
-                .zip(0..num_evictions)
-            {
-                todo!()
+        {
+            let mut cands = cache.evict_cands();
+            while free_list.len() < free_cap_target {
+                let (pid, idx) = cands.next().unwrap();
+                let buf = &mut buf_pool[idx];
+                let flush_len = buf.flush_len();
+                if flush_len > 0 {
+                    // first we check if we have enough space in the current write buf to take this
+                    // write
+                    if block_size - write_buf_pos < OFFSET_SIZE + CHUNK_LEN_SIZE + flush_len {
+                        // we don't have enough room and need to write the buffer out
+                        io_send
+                            .send(IOReq {
+                                block: None,
+                                buf: write_bufs.pop().unwrap(),
+                            })
+                            .unwrap();
+                        write_buf_pos = 0;
+                        current_write_block += 1;
+                    }
+
+                    let write_buf = write_bufs.last_mut().unwrap();
+
+                    // need to write before we evict
+                    let new_offset = (current_write_block * block_size) + write_buf_pos;
+                    let old_offset = offset_table.insert(pid, new_offset).unwrap();
+                    if buf.flush != buf.cap {
+                        // we're flushing deltas, not base page, so need to store old offset
+                        write_buf[write_buf_pos..write_buf_pos + OFFSET_SIZE]
+                            .copy_from_slice(&(old_offset as u64).to_be_bytes());
+                    }
+                    write_buf_pos += OFFSET_SIZE;
+                    write_buf[write_buf_pos..write_buf_pos + CHUNK_LEN_SIZE]
+                        .copy_from_slice(&(flush_len as u64).to_be_bytes());
+                    write_buf_pos += CHUNK_LEN_SIZE;
+                    buf.flush(&mut write_buf[write_buf_pos..write_buf_pos + flush_len]);
+                    write_buf_pos += flush_len;
+                }
+                free_list.push(idx);
+                evict_list.push(pid);
             }
         }
+        while let Some(pid) = evict_list.pop() {
+            cache.remove(pid);
+        }
     }
+}
+
+struct PendingRead {
+    page_id: PageId,
+    buf_pool_idx: usize,
+    block_offset: usize,
+    buffer_offset: usize,
 }
 
 fn io_manager(path: &Path, block_size: usize, send: Sender<IOResp>, recv: Receiver<IOReq>) {

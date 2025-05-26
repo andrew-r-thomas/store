@@ -11,8 +11,8 @@ use crate::PageId;
 pub struct PageBuffer {
     ptr: *mut u8,
     pub top: usize,
-    cap: usize,
-    flush: usize,
+    pub cap: usize,
+    pub flush: usize,
 }
 impl PageBuffer {
     pub fn new(cap: usize) -> Self {
