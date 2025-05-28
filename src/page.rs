@@ -627,6 +627,7 @@ impl PageMut {
 
         let top = page_buf.cap - self.total_size;
         page_buf.top = top;
+        page_buf.flush = page_buf.cap;
         let buf = &mut page_buf.raw_buffer_mut()[top..];
 
         buf[BasePage::NUM_ENTRIES_RANGE]

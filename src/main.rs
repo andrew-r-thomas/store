@@ -4,6 +4,7 @@ pub mod page;
 use std::{
     collections::{HashMap, HashSet},
     fs::OpenOptions,
+    io::{Read, Seek, SeekFrom, Write},
     ops::Range,
     path::Path,
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
@@ -130,7 +131,6 @@ fn conn(
             Ok(resp) => match resp {
                 ConnResp::Set { id } => {
                     assert_eq!(id, i as u64);
-                    break;
                 }
                 _ => panic!(),
             },
@@ -158,7 +158,6 @@ fn conn(
                             assert_eq!(id, i as u64);
                             assert!(succ);
                             assert_eq!(&val, v);
-                            break;
                         }
                         _ => panic!(),
                     },
@@ -186,7 +185,6 @@ fn conn(
                     Ok(resp) => match resp {
                         ConnResp::Set { id } => {
                             assert_eq!(id, i as u64);
-                            break;
                         }
                         _ => panic!(),
                     },
@@ -211,7 +209,6 @@ fn conn(
                     Ok(resp) => match resp {
                         ConnResp::Set { id } => {
                             assert_eq!(id, i as u64);
-                            break;
                         }
                         _ => panic!(),
                     },
@@ -242,27 +239,19 @@ fn shard(
     let mut buf_pool = vec![PageBuffer::new(page_size); buf_pool_size];
     let mut free_list = Vec::from_iter(0..buf_pool_size);
     let mut cache = Cache::new(buf_pool_size);
-    let mut evict_list = Vec::new();
-    let mut offset_table = HashMap::<PageId, usize>::new();
     let mut root = 1;
     let mut next_pid = 2;
 
     // scratch space for writes
     let mut page_mut = PageMut::new(page_size);
-    let mut path = Vec::new();
 
     // tracking for connections
     let mut next_conn_id: u64 = 0;
     let mut conns = HashMap::new();
-    let mut disconns = Vec::new();
 
-    // tracking for ios
-    let mut pending_ios = HashMap::<PageId, u32>::new();
-    let mut current_read: Option<PendingRead> = None;
-    let mut read_buf = Some(vec![0; block_size]);
-    let mut write_bufs = vec![vec![0; block_size]; 4];
-    let mut write_buf_pos = 0;
-    let mut current_write_block = 0;
+    let mut disconns = Vec::new();
+    let mut reads = HashMap::<PageId, ReadGroup>::new();
+    let mut writes = HashMap::<PageId, WriteGroup>::new();
 
     // make the root
     {
@@ -270,14 +259,6 @@ fn shard(
         page_mut.pack(&mut buf_pool[root_idx]);
         cache.insert(root, root_idx);
     }
-
-    // start the io thread
-    let (io_send, io_recv_) = mpsc::channel();
-    let (io_send_, io_recv) = mpsc::channel();
-    thread::Builder::new()
-        .name("io".into())
-        .spawn(move || io_manager(Path::new("temp.store"), block_size, io_send_, io_recv_))
-        .unwrap();
 
     // main pipeline
     loop {
@@ -292,251 +273,193 @@ fn shard(
             }
         }
 
-        // check for any io results
-        while let Ok(mut res) = io_recv.try_recv() {
-            if res.read {
-                let pending = current_read.as_mut().unwrap();
-                let page_buf = buf_pool[pending.buf_pool_idx].raw_buffer_mut();
-
-                let mut block_cursor = pending.block_offset;
-                let next = u64::from_be_bytes(
-                    res.buf[block_cursor..block_cursor + OFFSET_SIZE]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-                block_cursor += OFFSET_SIZE;
-                let chunk_len = u64::from_be_bytes(
-                    res.buf[block_cursor..block_cursor + CHUNK_LEN_SIZE]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-                block_cursor += CHUNK_LEN_SIZE;
-
-                page_buf[pending.buffer_offset..pending.buffer_offset + chunk_len]
-                    .copy_from_slice(&res.buf[block_cursor..block_cursor + chunk_len]);
-                pending.buffer_offset += chunk_len;
-
-                if next == 0 {
-                    // no more to read for this page
-                    page_buf.copy_within(
-                        0..pending.buffer_offset,
-                        page_buf.len() - pending.buffer_offset,
-                    );
-                    let top = page_buf.len() - pending.buffer_offset;
-                    buf_pool[pending.buf_pool_idx].top = top;
-                    buf_pool[pending.buf_pool_idx].flush = top;
-
-                    pending_ios.remove(&pending.page_id).unwrap();
-                    cache.insert(pending.page_id, pending.buf_pool_idx);
-
-                    res.buf.fill(0);
-                    read_buf = Some(res.buf);
-                    current_read = None;
-                } else {
-                    // need to keep reading
-                    let next_block = next / block_size;
-                    pending.block_offset = next % block_size;
-                    res.buf.fill(0);
-                    io_send
-                        .send(IOReq {
-                            buf: res.buf,
-                            block: Some(next_block),
-                        })
-                        .unwrap();
-                }
-            } else {
-                let current = write_bufs.pop().unwrap();
-                res.buf.fill(0);
-                write_bufs.push(res.buf);
-                write_bufs.push(current);
-            }
-        }
-
-        // iterate over conns and try to make progress towards their requests
+        // load up our work for this loop
         for (conn_id, conn) in conns.iter_mut() {
-            if conn.pending_req.is_none() {
-                match conn.recv.try_recv() {
-                    Ok(req) => conn.pending_req = Some(req),
-                    Err(e) => {
-                        if let TryRecvError::Disconnected = e {
-                            disconns.push(*conn_id);
+            match conn.recv.try_recv() {
+                Ok(req) => match req {
+                    ConnReq::Get(get_req) => {
+                        match find_leaf(&get_req.key, &buf_pool, &mut cache, root) {
+                            Ok((pid, idx)) => match reads.get_mut(&pid) {
+                                Some(group) => group.reads.push((*conn_id, get_req)),
+                                None => {
+                                    reads.insert(
+                                        pid,
+                                        ReadGroup {
+                                            page_idx: idx,
+                                            reads: vec![(*conn_id, get_req)],
+                                        },
+                                    );
+                                }
+                            },
+                            Err(_) => panic!(),
                         }
                     }
-                }
-            }
-
-            if let Some(req) = &conn.pending_req {
-                match req {
-                    ConnReq::Get { id, key } => {
-                        let mut val_buf = Vec::new();
-                        match get(&key, &mut val_buf, root, &buf_pool, &mut cache) {
-                            OpRes::Ok => {
-                                conn.send
-                                    .send(ConnResp::Get {
-                                        id: *id,
-                                        val: val_buf,
-                                        succ: true,
-                                    })
-                                    .unwrap();
-                                conn.pending_req = None;
+                    ConnReq::Set(set_req) => {
+                        match find_path(&set_req.key, &buf_pool, &mut cache, root) {
+                            Ok(mut path) => {
+                                let (pid, idx) = path.pop().unwrap();
+                                match writes.get_mut(&pid) {
+                                    Some(group) => group.writes.push(set_req),
+                                    None => {
+                                        writes.insert(
+                                            pid,
+                                            WriteGroup {
+                                                page_idx: idx,
+                                                path: path,
+                                                writes: vec![set_req],
+                                            },
+                                        );
+                                    }
+                                }
                             }
-                            OpRes::Err => {
-                                conn.send
-                                    .send(ConnResp::Get {
-                                        id: *id,
-                                        val: val_buf,
-                                        succ: false,
-                                    })
-                                    .unwrap();
-                                conn.pending_req = None;
-                            }
-                            OpRes::NeedsIO(pid) => {
-                                *pending_ios.entry(pid).or_insert(0) += 1;
-                            }
+                            Err(_) => panic!(),
                         }
                     }
-                    ConnReq::Set { id, key, val } => {
-                        path.clear();
-                        match set(
-                            &mut root,
-                            &mut next_pid,
-                            &mut buf_pool,
-                            &mut free_list,
-                            &mut cache,
-                            &mut path,
-                            &mut page_mut,
-                            &key,
-                            &val,
-                        ) {
-                            OpRes::Ok => {
-                                conn.send.send(ConnResp::Set { id: *id }).unwrap();
-                                conn.pending_req = None;
-                            }
-                            OpRes::NeedsIO(pid) => {
-                                *pending_ios.entry(pid).or_insert(0) += 1;
-                            }
-                            OpRes::Err => panic!(),
-                        }
+                },
+                Err(e) => {
+                    if let TryRecvError::Disconnected = e {
+                        disconns.push(*conn_id);
+                    } else {
+                        panic!()
                     }
                 }
             }
         }
+
+        // remove any disconnections
         while let Some(conn_id) = disconns.pop() {
             conns.remove(&conn_id);
         }
 
-        // issue a read if we can/need to
-        if current_read.is_none() && !pending_ios.is_empty() {
-            let to_read = pending_ios.iter().max_by(|a, b| a.1.cmp(b.1)).unwrap().0;
-            let file_offset = *offset_table.get(to_read).unwrap();
-            let block = file_offset / block_size;
-            let block_offset = file_offset % block_size;
-            current_read = Some(PendingRead {
-                page_id: *to_read,
-                buf_pool_idx: free_list.pop().unwrap(),
-                block_offset,
-                buffer_offset: 0,
-            });
-            io_send
-                .send(IOReq {
-                    block: Some(block),
-                    buf: read_buf.take().unwrap(),
-                })
-                .unwrap();
-        }
-
-        // figure out if/what we need to evict to keep the free list nice and full
-        {
-            let mut cands = cache.evict_cands();
-            while free_list.len() < free_cap_target {
-                let (pid, idx) = cands.next().unwrap();
-                let buf = &mut buf_pool[idx];
-                let flush_len = buf.flush_len();
-                if flush_len > 0 {
-                    // first we check if we have enough space in the current write buf to take this
-                    // write
-                    if block_size - write_buf_pos < OFFSET_SIZE + CHUNK_LEN_SIZE + flush_len {
-                        // we don't have enough room and need to write the buffer out
-                        io_send
-                            .send(IOReq {
-                                block: None,
-                                buf: write_bufs.pop().unwrap(),
-                            })
-                            .unwrap();
-                        write_buf_pos = 0;
-                        current_write_block += 1;
-                    }
-
-                    let write_buf = write_bufs.last_mut().unwrap();
-
-                    // need to write before we evict
-                    let new_offset = (current_write_block * block_size) + write_buf_pos;
-                    let old_offset = offset_table.insert(pid, new_offset).unwrap();
-                    if buf.flush != buf.cap {
-                        // we're flushing deltas, not base page, so need to store old offset
-                        write_buf[write_buf_pos..write_buf_pos + OFFSET_SIZE]
-                            .copy_from_slice(&(old_offset as u64).to_be_bytes());
-                    }
-                    write_buf_pos += OFFSET_SIZE;
-                    write_buf[write_buf_pos..write_buf_pos + CHUNK_LEN_SIZE]
-                        .copy_from_slice(&(flush_len as u64).to_be_bytes());
-                    write_buf_pos += CHUNK_LEN_SIZE;
-                    buf.flush(&mut write_buf[write_buf_pos..write_buf_pos + flush_len]);
-                    write_buf_pos += flush_len;
+        // process reads
+        for (_, group) in reads.drain() {
+            let mut page = buf_pool[group.page_idx].read();
+            for (conn_id, req) in group.reads {
+                match page.search_leaf(&req.key) {
+                    Some(val) => conns
+                        .get_mut(&conn_id)
+                        .unwrap()
+                        .send
+                        .send(ConnResp::Get {
+                            id: req.id,
+                            val: Some(Vec::from(val)),
+                        })
+                        .unwrap(),
+                    None => conns
+                        .get_mut(&conn_id)
+                        .unwrap()
+                        .send
+                        .send(ConnResp::Get {
+                            id: req.id,
+                            val: None,
+                        })
+                        .unwrap(),
                 }
-                free_list.push(idx);
-                evict_list.push(pid);
             }
         }
-        while let Some(pid) = evict_list.pop() {
-            cache.remove(pid);
+
+        // process writes
+        for (pid, group) in writes.drain() {
+            let page = &mut buf_pool[group.page_idx];
+            // TODO: these should probably already be deltas
+            let total_size: usize = group
+                .writes
+                .iter()
+                .map(|w| {
+                    Delta::Set(SetDelta {
+                        key: &w.key,
+                        val: &w.val,
+                    })
+                    .len()
+                })
+                .sum();
         }
     }
-}
-
-struct PendingRead {
-    page_id: PageId,
-    buf_pool_idx: usize,
-    block_offset: usize,
-    buffer_offset: usize,
-}
-
-fn io_manager(path: &Path, block_size: usize, send: Sender<IOResp>, recv: Receiver<IOReq>) {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .unwrap();
-}
-
-struct IOResp {
-    buf: Vec<u8>,
-    read: bool,
-}
-struct IOReq {
-    buf: Vec<u8>,
-    block: Option<usize>,
 }
 
 struct Conn {
     send: Sender<ConnResp>,
     recv: Receiver<ConnReq>,
-    pending_req: Option<ConnReq>,
 }
 enum ConnReq {
-    Get { id: u64, key: Vec<u8> },
-    Set { id: u64, key: Vec<u8>, val: Vec<u8> },
+    Get(GetReq),
+    Set(SetReq),
+}
+struct GetReq {
+    id: u64,
+    key: Vec<u8>,
+}
+struct SetReq {
+    id: u64,
+    key: Vec<u8>,
+    val: Vec<u8>,
 }
 enum ConnResp {
-    Get { id: u64, val: Vec<u8>, succ: bool },
+    Get { id: u64, val: Option<Vec<u8>> },
     Set { id: u64 },
 }
 
-enum OpRes {
-    NeedsIO(PageId),
-    Ok,
-    Err,
+struct ReadGroup {
+    page_idx: usize,
+    reads: Vec<(u64, GetReq)>,
+}
+struct WriteGroup {
+    page_idx: usize,
+    path: Vec<(PageId, usize)>,
+    writes: Vec<SetReq>,
+}
+
+fn find_leaf(
+    target: &[u8],
+    buf_pool: &Vec<PageBuffer>,
+    cache: &mut Cache,
+    root: PageId,
+) -> Result<(PageId, usize), PageId> {
+    let (mut current, mut current_id, mut current_idx) = match cache.get(root) {
+        Some(idx) => (buf_pool[idx].read(), root, idx),
+        None => return Err(root),
+    };
+
+    while current.is_inner() {
+        current_id = current.search_inner(target);
+        current = match cache.get(current_id) {
+            Some(idx) => {
+                current_idx = idx;
+                buf_pool[idx].read()
+            }
+            None => return Err(current_id),
+        };
+    }
+
+    Ok((current_id, current_idx))
+}
+fn find_path(
+    target: &[u8],
+    buf_pool: &Vec<PageBuffer>,
+    cache: &mut Cache,
+    root: PageId,
+) -> Result<Vec<(PageId, usize)>, PageId> {
+    let mut path = Vec::new();
+
+    match cache.get(root) {
+        Some(idx) => path.push((root, idx)),
+        None => return Err(root),
+    }
+
+    loop {
+        let mut current = buf_pool[path.last().unwrap().1].read();
+        if current.is_inner() {
+            let id = current.search_inner(target);
+            match cache.get(id) {
+                Some(idx) => path.push((id, idx)),
+                None => return Err(id),
+            }
+        } else {
+            break;
+        }
+    }
+
+    Ok(path)
 }
 
 fn get(
