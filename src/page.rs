@@ -201,8 +201,8 @@ pub struct SplitDelta<'d> {
     pub left_pid: PageId,
 }
 impl<'d> Delta<'d> {
-    const SET_CODE: u8 = 1;
-    const SPLIT_CODE: u8 = 2;
+    const SET_CODE: u8 = 2;
+    const SPLIT_CODE: u8 = 10;
 
     pub fn from_top(buf: &'d [u8]) -> Self {
         match *buf.first().unwrap() {
@@ -311,6 +311,13 @@ impl<'d> Delta<'d> {
                     + LEN_SIZE
                     + CODE_SIZE
             }
+        }
+    }
+
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Set(s) => s.key,
+            Self::Split(s) => s.middle_key,
         }
     }
 
