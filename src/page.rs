@@ -7,12 +7,10 @@ use std::{
 
 use crate::PageId;
 
-#[derive(Clone)]
 pub struct PageBuffer {
     ptr: *mut u8,
     pub top: usize,
     pub cap: usize,
-    pub flush: usize,
 }
 impl PageBuffer {
     pub fn new(cap: usize) -> Self {
@@ -21,12 +19,7 @@ impl PageBuffer {
         if ptr.is_null() {
             alloc::handle_alloc_error(layout)
         }
-        Self {
-            ptr,
-            cap,
-            top: cap,
-            flush: cap,
-        }
+        Self { ptr, cap, top: cap }
     }
 
     pub fn read(&self) -> Page {
@@ -40,20 +33,10 @@ impl PageBuffer {
         }
 
         delta.write_to_buf(unsafe { slice::from_raw_parts_mut(self.ptr.add(self.top - len), len) });
+        let old_top = self.top;
         self.top -= len;
 
         true
-    }
-
-    #[inline]
-    pub fn flush(&mut self, buf: &mut [u8]) {
-        assert_eq!(self.flush_len(), buf.len());
-        buf.copy_from_slice(&self.raw_buffer()[self.top..self.flush]);
-        self.flush = self.top;
-    }
-    #[inline]
-    pub fn flush_len(&self) -> usize {
-        self.flush - self.top
     }
 
     #[inline]
@@ -63,6 +46,11 @@ impl PageBuffer {
     #[inline]
     pub fn raw_buffer(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.ptr, self.cap) }
+    }
+    pub fn clear(&mut self) {
+        self.raw_buffer_mut().fill(0);
+        let old_top = self.top;
+        self.top = self.cap;
     }
 }
 
@@ -133,8 +121,9 @@ impl<'p> From<&'p [u8]> for Page<'p> {
     fn from(buf: &'p [u8]) -> Self {
         let base_len =
             u64::from_be_bytes(buf[buf.len() - BASE_LEN_SIZE..].try_into().unwrap()) as usize;
-
         let deltas = DeltaIter::from(&buf[..buf.len() - (BASE_LEN_SIZE + base_len)]);
+        // In Page::from, after creating the delta buffer
+        let delta_buf = &buf[..buf.len() - (BASE_LEN_SIZE + base_len)];
         let base =
             BasePage::from(&buf[buf.len() - (BASE_LEN_SIZE + base_len)..buf.len() - BASE_LEN_SIZE]);
 
@@ -245,7 +234,7 @@ impl<'d> Delta<'d> {
                     left_pid,
                 })
             }
-            _ => panic!(),
+            n => panic!("{n}"),
         }
     }
     pub fn from_bottom(buf: &'d [u8]) -> Self {
@@ -632,9 +621,10 @@ impl PageMut {
     pub fn pack(&mut self, page_buf: &mut PageBuffer) {
         assert_eq!(page_buf.cap, self.page_size);
 
+        page_buf.clear();
         let top = page_buf.cap - self.total_size;
+        let old_top = page_buf.top;
         page_buf.top = top;
-        page_buf.flush = page_buf.cap;
         let buf = &mut page_buf.raw_buffer_mut()[top..];
 
         buf[BasePage::NUM_ENTRIES_RANGE]

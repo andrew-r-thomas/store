@@ -16,7 +16,7 @@ use std::{
 use crate::{
     Conn, PageId,
     cache::Cache,
-    page::{Delta, PageBuffer, PageMut, SetDelta, SplitDelta},
+    page::{Delta, PageBuffer, PageMut, SplitDelta},
 };
 
 const MAX_NEW_CONNS_PER_LOOP: usize = 4;
@@ -34,24 +34,25 @@ pub fn shard(
     free_cap_target: usize,
 ) {
     // tracking for pages and cache
-    let mut buf_pool = vec![PageBuffer::new(page_size); buf_pool_size];
+    let mut buf_pool = Vec::with_capacity(buf_pool_size);
+    for _ in 0..buf_pool_size {
+        buf_pool.push(PageBuffer::new(page_size));
+    }
     let mut free_list = Vec::from_iter(0..buf_pool_size);
     let mut cache = Cache::new(buf_pool_size);
     let mut root = 1;
     let mut next_pid = 2;
 
-    // scratch space for writes
+    // tracking for ops
     let mut page_mut = PageMut::new(page_size);
-    let mut current_level_writes = HashMap::<PageId, WriteGroup>::new();
-    let mut next_level_writes = HashMap::<PageId, WriteGroup>::new();
+    let mut path = Vec::new();
+    let mut reads = HashMap::<PageId, ReadGroup>::new();
+    let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
 
     // tracking for connections
     let mut next_conn_id: u64 = 0;
     let mut conns = HashMap::new();
     let mut disconns = Vec::new();
-
-    let mut reads = HashMap::<PageId, ReadGroup>::new();
-
     let mut resps = Vec::new();
 
     // make the root
@@ -102,41 +103,13 @@ pub fn shard(
                     }
                     2 => {
                         // set
-                        let mut cursor = 1;
-                        let key_len =
-                            u32::from_be_bytes(req[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
-                        cursor += 8;
-                        match find_path(&req[cursor..cursor + key_len], &buf_pool, &mut cache, root)
-                        {
-                            Ok(mut path) => {
-                                let (pid, idx) = path.pop().unwrap();
-                                match current_level_writes.get_mut(&path.last().unwrap().0) {
-                                    Some(group) => {
-                                        group.writes.push((Some(*conn_id), req));
-                                    }
-                                    None => {
-                                        current_level_writes.insert(
-                                            pid,
-                                            WriteGroup {
-                                                page_idx: idx,
-                                                path,
-                                                writes: vec![(Some(*conn_id), req)],
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            Err(_) => panic!(),
-                        }
+                        writes.push((*conn_id, req));
                     }
                     _ => panic!(),
                 },
                 Err(e) => {
                     if let TryRecvError::Disconnected = e {
                         disconns.push(*conn_id);
-                    } else {
-                        panic!()
                     }
                 }
             }
@@ -165,115 +138,22 @@ pub fn shard(
         }
 
         // process writes
-        while !current_level_writes.is_empty() {
-            for (_, mut group) in current_level_writes.drain() {
-                let page = &mut buf_pool[group.page_idx];
+        for (conn_id, buf) in writes.drain(..) {
+            path.clear();
+            page_mut.clear();
 
-                let total_len: usize = group
-                    .writes
-                    .iter()
-                    .map(|(_, d)| Delta::from_top(d).len())
-                    .sum();
+            apply_write(
+                &mut cache,
+                &mut buf_pool,
+                &mut free_list,
+                &mut next_pid,
+                &mut root,
+                &mut path,
+                &mut page_mut,
+                Delta::from_top(&buf),
+            );
 
-                if page.top < total_len {
-                    // don't have enough space, need to compact
-                    page_mut.clear();
-                    page_mut.compact(page.read());
-                    let mut left: Option<PageMut> = None;
-                    let mut middle_key = Vec::new();
-
-                    for w in group.writes {
-                        let delta = Delta::from_top(&w.1);
-                        match left.as_mut() {
-                            Some(l) => {
-                                if delta.key() <= &middle_key {
-                                    assert!(l.apply_delta(&delta));
-                                } else {
-                                    assert!(page_mut.apply_delta(&delta));
-                                }
-                            }
-                            None => {
-                                if !page_mut.apply_delta(&delta) {
-                                    match w.0 {
-                                        Some(_) => {
-                                            left = Some(page_mut.split_leaf(&mut middle_key));
-                                            if delta.key() <= &middle_key {
-                                                assert!(left.as_mut().unwrap().apply_delta(&delta));
-                                            } else {
-                                                assert!(page_mut.apply_delta(&delta));
-                                            }
-                                        }
-                                        None => {
-                                            left = Some(page_mut.split_inner(&mut middle_key));
-                                            if delta.key() <= &middle_key {
-                                                assert!(left.as_mut().unwrap().apply_delta(&delta));
-                                            } else {
-                                                assert!(page_mut.apply_delta(&delta));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    page_mut.pack(&mut buf_pool[group.page_idx]);
-
-                    if let Some(mut l) = left {
-                        let left_pid = next_pid;
-                        next_pid += 1;
-                        let left_idx = free_list.pop().unwrap();
-                        cache.insert(left_pid, left_idx);
-                        l.pack(&mut buf_pool[left_idx]);
-
-                        let split_delta = Delta::Split(SplitDelta {
-                            middle_key: &middle_key,
-                            left_pid,
-                        });
-                        let mut buf = vec![0; split_delta.len()];
-                        split_delta.write_to_buf(&mut buf);
-
-                        match group.path.pop() {
-                            Some((parent_id, parent_idx)) => {
-                                match next_level_writes.get_mut(&parent_id) {
-                                    Some(g) => {
-                                        g.writes.push((None, buf));
-                                    }
-                                    None => {
-                                        next_level_writes.insert(
-                                            parent_id,
-                                            WriteGroup {
-                                                page_idx: parent_idx,
-                                                path: group.path,
-                                                writes: vec![(None, buf)],
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            None => {
-                                // we split the root, which means we're at the last level, and
-                                // there's only one page (the old root), so we should just make the
-                                // new root, and then we're done
-                                todo!()
-                            }
-                        }
-                    }
-                } else {
-                    // can just write the deltas in
-                    for w in group.writes {
-                        page.write_delta(&Delta::from_top(&w.1));
-
-                        // PERF: this option for the conn id is us making a decision too far down,
-                        // we have this information much earlier than we're taking a branch on it
-                        if let Some(conn_id) = w.0 {
-                            resps.push((conn_id, vec![0]));
-                        }
-                    }
-                }
-            }
-
-            std::mem::swap(&mut current_level_writes, &mut next_level_writes);
+            resps.push((conn_id, vec![0]));
         }
 
         // send responses
@@ -308,114 +188,126 @@ fn find_leaf(
 
     Ok((current_id, current_idx))
 }
-fn find_path(
-    target: &[u8],
-    buf_pool: &Vec<PageBuffer>,
+
+fn apply_write(
     cache: &mut Cache,
-    root: PageId,
-) -> Result<Vec<(PageId, usize)>, PageId> {
-    let mut path = Vec::new();
+    buf_pool: &mut Vec<PageBuffer>,
+    free_list: &mut Vec<usize>,
+    next_pid: &mut PageId,
+    root: &mut PageId,
 
-    match cache.get(root) {
-        Some(idx) => path.push((root, idx)),
-        None => return Err(root),
-    }
+    path: &mut Vec<(PageId, usize)>,
+    page_mut: &mut PageMut,
 
+    delta: Delta,
+) {
+    let key = delta.key();
+
+    path.push((*root, cache.get(*root).unwrap()));
     loop {
         let mut current = buf_pool[path.last().unwrap().1].read();
         if current.is_inner() {
-            let id = current.search_inner(target);
-            match cache.get(id) {
-                Some(idx) => path.push((id, idx)),
-                None => return Err(id),
-            }
+            let id = current.search_inner(key);
+            path.push((id, cache.get(id).unwrap()));
         } else {
             break;
         }
     }
 
-    Ok(path)
-}
+    let (leaf_id, leaf_idx) = path.pop().unwrap();
+    if !buf_pool[leaf_idx].write_delta(&delta) {
+        let new_page = &mut *page_mut;
+        new_page.clear();
+        new_page.compact(buf_pool[leaf_idx].read());
 
-// writes =========================================================================================
-struct LeafWriteGroup {
-    page_idx: usize,
-    path: Vec<(PageId, usize)>,
-    writes: Vec<(u64, Vec<u8>)>,
-}
-struct InnerWriteGroup {
-    page_idx: usize,
-    path: Vec<(PageId, usize)>,
-    writes: Vec<Vec<u8>>,
-}
-
-fn apply_leaf_writes(
-    write_batch: &mut HashMap<PageId, LeafWriteGroup>,
-    next_batch: &mut HashMap<PageId, InnerWriteGroup>,
-    buf_pool: &mut Vec<PageBuffer>,
-    page_mut: &mut PageMut,
-    resps: &mut Vec<(u64, Vec<u8>)>,
-    next_pid: &mut PageId,
-    free_list: &mut Vec<usize>,
-    cache: &mut Cache,
-) {
-    for (_, group) in write_batch.drain() {
-        let page = &mut buf_pool[group.page_idx];
-
-        let total_len: usize = group
-            .writes
-            .iter()
-            .map(|(_, d)| Delta::from_top(d).len())
-            .sum();
-
-        if page.top >= total_len {
-            // fast path, enough room to just dump the deltas
-            for (conn_id, buf) in group.writes {
-                page.write_delta(&Delta::from_top(&buf));
-                resps.push((conn_id, vec![0]));
-            }
-        } else {
-            // need to compact, then maybe split
-            page_mut.clear();
-            page_mut.compact(page.read());
-
-            let mut left: Option<PageMut> = None;
+        if !new_page.apply_delta(&delta) {
             let mut middle_key = Vec::new();
+            let mut to_page = new_page.split_leaf(&mut middle_key);
 
-            for (conn_id, buf) in group.writes {
-                let delta = Delta::from_top(&buf);
-                match left.as_mut() {
-                    Some(l) => {
-                        if delta.key() <= &middle_key {
-                            assert!(l.apply_delta(&delta));
+            if key <= &middle_key {
+                to_page.apply_delta(&delta);
+            } else {
+                new_page.apply_delta(&delta);
+            }
+
+            let to_page_id = *next_pid;
+            *next_pid += 1;
+            let to_page_idx = free_list.pop().unwrap();
+            to_page.pack(&mut buf_pool[to_page_idx]);
+            cache.insert(to_page_id, to_page_idx);
+
+            new_page.pack(&mut buf_pool[leaf_idx]);
+
+            let mut parent_delta = SplitDelta {
+                middle_key: &middle_key,
+                left_pid: to_page_id,
+            };
+            let mut right = leaf_id;
+
+            'split: loop {
+                match path.pop() {
+                    Some((parent_id, parent_idx)) => {
+                        if !buf_pool[parent_idx].write_delta(&Delta::Split(parent_delta)) {
+                            let new_parent = &mut *page_mut;
+                            new_parent.clear();
+                            new_parent.compact(buf_pool[parent_idx].read());
+
+                            if !new_parent.apply_delta(&Delta::Split(parent_delta)) {
+                                let mut temp_key = Vec::new();
+                                let mut to_parent = new_parent.split_inner(&mut temp_key);
+
+                                if &middle_key <= &temp_key {
+                                    to_parent.apply_delta(&Delta::Split(parent_delta));
+                                } else {
+                                    new_parent.apply_delta(&Delta::Split(parent_delta));
+                                }
+
+                                let to_parent_id = *next_pid;
+                                *next_pid += 1;
+                                let to_parent_idx = free_list.pop().unwrap();
+                                to_parent.pack(&mut buf_pool[to_parent_idx]);
+                                cache.insert(to_parent_id, to_parent_idx);
+
+                                new_parent.pack(&mut buf_pool[parent_idx]);
+
+                                middle_key.clear();
+                                middle_key.extend(temp_key);
+                                parent_delta = SplitDelta {
+                                    middle_key: &middle_key,
+                                    left_pid: to_parent_id,
+                                };
+                                right = parent_id;
+
+                                continue 'split;
+                            } else {
+                                new_parent.pack(&mut buf_pool[parent_idx]);
+                                break 'split;
+                            }
                         } else {
-                            assert!(page_mut.apply_delta(&delta));
+                            break 'split;
                         }
-                        resps.push((conn_id, vec![0]));
                     }
                     None => {
-                        if !page_mut.apply_delta(&delta) {
-                            left = Some(page_mut.split_leaf(&mut middle_key));
-                            if delta.key() <= &middle_key {
-                                assert!(left.as_mut().unwrap().apply_delta(&delta));
-                            } else {
-                                assert!(page_mut.apply_delta(&delta));
-                            }
-                        }
-                        resps.push((conn_id, vec![0]));
+                        let new_root = &mut *page_mut;
+                        new_root.clear();
+                        new_root.set_right_pid(right);
+                        new_root.set_left_pid(u64::MAX);
+                        new_root.apply_delta(&Delta::Split(parent_delta));
+
+                        let new_root_id = *next_pid;
+                        *next_pid += 1;
+                        *root = new_root_id;
+
+                        let new_root_idx = free_list.pop().unwrap();
+                        new_root.pack(&mut buf_pool[new_root_idx]);
+                        cache.insert(new_root_id, new_root_idx);
+
+                        break 'split;
                     }
                 }
             }
-            page_mut.pack(&mut buf_pool[group.page_idx]);
-            if let Some(mut l) = left {
-                let left_id = *next_pid;
-                *next_pid += 1;
-                let left_idx = free_list.pop().unwrap();
-                cache.insert(left_id, left_idx);
-
-                l.pack(&mut buf_pool[left_idx]);
-                todo!()
-            }
+        } else {
+            new_page.pack(&mut buf_pool[leaf_idx]);
         }
     }
 }

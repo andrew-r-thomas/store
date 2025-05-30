@@ -28,12 +28,12 @@ impl Cache {
             None => None,
         }
     }
-    pub fn insert(&mut self, page_id: PageId, frame: usize) {
-        if let Some(_) = self.id_map.insert(page_id, frame) {
+    pub fn insert(&mut self, page_id: PageId, idx: usize) {
+        if let Some(_) = self.id_map.insert(page_id, idx) {
             panic!()
         }
-        self.hits[frame][0] = self.hit;
-        self.hits[frame][1] = 0;
+        self.hits[idx][0] = self.hit;
+        self.hits[idx][1] = 0;
         self.hit += 1;
     }
     pub fn remove(&mut self, page_id: PageId) {

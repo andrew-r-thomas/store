@@ -85,7 +85,9 @@ fn main() {
     }
 
     for c in conns {
-        c.join().unwrap();
+        if let Err(e) = c.join() {
+            println!("error on join: {:?}", e);
+        }
     }
 }
 
@@ -96,13 +98,13 @@ fn conn(
     key_len_range: Range<usize>,
     val_len_range: Range<usize>,
 
-    send: Sender<ConnReq>,
-    recv: Receiver<ConnResp>,
+    send: Sender<Vec<u8>>,
+    recv: Receiver<Vec<u8>>,
 ) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut entries = Vec::new();
 
-    for i in 0..num_ingest {
+    for _ in 0..num_ingest {
         let key_len = rng.random_range(key_len_range.clone());
         let val_len = rng.random_range(val_len_range.clone());
         let mut key = vec![0; key_len];
@@ -112,47 +114,42 @@ fn conn(
 
         entries.push((key.clone(), val.clone()));
 
-        send.send(ConnReq::Set(SetReq {
-            id: i as u64,
-            key,
-            val,
-        }))
-        .unwrap();
+        let mut req_buf = Vec::new();
+        req_buf.push(2);
+        req_buf.extend(&(key_len as u32).to_be_bytes());
+        req_buf.extend(&(val_len as u32).to_be_bytes());
+        req_buf.extend(&key);
+        req_buf.extend(&val);
+        send.send(req_buf).unwrap();
 
         match recv.recv() {
-            Ok(resp) => match resp {
-                ConnResp::Set { id } => {
-                    assert_eq!(id, i as u64);
-                }
-                _ => panic!(),
-            },
-            _ => {}
+            Ok(resp) => {
+                assert_eq!(resp[0], 0);
+            }
+            _ => panic!(),
         }
     }
 
     let ops = ["get", "insert", "update"];
-    for i in 0..num_ops {
+    for _ in 0..num_ops {
         if rng.random_bool(0.05) {
             return;
         }
         match *ops.choose(&mut rng).unwrap() {
             "get" => {
                 let (k, v) = entries.choose(&mut rng).unwrap();
-                send.send(ConnReq::Get(GetReq {
-                    id: i as u64,
-                    key: k.clone(),
-                }))
-                .unwrap();
+                let mut req_buf = Vec::new();
+                req_buf.push(1);
+                req_buf.extend(&(k.len() as u32).to_be_bytes());
+                req_buf.extend(k);
+                send.send(req_buf).unwrap();
 
                 match recv.recv() {
-                    Ok(resp) => match resp {
-                        ConnResp::Get { id, val } => {
-                            assert_eq!(id, i as u64);
-                            assert_eq!(&val.unwrap(), v);
-                        }
-                        _ => panic!(),
-                    },
-                    _ => {}
+                    Ok(resp) => {
+                        assert_eq!(resp[0], 0);
+                        assert_eq!(&resp[5..], v);
+                    }
+                    _ => panic!(),
                 }
             }
             "insert" => {
@@ -163,23 +160,21 @@ fn conn(
                 rng.fill(&mut k[..]);
                 rng.fill(&mut v[..]);
 
-                send.send(ConnReq::Set(SetReq {
-                    id: i as u64,
-                    key: k.clone(),
-                    val: v.clone(),
-                }))
-                .unwrap();
+                let mut req_buf = Vec::new();
+                req_buf.push(2);
+                req_buf.extend(&(key_len as u32).to_be_bytes());
+                req_buf.extend(&(val_len as u32).to_be_bytes());
+                req_buf.extend(&k);
+                req_buf.extend(&v);
+                send.send(req_buf).unwrap();
 
                 entries.push((k, v));
 
                 match recv.recv() {
-                    Ok(resp) => match resp {
-                        ConnResp::Set { id } => {
-                            assert_eq!(id, i as u64);
-                        }
-                        _ => panic!(),
-                    },
-                    _ => {}
+                    Ok(resp) => {
+                        assert_eq!(resp[0], 0);
+                    }
+                    _ => panic!(),
                 }
             }
             "update" => {
@@ -189,21 +184,19 @@ fn conn(
                 rng.fill(&mut new_val[..]);
                 *v = new_val;
 
-                send.send(ConnReq::Set(SetReq {
-                    id: i as u64,
-                    key: k.clone(),
-                    val: v.clone(),
-                }))
-                .unwrap();
+                let mut req_buf = Vec::new();
+                req_buf.push(2);
+                req_buf.extend(&(k.len() as u32).to_be_bytes());
+                req_buf.extend(&(val_len as u32).to_be_bytes());
+                req_buf.extend(&*k);
+                req_buf.extend(&*v);
+                send.send(req_buf).unwrap();
 
                 match recv.recv() {
-                    Ok(resp) => match resp {
-                        ConnResp::Set { id } => {
-                            assert_eq!(id, i as u64);
-                        }
-                        _ => panic!(),
-                    },
-                    _ => {}
+                    Ok(resp) => {
+                        assert_eq!(resp[0], 0);
+                    }
+                    _ => panic!(),
                 }
             }
             _ => panic!(),
