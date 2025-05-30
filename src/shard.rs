@@ -17,6 +17,7 @@ use crate::{
     Conn, PageId,
     cache::Cache,
     page::{Delta, PageBuffer, PageMut, SplitDelta},
+    utils::validate_tree_structure,
 };
 
 const MAX_NEW_CONNS_PER_LOOP: usize = 4;
@@ -26,13 +27,7 @@ struct ReadGroup {
     reads: Vec<(u64, Vec<u8>)>,
 }
 
-pub fn shard(
-    conn_recv: Receiver<Conn>,
-    page_size: usize,
-    buf_pool_size: usize,
-    block_size: usize,
-    free_cap_target: usize,
-) {
+pub fn shard(conn_recv: Receiver<Conn>, page_size: usize, buf_pool_size: usize) {
     // tracking for pages and cache
     let mut buf_pool = Vec::with_capacity(buf_pool_size);
     for _ in 0..buf_pool_size {
@@ -78,34 +73,39 @@ pub fn shard(
         // load up our work for this loop
         for (conn_id, conn) in conns.iter_mut() {
             match conn.recv.try_recv() {
-                Ok(mut req) => match *req.first().unwrap() {
-                    1 => {
-                        // get
-                        // would have key length parsing in here as well
-                        req.drain(0..5);
-                        match find_leaf(&req, &buf_pool, &mut cache, root) {
-                            Ok((pid, idx)) => match reads.get_mut(&pid) {
-                                Some(group) => {
-                                    group.reads.push((*conn_id, req));
-                                }
-                                None => {
-                                    reads.insert(
-                                        pid,
-                                        ReadGroup {
-                                            page_idx: idx,
-                                            reads: vec![(*conn_id, req)],
-                                        },
-                                    );
-                                }
-                            },
-                            Err(_) => panic!(),
+                Ok(mut req) => match req.first() {
+                    Some(b) => match b {
+                        1 => {
+                            // get
+                            // would have key length parsing in here as well
+                            req.drain(0..5);
+                            match find_leaf(&req, &buf_pool, &mut cache, root) {
+                                Ok((pid, idx)) => match reads.get_mut(&pid) {
+                                    Some(group) => {
+                                        group.reads.push((*conn_id, req));
+                                    }
+                                    None => {
+                                        reads.insert(
+                                            pid,
+                                            ReadGroup {
+                                                page_idx: idx,
+                                                reads: vec![(*conn_id, req)],
+                                            },
+                                        );
+                                    }
+                                },
+                                Err(_) => panic!(),
+                            }
                         }
+                        2 => {
+                            // set
+                            writes.push((*conn_id, req));
+                        }
+                        _ => panic!(),
+                    },
+                    None => {
+                        resps.push((*conn_id, vec![]));
                     }
-                    2 => {
-                        // set
-                        writes.push((*conn_id, req));
-                    }
-                    _ => panic!(),
                 },
                 Err(e) => {
                     if let TryRecvError::Disconnected = e {
@@ -132,7 +132,43 @@ pub fn shard(
                         resp.extend(val);
                         resps.push((conn_id, resp));
                     }
-                    None => resps.push((conn_id, vec![1])),
+                    None => {
+                        // Check if key exists anywhere in the tree
+                        let key_exists_somewhere = {
+                            let mut found = false;
+                            for (_, idx) in cache.id_map.iter() {
+                                let mut check_page = buf_pool[*idx].read();
+                                if !check_page.is_inner() && check_page.search_leaf(&req).is_some()
+                                {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            found
+                        };
+                        if key_exists_somewhere {
+                            println!("NAVIGATION BUG:");
+                            println!("  Target key: {:?}", &req[..4.min(req.len())]);
+                            println!("  Navigation led to page: {}", group.page_idx);
+                            println!("  But key actually exists in tree");
+
+                            // Show where the key actually is
+                            for (pid, &buf_idx) in cache.id_map.iter() {
+                                let mut check_page = buf_pool[buf_idx].read();
+                                if !check_page.is_inner() && check_page.search_leaf(&req).is_some()
+                                {
+                                    println!("  Key actually found in page: {}", pid);
+                                    break;
+                                }
+                            }
+
+                            panic!(
+                                "BUG: Key exists in tree but index navigation led to wrong leaf!"
+                            );
+                        }
+
+                        resps.push((conn_id, vec![1]))
+                    }
                 }
             }
         }
@@ -142,6 +178,7 @@ pub fn shard(
             path.clear();
             page_mut.clear();
 
+            let delta = Delta::from_top(&buf);
             apply_write(
                 &mut cache,
                 &mut buf_pool,
@@ -150,8 +187,12 @@ pub fn shard(
                 &mut root,
                 &mut path,
                 &mut page_mut,
-                Delta::from_top(&buf),
+                delta,
             );
+
+            // if let Err(error) = validate_tree_structure(&buf_pool, &mut cache, root) {
+            //     panic!("Tree structure violation after write: {}", error);
+            // }
 
             resps.push((conn_id, vec![0]));
         }
@@ -170,13 +211,41 @@ fn find_leaf(
     cache: &mut Cache,
     root: PageId,
 ) -> Result<(PageId, usize), PageId> {
+    // Debug this specific failing key
+    let debug_key = [53, 89, 181, 126];
+    let debug_this = target.len() >= 4
+        && target[0] == debug_key[0]
+        && target[1] == debug_key[1]
+        && target[2] == debug_key[2]
+        && target[3] == debug_key[3];
+
+    if debug_this {
+        println!(
+            "FIND_LEAF: Tracing navigation for key {:?}...",
+            &target[..8]
+        );
+        println!("  Starting at root: {}", root);
+    }
+
     let (mut current, mut current_id, mut current_idx) = match cache.get(root) {
         Some(idx) => (buf_pool[idx].read(), root, idx),
         None => return Err(root),
     };
 
+    let mut level = 0;
     while current.is_inner() {
+        if debug_this {
+            println!("  Level {}: At inner node {}", level, current_id);
+        }
+
         current_id = current.search_inner(target);
+
+        if debug_this {
+            println!(
+                "  Level {}: search_inner chose next_id = {}",
+                level, current_id
+            );
+        }
         current = match cache.get(current_id) {
             Some(idx) => {
                 current_idx = idx;
@@ -184,6 +253,15 @@ fn find_leaf(
             }
             None => return Err(current_id),
         };
+
+        level += 1;
+    }
+
+    if debug_this {
+        println!(
+            "  Final: Reached leaf node {} at level {}",
+            current_id, level
+        );
     }
 
     Ok((current_id, current_idx))

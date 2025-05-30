@@ -33,7 +33,6 @@ impl PageBuffer {
         }
 
         delta.write_to_buf(unsafe { slice::from_raw_parts_mut(self.ptr.add(self.top - len), len) });
-        let old_top = self.top;
         self.top -= len;
 
         true
@@ -71,6 +70,7 @@ impl Page<'_> {
 
     pub fn search_inner(&mut self, target: &[u8]) -> PageId {
         let mut best = None;
+
         while let Some(delta) = self.deltas.next() {
             match delta {
                 Delta::Split(split_delta) => {
@@ -122,8 +122,6 @@ impl<'p> From<&'p [u8]> for Page<'p> {
         let base_len =
             u64::from_be_bytes(buf[buf.len() - BASE_LEN_SIZE..].try_into().unwrap()) as usize;
         let deltas = DeltaIter::from(&buf[..buf.len() - (BASE_LEN_SIZE + base_len)]);
-        // In Page::from, after creating the delta buffer
-        let delta_buf = &buf[..buf.len() - (BASE_LEN_SIZE + base_len)];
         let base =
             BasePage::from(&buf[buf.len() - (BASE_LEN_SIZE + base_len)..buf.len() - BASE_LEN_SIZE]);
 
@@ -175,6 +173,7 @@ impl<'i> DoubleEndedIterator for DeltaIter<'i> {
 // pretty much always going to be stack allocated things, so having a vtable seems really dumb, but
 // also having it be an enum might make us have to branch a lot more than we need to (could maybe
 // have a top level enum that contains things that implement a trait, idk, play around with it)
+#[derive(Copy, Clone)]
 pub enum Delta<'d> {
     Set(SetDelta<'d>),
     Split(SplitDelta<'d>),
@@ -466,11 +465,11 @@ impl<'b> From<&'b [u8]> for BasePage<'b> {
 // make this better once i get a better sense of how it'll be used, and it definietly doesn't need
 // to be treated as a "page"
 pub struct PageMut {
-    entries: BTreeMap<Vec<u8>, Vec<u8>>,
-    left_pid: PageId,
-    right_pid: PageId,
-    total_size: usize,
-    page_size: usize,
+    pub entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub left_pid: PageId,
+    pub right_pid: PageId,
+    pub total_size: usize,
+    pub page_size: usize,
 }
 impl PageMut {
     pub fn new(page_size: usize) -> Self {
@@ -623,7 +622,6 @@ impl PageMut {
 
         page_buf.clear();
         let top = page_buf.cap - self.total_size;
-        let old_top = page_buf.top;
         page_buf.top = top;
         let buf = &mut page_buf.raw_buffer_mut()[top..];
 
