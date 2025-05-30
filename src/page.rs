@@ -48,7 +48,6 @@ impl PageBuffer {
     }
     pub fn clear(&mut self) {
         self.raw_buffer_mut().fill(0);
-        let old_top = self.top;
         self.top = self.cap;
     }
 }
