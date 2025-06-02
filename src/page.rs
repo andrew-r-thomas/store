@@ -68,8 +68,9 @@ impl Page<'_> {
     }
 
     pub fn search_inner(&mut self, target: &[u8]) -> PageId {
-        let mut best = None;
+        self.deltas.reset();
 
+        let mut best = None;
         while let Some(delta) = self.deltas.next() {
             match delta {
                 Delta::Split(split_delta) => {
@@ -102,14 +103,12 @@ impl Page<'_> {
         }
     }
     pub fn search_leaf(&mut self, target: &[u8]) -> Option<&[u8]> {
-        println!("Searching page as leaf for target {:?}...", &target[0..4]);
+        self.deltas.reset();
 
         while let Some(delta) = self.deltas.next() {
             match delta {
                 Delta::Set(set_delta) => {
-                    println!("Found delta with key {:?}...", &set_delta.key[0..4]);
                     if set_delta.key == target {
-                        println!("Delta matches, returning val {:?}...", &set_delta.val[0..4]);
                         return Some(set_delta.val);
                     }
                 }
@@ -117,11 +116,7 @@ impl Page<'_> {
             }
         }
 
-        println!("No matches in deltas, searching base page");
         self.base.search_leaf(target)
-    }
-    pub fn reset(&mut self) {
-        self.deltas.reset();
     }
 }
 impl<'p> From<&'p [u8]> for Page<'p> {

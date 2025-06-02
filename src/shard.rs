@@ -79,13 +79,9 @@ impl Shard {
         }
 
         // process reads
-        println!("Processing {} read groups", self.reads.len());
-        for (pid, group) in self.reads.drain() {
+        for (_, group) in self.reads.drain() {
             let mut page = self.page_dir.buf_pool[group.page_idx].read();
-            let group_len = group.reads.len();
             for (conn_id, req) in group.reads {
-                println!("Group for page {}: {} reads", pid, group_len);
-                page.reset();
                 match page.search_leaf(&req) {
                     Some(val) => {
                         let mut resp = Vec::new();
@@ -186,7 +182,6 @@ fn find_leaf(target: &[u8], page_dir: &mut PageDir) -> Result<(PageId, usize), P
 
 fn apply_write(page_dir: &mut PageDir, scratch: &mut WriteScratch, delta: Delta) {
     let key = delta.key();
-    println!("Applying write for key {:?}...", &key[0..4]);
 
     scratch
         .path
@@ -201,19 +196,13 @@ fn apply_write(page_dir: &mut PageDir, scratch: &mut WriteScratch, delta: Delta)
         }
     }
 
-    println!("Found path for write: {:?}", scratch.path);
-
     let (leaf_id, leaf_idx) = scratch.path.pop().unwrap();
     if !page_dir.buf_pool[leaf_idx].write_delta(&delta) {
-        println!("Leaf {} full, needs compaction", leaf_id);
-
         let new_page = &mut scratch.page_mut;
         new_page.clear();
         new_page.compact(page_dir.buf_pool[leaf_idx].read());
 
         if !new_page.apply_delta(&delta) {
-            println!("Compacted leaf {} still full, needs split", leaf_id);
-
             let mut middle_key = Vec::new();
             let mut to_page = new_page.split_leaf(&mut middle_key);
 
@@ -297,6 +286,4 @@ fn apply_write(page_dir: &mut PageDir, scratch: &mut WriteScratch, delta: Delta)
             new_page.pack(&mut page_dir.buf_pool[leaf_idx]);
         }
     }
-
-    println!("Finished applying write\n");
 }
