@@ -102,10 +102,14 @@ impl Page<'_> {
         }
     }
     pub fn search_leaf(&mut self, target: &[u8]) -> Option<&[u8]> {
+        println!("Searching page as leaf for target {:?}...", &target[0..4]);
+
         while let Some(delta) = self.deltas.next() {
             match delta {
                 Delta::Set(set_delta) => {
+                    println!("Found delta with key {:?}...", &set_delta.key[0..4]);
                     if set_delta.key == target {
+                        println!("Delta matches, returning val {:?}...", &set_delta.val[0..4]);
                         return Some(set_delta.val);
                     }
                 }
@@ -113,7 +117,11 @@ impl Page<'_> {
             }
         }
 
+        println!("No matches in deltas, searching base page");
         self.base.search_leaf(target)
+    }
+    pub fn reset(&mut self) {
+        self.deltas.reset();
     }
 }
 impl<'p> From<&'p [u8]> for Page<'p> {
@@ -132,6 +140,12 @@ pub struct DeltaIter<'i> {
     pub buf: &'i [u8],
     pub top: usize,
     pub bottom: usize,
+}
+impl DeltaIter<'_> {
+    pub fn reset(&mut self) {
+        self.top = 0;
+        self.bottom = self.buf.len();
+    }
 }
 impl<'i> From<&'i [u8]> for DeltaIter<'i> {
     fn from(buf: &'i [u8]) -> Self {

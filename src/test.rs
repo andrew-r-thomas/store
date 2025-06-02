@@ -1,8 +1,8 @@
 #![cfg(test)]
 
-use std::{collections::HashMap, ops::Range};
+use crate::shard::Shard;
 
-use crate::shard::{self, PageDir, Shard, WriteScratch};
+use std::{collections::HashMap, ops::Range};
 
 use rand::{
     Rng, SeedableRng,
@@ -20,8 +20,8 @@ fn scratch() {
     const NUM_INGEST: usize = 1024;
     const NUM_BATCHES: usize = 2048;
 
-    const PAGE_SIZE: usize = 1024 * 1024;
-    const BUF_POOL_SIZE: usize = 1024;
+    const PAGE_SIZE: usize = 16 * 1024;
+    const BUF_POOL_SIZE: usize = 128 * 4096;
 
     run_sim(
         SEED,
@@ -85,15 +85,20 @@ pub fn run_sim(
             assert_eq!(&[0][..], &resp);
         }
 
-        println!("Completed ingest {}", i);
+        println!("Ingest {i} completed");
     }
 
     // process batches
+
     let ops = ["insert", "update", "get"];
     let mut expected = HashMap::new();
+    println!("Starting batch processing with {} batches", num_batches);
     for b in 0..num_batches {
+        println!("=== BATCH {} ===", b);
         for (id, entries) in clients.iter_mut() {
-            match *ops.choose(&mut rng).unwrap() {
+            let chosen_op = ops.choose(&mut rng).unwrap();
+            println!("Client {} chose operation: {}", id, chosen_op);
+            match *chosen_op {
                 "insert" => {
                     let key_len = rng.random_range(key_len_range.clone());
                     let val_len = rng.random_range(val_len_range.clone());
@@ -131,6 +136,11 @@ pub fn run_sim(
                     expected.insert(*id, vec![0]);
                 }
                 "get" => {
+                    println!(
+                        "Generating get for client {} with {} entries",
+                        id,
+                        entries.len()
+                    );
                     let (key, val) = entries.choose(&mut rng).unwrap();
 
                     let mut req = Vec::new();
