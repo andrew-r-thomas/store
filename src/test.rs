@@ -1,8 +1,13 @@
 #![cfg(test)]
 
-use crate::shard::Shard;
+use crate::shard::{Comp, IO, Shard, Sub};
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    ops::Range,
+    path::Path,
+};
 
 use rand::{
     Rng, SeedableRng,
@@ -166,5 +171,36 @@ pub fn run_sim(
         }
 
         println!("Completed batch {}", b);
+    }
+}
+
+struct TestIO {
+    file: File,
+    subs: Vec<Sub>,
+    pending_subs: Vec<Sub>,
+    comps: Vec<Comp>,
+}
+impl IO for TestIO {
+    fn poll(&mut self) -> impl Iterator<Item = Comp> {
+        self.comps.drain(..)
+    }
+    fn register_sub(&mut self, sub: Sub) {
+        self.pending_subs.push(sub);
+    }
+    fn submit(&mut self) {
+        self.subs.extend(self.pending_subs.drain(..));
+    }
+    fn create(path: &Path) -> Self {
+        Self {
+            file: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap(),
+            subs: Vec::new(),
+            pending_subs: Vec::new(),
+            comps: Vec::new(),
+        }
     }
 }
