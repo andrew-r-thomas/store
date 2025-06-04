@@ -116,8 +116,36 @@ impl<IO_: IO> Shard<IO_> {
                     buf.resize(1024, 0);
                     self.conn_bufs.push(buf);
                 }
-                Comp::FileRead { .. } => todo!(),
-                Comp::FileWrite { .. } => todo!(),
+                Comp::FileRead { mut buf } => {
+                    let pr = self.pending_read.as_mut().unwrap();
+                    let (next_off, chunk) = parse_chunk(&buf, pr.off);
+                    let page = &mut self.page_dir.buf_pool[pr.idx];
+                    let page_buf = page.raw_buffer_mut();
+                    page_buf[pr.len..pr.len + chunk.len()].copy_from_slice(chunk);
+                    pr.len += chunk.len();
+                    pr.off = next_off % self.block_size;
+
+                    buf.fill(0);
+                    self.block_bufs.push(buf);
+
+                    if next_off == 0 {
+                        page_buf.copy_within(0..pr.len, page_buf.len() - pr.len);
+                        page.top = page_buf.len() - pr.len;
+                        self.page_dir.cache.insert(pr.pid, pr.idx);
+                        self.pending_read = None;
+                    } else {
+                        let next_block_start =
+                            ((next_off / self.block_size) * self.block_size) as u64;
+                        self.io.register_sub(Sub::FileRead {
+                            buf: self.block_bufs.pop().unwrap(),
+                            offset: next_block_start,
+                        });
+                    }
+                }
+                Comp::FileWrite { mut buf } => {
+                    buf.fill(0);
+                    self.block_bufs.push(buf);
+                }
             }
         }
 
@@ -207,10 +235,6 @@ impl<IO_: IO> Shard<IO_> {
 
         // tee up best page read if we can/need to
         if self.pending_read.is_none() && !self.read_prios.is_empty() {
-            let mut pr = PendingRead {
-                idx: self.page_dir.free_list.pop().unwrap(),
-                len: 0,
-            };
             let best = *self
                 .read_prios
                 .iter()
@@ -222,20 +246,28 @@ impl<IO_: IO> Shard<IO_> {
             // PERF: power of 2 and bit ops
             let offset = *self.offset_table.get(&best).unwrap() as usize;
             let block = offset / self.block_size;
+            let block_off = offset % self.block_size;
+            let mut pr = PendingRead {
+                pid: best,
+                idx: self.page_dir.free_list.pop().unwrap(),
+                len: 0,
+                off: block_off,
+            };
 
             if block == self.write_block {
                 // most recent page chunk is in write buffer
-                let block_off = offset % self.block_size;
                 let (next_off, chunk) = parse_chunk(&self.write_buf, block_off);
                 let page = &mut self.page_dir.buf_pool[pr.idx];
                 let buf = page.raw_buffer_mut();
                 buf[pr.len..pr.len + chunk.len()].copy_from_slice(chunk);
                 pr.len += chunk.len();
+                pr.off = next_off % self.block_size;
 
                 if next_off == 0 {
                     // no more chunks
                     buf.copy_within(0..pr.len, buf.len() - pr.len);
                     page.top = buf.len() - pr.len;
+                    self.page_dir.cache.insert(pr.pid, pr.idx);
                 } else {
                     // need to read more
                     let next_block_start = ((next_off / self.block_size) * self.block_size) as u64;
@@ -527,6 +559,8 @@ pub enum OpState {
     None,
 }
 pub struct PendingRead {
+    pid: PageId,
     idx: usize,
     len: usize,
+    off: usize,
 }
