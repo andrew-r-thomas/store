@@ -17,28 +17,33 @@ use crate::{
 
 use std::{collections::HashMap, path::Path};
 
-pub struct Shard<io: IO> {
+pub struct Shard<IO_: IO> {
     pub page_dir: PageDir,
-
-    pub ops: Ops,
 
     pub conns: HashMap<u32, Conn>,
     pub conn_bufs: Vec<Vec<u8>>,
+    pub ops: Ops,
 
-    pub pending_read: Option<()>,
-    pub write_bufs: Vec<Vec<u8>>,
+    pub block_size: usize,
+    pub free_cap_target: usize,
+    pub pending_read: Option<PendingRead>,
+    pub write_block: usize,
+    pub write_offset: usize,
+    pub block_bufs: Vec<Vec<u8>>,
+    pub write_buf: Vec<u8>,
     pub read_prios: HashMap<PageId, u32>,
     pub offset_table: HashMap<PageId, u64>,
-    pub io: io,
+    pub io: IO_,
 }
-impl<io: IO> Shard<io> {
+impl<IO_: IO> Shard<IO_> {
     pub fn new(
         page_size: usize,
         buf_pool_size: usize,
-        write_buf_size: usize,
+        block_size: usize,
         num_write_bufs: usize,
         num_conn_bufs: usize,
         conn_buf_size: usize,
+        free_cap_target: usize,
         path: &Path,
     ) -> Self {
         let mut page_dir = PageDir::new(page_size, buf_pool_size, 1, 2);
@@ -57,27 +62,36 @@ impl<io: IO> Shard<io> {
             conns: HashMap::new(),
             conn_bufs: Vec::from_iter((0..num_conn_bufs).map(|_| vec![0; conn_buf_size])),
 
+            block_size,
+            write_block: 0,
+            write_offset: 0,
+            free_cap_target,
             pending_read: None,
-            write_bufs: Vec::from_iter((0..num_write_bufs).map(|_| vec![0; write_buf_size])),
+            block_bufs: Vec::from_iter((0..num_write_bufs).map(|_| vec![0; block_size])),
+            write_buf: vec![0; block_size],
             read_prios: HashMap::new(),
             offset_table: HashMap::new(),
-            io: io::create(path),
+            io: IO_::create(path),
         }
     }
 
+    // TODO: connection adding and disconnect
     pub fn run_pipeline(&mut self) {
         // read inputs
         for comp in self.io.poll() {
             match comp {
-                Comp::TcpRead { buf, conn_id } => {
+                Comp::TcpRead { mut buf, conn_id } => {
                     let conn = self.conns.get_mut(&conn_id).unwrap();
                     match conn.op {
-                        OpState::Reading(b) => {
-                            b.extend(buf);
+                        OpState::Reading => {
+                            conn.buf.extend(&buf);
+
                             buf.fill(0);
+                            buf.resize(1024, 0);
                             self.conn_bufs.push(buf);
-                            match parse_req(&b) {
-                                Ok(_) => conn.op = OpState::Pending(b),
+
+                            match parse_req(&conn.buf) {
+                                Ok(_) => conn.op = OpState::Pending,
                                 Err(()) => self.io.register_sub(Sub::TcpRead {
                                     buf: self.conn_bufs.pop().unwrap(),
                                     conn_id,
@@ -85,9 +99,9 @@ impl<io: IO> Shard<io> {
                             }
                         }
                         OpState::None => match parse_req(&buf) {
-                            Ok(_) => conn.op = OpState::Pending(buf),
+                            Ok(_) => conn.op = OpState::Pending,
                             Err(()) => {
-                                conn.op = OpState::Reading(buf);
+                                conn.op = OpState::Reading;
                                 self.io.register_sub(Sub::TcpRead {
                                     buf: self.conn_bufs.pop().unwrap(),
                                     conn_id,
@@ -97,100 +111,188 @@ impl<io: IO> Shard<io> {
                         _ => panic!(),
                     }
                 }
-                Comp::TcpWrite { buf } => self.conn_bufs.push(buf),
+                Comp::TcpWrite { mut buf } => {
+                    buf.fill(0);
+                    buf.resize(1024, 0);
+                    self.conn_bufs.push(buf);
+                }
                 Comp::FileRead { .. } => todo!(),
                 Comp::FileWrite { .. } => todo!(),
             }
         }
 
+        // find ops that can be completed in this pipeline
         for (conn_id, conn) in self.conns.iter_mut() {
-            if let OpState::Pending(buf) = conn.op {
-                match parse_req(&buf).unwrap() {
+            if let OpState::Pending = conn.op {
+                match parse_req(&conn.buf).unwrap() {
                     Req::Get(get_req) => match find_leaf(get_req.key, &mut self.page_dir) {
-                        Ok((pid, idx)) => match self.ops.reads.get_mut(&pid) {
-                            Some(group) => {
-                                group.reads.push((*conn_id, buf));
+                        Ok((pid, idx)) => {
+                            match self.ops.reads.get_mut(&pid) {
+                                Some(group) => {
+                                    group.reads.push(*conn_id);
+                                }
+                                None => {
+                                    self.ops.reads.insert(
+                                        pid,
+                                        ReadGroup {
+                                            page_idx: idx,
+                                            reads: vec![*conn_id],
+                                        },
+                                    );
+                                }
                             }
-                            None => {
-                                self.ops.reads.insert(
-                                    pid,
-                                    ReadGroup {
-                                        page_idx: idx,
-                                        reads: vec![(*conn_id, buf)],
-                                    },
-                                );
-                            }
-                        },
+
+                            conn.op = OpState::None;
+                            self.io.register_sub(Sub::TcpRead {
+                                conn_id: *conn_id,
+                                buf: self.conn_bufs.pop().unwrap(),
+                            });
+                        }
                         Err(pid) => *self.read_prios.entry(pid).or_insert(0) += 1,
                     },
-                    Req::Set(set_req) => {}
-                }
-            }
-        }
+                    Req::Set(set_req) => {
+                        if let Err(pid) = find_leaf(set_req.key, &mut self.page_dir) {
+                            *self.read_prios.entry(pid).or_insert(0) += 1;
+                        } else {
+                            self.ops.writes.push(*conn_id);
 
-        // load up ops
-        for (conn_id, mut req) in self.ops.pending.drain(..) {
-            match *req.first().unwrap() {
-                1 => {
-                    // get
-                    // would have key length parsing in here as well
-                    req.drain(0..5);
-                    match find_leaf(&req, &mut self.page_dir) {
-                        Ok((pid, idx)) => match self.reads.get_mut(&pid) {
-                            Some(group) => {
-                                group.reads.push((conn_id, req));
-                            }
-                            None => {
-                                self.reads.insert(
-                                    pid,
-                                    ReadGroup {
-                                        page_idx: idx,
-                                        reads: vec![(conn_id, req)],
-                                    },
-                                );
-                            }
-                        },
-                        Err(pid) => *self.read_prios.entry(pid).or_insert(0) += 1,
+                            conn.op = OpState::None;
+                            self.io.register_sub(Sub::TcpRead {
+                                conn_id: *conn_id,
+                                buf: self.conn_bufs.pop().unwrap(),
+                            });
+                        }
                     }
                 }
-                2 => {
-                    // set
-                    if let Err(pid) = find_leaf(Delta::from_top(&req).key(), &mut self.page_dir) {
-                        *self.read_prios.entry(pid).or_insert(0) += 1;
-                    } else {
-                        self.writes.push((conn_id, req));
-                    }
-                }
-                _ => panic!(),
             }
         }
 
         // process reads
         for (_, group) in self.ops.reads.drain() {
             let mut page = self.page_dir.buf_pool[group.page_idx].read();
-            for (conn_id, req) in group.reads {
-                match page.search_leaf(&req) {
+            for conn_id in group.reads {
+                match page.search_leaf(&self.conns.get(&conn_id).unwrap().buf) {
                     Some(val) => {
-                        let mut resp = Vec::new();
-                        resp.push(0);
-                        resp.extend(&(val.len() as u32).to_be_bytes());
-                        resp.extend(val);
-                        resps.push((conn_id, resp));
+                        let mut buf = self.conn_bufs.pop().unwrap();
+                        buf.clear();
+                        buf.push(0);
+                        buf.extend(&(val.len() as u32).to_be_bytes());
+                        buf.extend(val);
+
+                        self.io.register_sub(Sub::TcpWrite { buf, conn_id });
                     }
-                    None => resps.push((conn_id, vec![1])),
+                    None => {
+                        let mut buf = self.conn_bufs.pop().unwrap();
+                        buf.clear();
+                        buf.push(1);
+
+                        self.io.register_sub(Sub::TcpWrite { buf, conn_id });
+                    }
                 }
             }
         }
 
         // process writes
-        for (conn_id, buf) in self.writes.drain(..) {
-            self.scratch.clear();
+        for conn_id in self.ops.writes.drain(..) {
+            self.ops.scratch.clear();
+            let delta = Delta::from_top(&self.conns.get(&conn_id).unwrap().buf);
+            apply_write(&mut self.page_dir, &mut self.ops.scratch, delta);
 
-            let delta = Delta::from_top(&buf);
-            apply_write(&mut self.page_dir, &mut self.scratch, delta);
+            let mut buf = self.conn_bufs.pop().unwrap();
+            buf.clear();
+            buf.push(0);
 
-            resps.push((conn_id, vec![0]));
+            self.io.register_sub(Sub::TcpWrite { buf, conn_id });
         }
+
+        // tee up best page read if we can/need to
+        if self.pending_read.is_none() && !self.read_prios.is_empty() {
+            let mut pr = PendingRead {
+                idx: self.page_dir.free_list.pop().unwrap(),
+                len: 0,
+            };
+            let best = *self
+                .read_prios
+                .iter()
+                .max_by(|(_, a), (_, b)| a.cmp(b))
+                .unwrap()
+                .0;
+            self.read_prios.remove(&best);
+
+            // PERF: power of 2 and bit ops
+            let offset = *self.offset_table.get(&best).unwrap() as usize;
+            let block = offset / self.block_size;
+
+            if block == self.write_block {
+                // most recent page chunk is in write buffer
+                let block_off = offset % self.block_size;
+                let (next_off, chunk) = parse_chunk(&self.write_buf, block_off);
+                let page = &mut self.page_dir.buf_pool[pr.idx];
+                let buf = page.raw_buffer_mut();
+                buf[pr.len..pr.len + chunk.len()].copy_from_slice(chunk);
+                pr.len += chunk.len();
+
+                if next_off == 0 {
+                    // no more chunks
+                    buf.copy_within(0..pr.len, buf.len() - pr.len);
+                    page.top = buf.len() - pr.len;
+                } else {
+                    // need to read more
+                    let next_block_start = ((next_off / self.block_size) * self.block_size) as u64;
+                    self.io.register_sub(Sub::FileRead {
+                        buf: self.block_bufs.pop().unwrap(),
+                        offset: next_block_start,
+                    });
+                    self.pending_read = Some(pr);
+                }
+            } else {
+                // need to read in the block
+                let block_start = (block * self.block_size) as u64;
+                self.io.register_sub(Sub::FileRead {
+                    buf: self.block_bufs.pop().unwrap(),
+                    offset: block_start,
+                });
+                self.pending_read = Some(pr);
+            }
+        }
+
+        // evict enough to have a nice full free list
+        let mut evicts = Vec::new(); // PERF:
+        {
+            let mut evict_cands = self.page_dir.cache.evict_cands();
+            while self.page_dir.free_list.len() < self.free_cap_target {
+                let (pid, idx) = evict_cands.next().unwrap();
+                // for now we'll just evict the best candidates, but we may have some constraints
+                // later from things like txns that prevent us from evicting certain pages
+                let page = &mut self.page_dir.buf_pool[idx];
+                let flush_len = page.flush_len();
+
+                if self.block_size - self.write_offset < flush_len {
+                    // not enough room in current write buffer
+                    let mut write_buf = self.block_bufs.pop().unwrap();
+                    std::mem::swap(&mut write_buf, &mut self.write_buf);
+                    self.io.register_sub(Sub::FileWrite {
+                        buf: write_buf,
+                        offset: (self.write_block * self.block_size) as u64,
+                    });
+                    self.write_block += 1;
+                    self.write_offset = 0;
+                }
+
+                page.flush(&mut self.write_buf[self.write_offset..self.write_offset + flush_len]);
+                self.write_offset += flush_len;
+                page.clear();
+                self.page_dir.free_list.push(idx);
+
+                evicts.push(pid);
+            }
+        }
+        for pid in evicts.drain(..) {
+            self.page_dir.cache.remove(pid);
+        }
+
+        // submit io
+        self.io.submit();
     }
 }
 
@@ -244,7 +346,7 @@ impl WriteScratch {
 
 pub struct Ops {
     pub reads: HashMap<PageId, ReadGroup>,
-    pub writes: Vec<(u32, Vec<u8>)>,
+    pub writes: Vec<u32>,
     pub scratch: WriteScratch,
 }
 impl Ops {
@@ -258,7 +360,7 @@ impl Ops {
 }
 pub struct ReadGroup {
     page_idx: usize,
-    reads: Vec<(u32, Vec<u8>)>,
+    reads: Vec<u32>,
 }
 
 fn find_leaf(target: &[u8], page_dir: &mut PageDir) -> Result<(PageId, usize), PageId> {
@@ -389,11 +491,17 @@ fn apply_write(page_dir: &mut PageDir, scratch: &mut WriteScratch, delta: Delta)
     }
 }
 
+pub fn parse_chunk(buf: &[u8], start: usize) -> (usize, &[u8]) {
+    let next_off = u64::from_be_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
+    let chunk_len = u64::from_be_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+    (next_off, &buf[start + 16..start + 16 + chunk_len])
+}
+
 pub trait IO {
     fn create(path: &Path) -> Self;
     fn register_sub(&mut self, sub: Sub);
     fn submit(&mut self);
-    fn poll(&mut self) -> impl Iterator<Item = Comp>;
+    fn poll(&mut self) -> Vec<Comp>;
 }
 pub enum Sub {
     TcpRead { buf: Vec<u8>, conn_id: u32 },
@@ -401,6 +509,7 @@ pub enum Sub {
     FileRead { buf: Vec<u8>, offset: u64 },
     FileWrite { buf: Vec<u8>, offset: u64 },
 }
+#[derive(Clone)]
 pub enum Comp {
     TcpRead { buf: Vec<u8>, conn_id: u32 },
     TcpWrite { buf: Vec<u8> },
@@ -409,10 +518,15 @@ pub enum Comp {
 }
 
 pub struct Conn {
+    buf: Vec<u8>,
     op: OpState,
 }
 pub enum OpState {
-    Pending(Vec<u8>),
-    Reading(Vec<u8>),
+    Pending,
+    Reading,
     None,
+}
+pub struct PendingRead {
+    idx: usize,
+    len: usize,
 }

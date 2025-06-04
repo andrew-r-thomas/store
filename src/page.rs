@@ -11,6 +11,7 @@ pub struct PageBuffer {
     ptr: *mut u8,
     pub top: usize,
     pub cap: usize,
+    pub flush: usize,
 }
 impl PageBuffer {
     pub fn new(cap: usize) -> Self {
@@ -19,7 +20,12 @@ impl PageBuffer {
         if ptr.is_null() {
             alloc::handle_alloc_error(layout)
         }
-        Self { ptr, cap, top: cap }
+        Self {
+            ptr,
+            cap,
+            top: cap,
+            flush: cap,
+        }
     }
 
     pub fn read(&self) -> Page {
@@ -49,6 +55,16 @@ impl PageBuffer {
     pub fn clear(&mut self) {
         self.raw_buffer_mut().fill(0);
         self.top = self.cap;
+        self.flush = self.cap;
+    }
+    #[inline]
+    pub fn flush_len(&self) -> usize {
+        self.flush - self.top
+    }
+    pub fn flush(&mut self, buf: &mut [u8]) {
+        assert_eq!(self.flush_len(), buf.len());
+        buf.copy_from_slice(&self.raw_buffer()[self.top..self.flush]);
+        self.flush = self.top;
     }
 }
 

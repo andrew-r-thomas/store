@@ -181,8 +181,10 @@ struct TestIO {
     comps: Vec<Comp>,
 }
 impl IO for TestIO {
-    fn poll(&mut self) -> impl Iterator<Item = Comp> {
-        self.comps.drain(..)
+    fn poll(&mut self) -> Vec<Comp> {
+        let out = self.comps.clone();
+        self.comps.clear();
+        out
     }
     fn register_sub(&mut self, sub: Sub) {
         self.pending_subs.push(sub);
