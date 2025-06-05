@@ -15,12 +15,14 @@ use crate::{
     page::{Delta, PageBuffer, PageMut, SplitDelta},
 };
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+// NOTE: for now using BTreeMap bc the iteration order is deterministic, need a better solution
+// though
 pub struct Shard<I: IO, M: Mesh> {
     pub page_dir: PageDir,
 
-    pub conns: HashMap<u32, Conn>,
+    pub conns: BTreeMap<u32, Conn>,
     pub net_bufs: Vec<Vec<u8>>,
     pub ops: Ops,
     pub net_buf_size: usize,
@@ -32,8 +34,8 @@ pub struct Shard<I: IO, M: Mesh> {
     pub write_offset: usize,
     pub block_bufs: Vec<Vec<u8>>,
     pub write_buf: Vec<u8>,
-    pub read_prios: HashMap<PageId, u32>,
-    pub offset_table: HashMap<PageId, u64>,
+    pub read_prios: BTreeMap<PageId, u32>,
+    pub offset_table: BTreeMap<PageId, u64>,
     pub io: I,
 
     pub mesh: M,
@@ -63,7 +65,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
 
             ops,
 
-            conns: HashMap::new(),
+            conns: BTreeMap::new(),
             net_bufs: Vec::from_iter((0..num_conn_bufs).map(|_| vec![0; net_buf_size])),
             net_buf_size,
 
@@ -74,8 +76,8 @@ impl<I: IO, M: Mesh> Shard<I, M> {
             pending_read: None,
             block_bufs: Vec::from_iter((0..num_write_bufs).map(|_| vec![0; block_size])),
             write_buf: vec![0; block_size],
-            read_prios: HashMap::new(),
-            offset_table: HashMap::new(),
+            read_prios: BTreeMap::new(),
+            offset_table: BTreeMap::new(),
             io,
 
             mesh,
@@ -124,10 +126,6 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                         if let OpState::Pending = conn.op {
                             panic!()
                         }
-
-                        let new_bytes = &buf[..bytes];
-                        println!("first byte of new is {:?}", new_bytes.first());
-                        println!("first bytes of conn buf is {:?}", conn.buf.first());
 
                         conn.buf.extend(&buf[..bytes]);
                         match parse_req(&conn.buf) {
@@ -195,19 +193,21 @@ impl<I: IO, M: Mesh> Shard<I, M> {
         // find ops that can be completed in this pipeline
         for (conn_id, conn) in self.conns.iter_mut() {
             if let OpState::Pending = conn.op {
-                match parse_req(&conn.buf).unwrap() {
+                let req = parse_req(&conn.buf).unwrap();
+                let req_len = req.len();
+                match req {
                     Req::Get(get_req) => match find_leaf(get_req.key, &mut self.page_dir) {
                         Ok((pid, idx)) => {
                             match self.ops.reads.get_mut(&pid) {
                                 Some(group) => {
-                                    group.reads.push(*conn_id);
+                                    group.reads.push((*conn_id, req_len));
                                 }
                                 None => {
                                     self.ops.reads.insert(
                                         pid,
                                         ReadGroup {
                                             page_idx: idx,
-                                            reads: vec![*conn_id],
+                                            reads: vec![(*conn_id, req_len)],
                                         },
                                     );
                                 }
@@ -225,7 +225,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                         if let Err(pid) = find_leaf(set_req.key, &mut self.page_dir) {
                             *self.read_prios.entry(pid).or_insert(0) += 1;
                         } else {
-                            self.ops.writes.push(*conn_id);
+                            self.ops.writes.push((*conn_id, req_len));
 
                             conn.op = OpState::Reading;
                             self.io.register_sub(Sub::TcpRead {
@@ -239,10 +239,11 @@ impl<I: IO, M: Mesh> Shard<I, M> {
         }
 
         // process reads
-        for (_, group) in self.ops.reads.drain() {
+        let reads = std::mem::replace(&mut self.ops.reads, BTreeMap::new());
+        for (_, group) in reads {
             let mut page = self.page_dir.buf_pool[group.page_idx].read();
 
-            for conn_id in group.reads {
+            for (conn_id, req_len) in group.reads {
                 let conn_buf = &mut self.conns.get_mut(&conn_id).unwrap().buf;
                 let key = {
                     match parse_req(conn_buf).unwrap() {
@@ -270,12 +271,12 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                     }
                 }
 
-                conn_buf.clear();
+                conn_buf.drain(0..req_len);
             }
         }
 
         // process writes
-        for conn_id in self.ops.writes.drain(..) {
+        for (conn_id, req_len) in self.ops.writes.drain(..) {
             let conn_buf = &mut self.conns.get_mut(&conn_id).unwrap().buf;
             let delta = Delta::from_top(conn_buf);
 
@@ -288,7 +289,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
 
             self.io.register_sub(Sub::TcpWrite { buf, conn_id });
 
-            conn_buf.clear();
+            conn_buf.drain(0..req_len);
         }
 
         // tee up best page read if we can/need to
@@ -370,6 +371,10 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 }
 
                 page.flush(&mut self.write_buf[self.write_offset..self.write_offset + flush_len]);
+                self.offset_table.insert(
+                    pid,
+                    ((self.write_block * self.block_size) + self.write_offset) as u64,
+                );
                 self.write_offset += flush_len;
                 page.clear();
                 self.page_dir.free_list.push(idx);
@@ -435,14 +440,14 @@ impl WriteScratch {
 }
 
 pub struct Ops {
-    pub reads: HashMap<PageId, ReadGroup>,
-    pub writes: Vec<u32>,
+    pub reads: BTreeMap<PageId, ReadGroup>,
+    pub writes: Vec<(u32, usize)>,
     pub scratch: WriteScratch,
 }
 impl Ops {
     pub fn new(page_size: usize) -> Self {
         Self {
-            reads: HashMap::new(),
+            reads: BTreeMap::new(),
             writes: Vec::new(),
             scratch: WriteScratch::new(page_size),
         }
@@ -450,7 +455,7 @@ impl Ops {
 }
 pub struct ReadGroup {
     page_idx: usize,
-    reads: Vec<u32>,
+    reads: Vec<(u32, usize)>,
 }
 
 fn find_leaf(target: &[u8], page_dir: &mut PageDir) -> Result<(PageId, usize), PageId> {

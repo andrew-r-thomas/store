@@ -9,6 +9,14 @@ pub struct SetReq<'r> {
     pub key: &'r [u8],
     pub val: &'r [u8],
 }
+impl Req<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Get(get_req) => 1 + 4 + get_req.key.len(),
+            Self::Set(set_req) => 1 + 4 + 4 + set_req.key.len() + set_req.val.len(),
+        }
+    }
+}
 
 const GET_CODE: u8 = 1;
 const SET_CODE: u8 = 2;

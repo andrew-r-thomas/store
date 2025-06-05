@@ -5,7 +5,7 @@ use crate::shard::{Comp, IO, Mesh, Msg, Shard, Sub};
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     ops::Range,
     path::Path,
 };
@@ -27,7 +27,7 @@ fn scratch() {
     const NUM_BATCHES: usize = 2048;
 
     const PAGE_SIZE: usize = 16 * 1024;
-    const BUF_POOL_SIZE: usize = 128 * 4096;
+    const BUF_POOL_SIZE: usize = 4096;
     const FREE_CAP_TARGET: usize = BUF_POOL_SIZE / 5;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
@@ -252,6 +252,8 @@ impl TestConn {
                 break;
             }
         }
+
+        self.ticks += 1;
     }
     fn is_done(&self, num_ingest: usize, num_ops: usize) -> bool {
         self.ticks >= num_ingest + num_ops && self.expected.is_empty()
@@ -271,11 +273,16 @@ impl TestIO {
         for sub in self.subs.drain(..) {
             match sub {
                 Sub::FileRead { mut buf, offset } => {
+                    println!(
+                        "doing file read at offset {offset} with file len {}",
+                        self.file.metadata().unwrap().len()
+                    );
                     self.file.seek(SeekFrom::Start(offset)).unwrap();
                     self.file.read_exact(&mut buf).unwrap();
                     self.comps.push(Comp::FileRead { buf });
                 }
                 Sub::FileWrite { buf, offset } => {
+                    println!("doing file write");
                     self.file.seek(SeekFrom::Start(offset)).unwrap();
                     self.file.write_all(&buf).unwrap();
                     self.comps.push(Comp::FileWrite { buf });
