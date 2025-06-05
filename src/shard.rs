@@ -21,8 +21,9 @@ pub struct Shard<IO_: IO> {
     pub page_dir: PageDir,
 
     pub conns: HashMap<u32, Conn>,
-    pub conn_bufs: Vec<Vec<u8>>,
+    pub net_bufs: Vec<Vec<u8>>,
     pub ops: Ops,
+    pub net_buf_size: usize,
 
     pub block_size: usize,
     pub free_cap_target: usize,
@@ -42,7 +43,7 @@ impl<IO_: IO> Shard<IO_> {
         block_size: usize,
         num_write_bufs: usize,
         num_conn_bufs: usize,
-        conn_buf_size: usize,
+        net_buf_size: usize,
         free_cap_target: usize,
         path: &Path,
     ) -> Self {
@@ -60,7 +61,8 @@ impl<IO_: IO> Shard<IO_> {
             ops,
 
             conns: HashMap::new(),
-            conn_bufs: Vec::from_iter((0..num_conn_bufs).map(|_| vec![0; conn_buf_size])),
+            net_bufs: Vec::from_iter((0..num_conn_bufs).map(|_| vec![0; net_buf_size])),
+            net_buf_size,
 
             block_size,
             write_block: 0,
@@ -87,13 +89,13 @@ impl<IO_: IO> Shard<IO_> {
                             conn.buf.extend(&buf);
 
                             buf.fill(0);
-                            buf.resize(1024, 0);
-                            self.conn_bufs.push(buf);
+                            buf.resize(self.net_buf_size, 0);
+                            self.net_bufs.push(buf);
 
                             match parse_req(&conn.buf) {
                                 Ok(_) => conn.op = OpState::Pending,
                                 Err(()) => self.io.register_sub(Sub::TcpRead {
-                                    buf: self.conn_bufs.pop().unwrap(),
+                                    buf: self.net_bufs.pop().unwrap(),
                                     conn_id,
                                 }),
                             }
@@ -103,7 +105,7 @@ impl<IO_: IO> Shard<IO_> {
                             Err(()) => {
                                 conn.op = OpState::Reading;
                                 self.io.register_sub(Sub::TcpRead {
-                                    buf: self.conn_bufs.pop().unwrap(),
+                                    buf: self.net_bufs.pop().unwrap(),
                                     conn_id,
                                 });
                             }
@@ -113,8 +115,8 @@ impl<IO_: IO> Shard<IO_> {
                 }
                 Comp::TcpWrite { mut buf } => {
                     buf.fill(0);
-                    buf.resize(1024, 0);
-                    self.conn_bufs.push(buf);
+                    buf.resize(self.net_buf_size, 0);
+                    self.net_bufs.push(buf);
                 }
                 Comp::FileRead { mut buf } => {
                     let pr = self.pending_read.as_mut().unwrap();
@@ -173,7 +175,7 @@ impl<IO_: IO> Shard<IO_> {
                             conn.op = OpState::None;
                             self.io.register_sub(Sub::TcpRead {
                                 conn_id: *conn_id,
-                                buf: self.conn_bufs.pop().unwrap(),
+                                buf: self.net_bufs.pop().unwrap(),
                             });
                         }
                         Err(pid) => *self.read_prios.entry(pid).or_insert(0) += 1,
@@ -187,7 +189,7 @@ impl<IO_: IO> Shard<IO_> {
                             conn.op = OpState::None;
                             self.io.register_sub(Sub::TcpRead {
                                 conn_id: *conn_id,
-                                buf: self.conn_bufs.pop().unwrap(),
+                                buf: self.net_bufs.pop().unwrap(),
                             });
                         }
                     }
@@ -201,7 +203,7 @@ impl<IO_: IO> Shard<IO_> {
             for conn_id in group.reads {
                 match page.search_leaf(&self.conns.get(&conn_id).unwrap().buf) {
                     Some(val) => {
-                        let mut buf = self.conn_bufs.pop().unwrap();
+                        let mut buf = self.net_bufs.pop().unwrap();
                         buf.clear();
                         buf.push(0);
                         buf.extend(&(val.len() as u32).to_be_bytes());
@@ -210,7 +212,7 @@ impl<IO_: IO> Shard<IO_> {
                         self.io.register_sub(Sub::TcpWrite { buf, conn_id });
                     }
                     None => {
-                        let mut buf = self.conn_bufs.pop().unwrap();
+                        let mut buf = self.net_bufs.pop().unwrap();
                         buf.clear();
                         buf.push(1);
 
@@ -226,7 +228,7 @@ impl<IO_: IO> Shard<IO_> {
             let delta = Delta::from_top(&self.conns.get(&conn_id).unwrap().buf);
             apply_write(&mut self.page_dir, &mut self.ops.scratch, delta);
 
-            let mut buf = self.conn_bufs.pop().unwrap();
+            let mut buf = self.net_bufs.pop().unwrap();
             buf.clear();
             buf.push(0);
 
@@ -563,4 +565,11 @@ pub struct PendingRead {
     idx: usize,
     len: usize,
     off: usize,
+}
+
+pub trait Mesh {
+    fn poll(&mut self) -> Vec<Msg>;
+}
+pub enum Msg {
+    NewConn(u32),
 }

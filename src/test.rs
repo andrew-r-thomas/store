@@ -51,6 +51,11 @@ pub fn run_sim(
 
     page_size: usize,
     buf_pool_size: usize,
+    block_size: usize,
+    num_block_bufs: usize,
+    num_net_bufs: usize,
+    net_buf_size: usize,
+    free_cap_target: usize,
 ) {
     // set up "clients"
     let mut clients = HashMap::<u64, Vec<(Vec<u8>, Vec<u8>)>>::from_iter(
@@ -61,7 +66,16 @@ pub fn run_sim(
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
     // setup shard
-    let mut shard = Shard::new(page_size, buf_pool_size);
+    let mut shard = Shard::new(
+        page_size,
+        buf_pool_size,
+        block_size,
+        num_block_bufs,
+        num_net_bufs,
+        net_buf_size,
+        free_cap_target,
+        Path::new("test.store"),
+    );
 
     // do ingest
     for i in 0..num_ingest {
