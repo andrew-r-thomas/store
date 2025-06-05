@@ -67,6 +67,11 @@ impl PageBuffer {
         self.flush = self.top;
     }
 }
+impl Drop for PageBuffer {
+    fn drop(&mut self) {
+        unsafe { alloc::dealloc(self.ptr, Layout::array::<u8>(self.cap).unwrap()) }
+    }
+}
 
 const CODE_SIZE: usize = 1;
 const LEN_SIZE: usize = 4;

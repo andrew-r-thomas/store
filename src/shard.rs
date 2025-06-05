@@ -15,9 +15,9 @@ use crate::{
     page::{Delta, PageBuffer, PageMut, SplitDelta},
 };
 
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
-pub struct Shard<IO_: IO> {
+pub struct Shard<I: IO, M: Mesh> {
     pub page_dir: PageDir,
 
     pub conns: HashMap<u32, Conn>,
@@ -34,9 +34,11 @@ pub struct Shard<IO_: IO> {
     pub write_buf: Vec<u8>,
     pub read_prios: HashMap<PageId, u32>,
     pub offset_table: HashMap<PageId, u64>,
-    pub io: IO_,
+    pub io: I,
+
+    pub mesh: M,
 }
-impl<IO_: IO> Shard<IO_> {
+impl<I: IO, M: Mesh> Shard<I, M> {
     pub fn new(
         page_size: usize,
         buf_pool_size: usize,
@@ -45,7 +47,8 @@ impl<IO_: IO> Shard<IO_> {
         num_conn_bufs: usize,
         net_buf_size: usize,
         free_cap_target: usize,
-        path: &Path,
+        io: I,
+        mesh: M,
     ) -> Self {
         let mut page_dir = PageDir::new(page_size, buf_pool_size, 1, 2);
         let mut ops = Ops::new(page_size);
@@ -73,47 +76,85 @@ impl<IO_: IO> Shard<IO_> {
             write_buf: vec![0; block_size],
             read_prios: HashMap::new(),
             offset_table: HashMap::new(),
-            io: IO_::create(path),
+            io,
+
+            mesh,
         }
     }
 
-    // TODO: connection adding and disconnect
     pub fn run_pipeline(&mut self) {
         // read inputs
+        //
+        // from other threads
+        for msg in self.mesh.poll() {
+            match msg {
+                Msg::NewConn(conn_id) => {
+                    let mut buf = self.net_bufs.pop().unwrap();
+                    buf.clear();
+
+                    self.conns.insert(
+                        conn_id,
+                        Conn {
+                            buf,
+                            op: OpState::Reading,
+                        },
+                    );
+
+                    self.io.register_sub(Sub::TcpRead {
+                        buf: self.net_bufs.pop().unwrap(),
+                        conn_id,
+                    });
+                }
+            }
+        }
+        // from io
         for comp in self.io.poll() {
             match comp {
-                Comp::TcpRead { mut buf, conn_id } => {
-                    let conn = self.conns.get_mut(&conn_id).unwrap();
-                    match conn.op {
-                        OpState::Reading => {
-                            conn.buf.extend(&buf);
-
-                            buf.fill(0);
-                            buf.resize(self.net_buf_size, 0);
-                            self.net_bufs.push(buf);
-
-                            match parse_req(&conn.buf) {
-                                Ok(_) => conn.op = OpState::Pending,
-                                Err(()) => self.io.register_sub(Sub::TcpRead {
-                                    buf: self.net_bufs.pop().unwrap(),
-                                    conn_id,
-                                }),
-                            }
+                Comp::TcpRead {
+                    mut buf,
+                    conn_id,
+                    res,
+                    bytes,
+                } => {
+                    if res <= 0 {
+                        // error, client disconnected
+                        self.conns.remove(&conn_id).unwrap();
+                    } else {
+                        let conn = self.conns.get_mut(&conn_id).unwrap();
+                        if let OpState::Pending = conn.op {
+                            panic!()
                         }
-                        OpState::None => match parse_req(&buf) {
+
+                        let new_bytes = &buf[..bytes];
+                        println!("first byte of new is {:?}", new_bytes.first());
+                        println!("first bytes of conn buf is {:?}", conn.buf.first());
+
+                        conn.buf.extend(&buf[..bytes]);
+                        match parse_req(&conn.buf) {
                             Ok(_) => conn.op = OpState::Pending,
-                            Err(()) => {
-                                conn.op = OpState::Reading;
-                                self.io.register_sub(Sub::TcpRead {
-                                    buf: self.net_bufs.pop().unwrap(),
-                                    conn_id,
-                                });
-                            }
-                        },
-                        _ => panic!(),
+                            Err(()) => self.io.register_sub(Sub::TcpRead {
+                                buf: self.net_bufs.pop().unwrap(),
+                                conn_id,
+                            }),
+                        }
                     }
+
+                    // reset the buf and add it back to the pool
+                    buf.fill(0);
+                    buf.resize(self.net_buf_size, 0);
+                    self.net_bufs.push(buf);
                 }
-                Comp::TcpWrite { mut buf } => {
+                Comp::TcpWrite {
+                    mut buf,
+                    conn_id,
+                    res,
+                } => {
+                    if res <= 0 {
+                        // error, client disconnected
+                        self.conns.remove(&conn_id).unwrap();
+                    }
+
+                    // reset the buf and add it back to the pool
                     buf.fill(0);
                     buf.resize(self.net_buf_size, 0);
                     self.net_bufs.push(buf);
@@ -172,7 +213,7 @@ impl<IO_: IO> Shard<IO_> {
                                 }
                             }
 
-                            conn.op = OpState::None;
+                            conn.op = OpState::Reading;
                             self.io.register_sub(Sub::TcpRead {
                                 conn_id: *conn_id,
                                 buf: self.net_bufs.pop().unwrap(),
@@ -186,7 +227,7 @@ impl<IO_: IO> Shard<IO_> {
                         } else {
                             self.ops.writes.push(*conn_id);
 
-                            conn.op = OpState::None;
+                            conn.op = OpState::Reading;
                             self.io.register_sub(Sub::TcpRead {
                                 conn_id: *conn_id,
                                 buf: self.net_bufs.pop().unwrap(),
@@ -200,8 +241,17 @@ impl<IO_: IO> Shard<IO_> {
         // process reads
         for (_, group) in self.ops.reads.drain() {
             let mut page = self.page_dir.buf_pool[group.page_idx].read();
+
             for conn_id in group.reads {
-                match page.search_leaf(&self.conns.get(&conn_id).unwrap().buf) {
+                let conn_buf = &mut self.conns.get_mut(&conn_id).unwrap().buf;
+                let key = {
+                    match parse_req(conn_buf).unwrap() {
+                        Req::Get(get_req) => get_req.key,
+                        _ => panic!(),
+                    }
+                };
+
+                match page.search_leaf(key) {
                     Some(val) => {
                         let mut buf = self.net_bufs.pop().unwrap();
                         buf.clear();
@@ -219,13 +269,17 @@ impl<IO_: IO> Shard<IO_> {
                         self.io.register_sub(Sub::TcpWrite { buf, conn_id });
                     }
                 }
+
+                conn_buf.clear();
             }
         }
 
         // process writes
         for conn_id in self.ops.writes.drain(..) {
+            let conn_buf = &mut self.conns.get_mut(&conn_id).unwrap().buf;
+            let delta = Delta::from_top(conn_buf);
+
             self.ops.scratch.clear();
-            let delta = Delta::from_top(&self.conns.get(&conn_id).unwrap().buf);
             apply_write(&mut self.page_dir, &mut self.ops.scratch, delta);
 
             let mut buf = self.net_bufs.pop().unwrap();
@@ -233,6 +287,8 @@ impl<IO_: IO> Shard<IO_> {
             buf.push(0);
 
             self.io.register_sub(Sub::TcpWrite { buf, conn_id });
+
+            conn_buf.clear();
         }
 
         // tee up best page read if we can/need to
@@ -532,7 +588,6 @@ pub fn parse_chunk(buf: &[u8], start: usize) -> (usize, &[u8]) {
 }
 
 pub trait IO {
-    fn create(path: &Path) -> Self;
     fn register_sub(&mut self, sub: Sub);
     fn submit(&mut self);
     fn poll(&mut self) -> Vec<Comp>;
@@ -545,10 +600,23 @@ pub enum Sub {
 }
 #[derive(Clone)]
 pub enum Comp {
-    TcpRead { buf: Vec<u8>, conn_id: u32 },
-    TcpWrite { buf: Vec<u8> },
-    FileRead { buf: Vec<u8> },
-    FileWrite { buf: Vec<u8> },
+    TcpRead {
+        buf: Vec<u8>,
+        conn_id: u32,
+        res: i32,
+        bytes: usize,
+    },
+    TcpWrite {
+        buf: Vec<u8>,
+        conn_id: u32,
+        res: i32,
+    },
+    FileRead {
+        buf: Vec<u8>,
+    },
+    FileWrite {
+        buf: Vec<u8>,
+    },
 }
 
 pub struct Conn {
@@ -558,7 +626,6 @@ pub struct Conn {
 pub enum OpState {
     Pending,
     Reading,
-    None,
 }
 pub struct PendingRead {
     pid: PageId,
@@ -570,6 +637,7 @@ pub struct PendingRead {
 pub trait Mesh {
     fn poll(&mut self) -> Vec<Msg>;
 }
+#[derive(Clone)]
 pub enum Msg {
     NewConn(u32),
 }
