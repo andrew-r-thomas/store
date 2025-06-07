@@ -85,6 +85,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
     }
 
     pub fn run_pipeline(&mut self) {
+        println!("===RUNNING PIPELINE===");
         // read inputs
         //
         // from other threads
@@ -177,6 +178,9 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                     } else {
                         let next_block_start =
                             ((next_off / self.block_size) * self.block_size) as u64;
+                        println!(
+                            "subbing read for {next_block_start}, got read, but need more for page"
+                        );
                         self.io.register_sub(Sub::FileRead {
                             buf: self.block_bufs.pop().unwrap(),
                             offset: next_block_start,
@@ -219,11 +223,25 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                                 buf: self.net_bufs.pop().unwrap(),
                             });
                         }
-                        Err(pid) => *self.read_prios.entry(pid).or_insert(0) += 1,
+                        Err(pid) => match &self.pending_read {
+                            Some(pr) => {
+                                if pr.pid != pid {
+                                    *self.read_prios.entry(pid).or_insert(0) += 1;
+                                }
+                            }
+                            None => *self.read_prios.entry(pid).or_insert(0) += 1,
+                        },
                     },
                     Req::Set(set_req) => {
                         if let Err(pid) = find_leaf(set_req.key, &mut self.page_dir) {
-                            *self.read_prios.entry(pid).or_insert(0) += 1;
+                            match &self.pending_read {
+                                Some(pr) => {
+                                    if pr.pid != pid {
+                                        *self.read_prios.entry(pid).or_insert(0) += 1;
+                                    }
+                                }
+                                None => *self.read_prios.entry(pid).or_insert(0) += 1,
+                            }
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
 
@@ -313,7 +331,14 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 off: block_off,
             };
 
+            println!("===STARTING PAGE READ===");
+            println!("  page: {best}");
+            println!("  offset: {offset}");
+            println!("  block: {block}");
+            println!("  block_off: {block_off}");
+
             if block == self.write_block {
+                println!("  first page chunk in current write buf");
                 // most recent page chunk is in write buffer
                 let (next_off, chunk) = parse_chunk(&self.write_buf, block_off);
                 let page = &mut self.page_dir.buf_pool[pr.idx];
@@ -330,6 +355,10 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 } else {
                     // need to read more
                     let next_block_start = ((next_off / self.block_size) * self.block_size) as u64;
+                    println!(
+                        "subbing read for {next_block_start}, getting next chunk for page in write buffer\nblock size: {}, next_off: {next_off}",
+                        self.block_size,
+                    );
                     self.io.register_sub(Sub::FileRead {
                         buf: self.block_bufs.pop().unwrap(),
                         offset: next_block_start,
@@ -339,6 +368,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
             } else {
                 // need to read in the block
                 let block_start = (block * self.block_size) as u64;
+                println!("subbing read for {block_start}, page not in write buffer");
                 self.io.register_sub(Sub::FileRead {
                     buf: self.block_bufs.pop().unwrap(),
                     offset: block_start,
@@ -358,7 +388,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 let page = &mut self.page_dir.buf_pool[idx];
                 let flush_len = page.flush_len();
 
-                if self.block_size - self.write_offset < flush_len {
+                if self.block_size - self.write_offset < flush_len + 16 {
                     // not enough room in current write buffer
                     let mut write_buf = self.block_bufs.pop().unwrap();
                     std::mem::swap(&mut write_buf, &mut self.write_buf);
@@ -370,12 +400,19 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                     self.write_offset = 0;
                 }
 
-                page.flush(&mut self.write_buf[self.write_offset..self.write_offset + flush_len]);
+                let prev_offset = *self.offset_table.get(&pid).unwrap_or(&0);
+                self.write_buf[self.write_offset..self.write_offset + 8]
+                    .copy_from_slice(&prev_offset.to_be_bytes());
+                self.write_buf[self.write_offset + 8..self.write_offset + 16]
+                    .copy_from_slice(&(flush_len as u64).to_be_bytes());
+                page.flush(
+                    &mut self.write_buf[self.write_offset + 16..self.write_offset + 16 + flush_len],
+                );
                 self.offset_table.insert(
                     pid,
                     ((self.write_block * self.block_size) + self.write_offset) as u64,
                 );
-                self.write_offset += flush_len;
+                self.write_offset += flush_len + 16;
                 page.clear();
                 self.page_dir.free_list.push(idx);
 
@@ -589,6 +626,7 @@ fn apply_write(page_dir: &mut PageDir, scratch: &mut WriteScratch, delta: Delta)
 pub fn parse_chunk(buf: &[u8], start: usize) -> (usize, &[u8]) {
     let next_off = u64::from_be_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
     let chunk_len = u64::from_be_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+    println!("in parse chunk: next off: {next_off}, chunk_len: {chunk_len}, start: {start}");
     (next_off, &buf[start + 16..start + 16 + chunk_len])
 }
 
