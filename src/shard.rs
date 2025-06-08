@@ -11,6 +11,7 @@
 use crate::{
     PageId,
     cache::Cache,
+    io,
     net_proto::{Req, parse_req},
     page::{Delta, PageBuffer, PageMut, SplitDelta},
 };
@@ -160,32 +161,41 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 }
                 Comp::FileRead { mut buf } => {
                     let pr = self.pending_read.as_mut().unwrap();
-                    let (next_off, chunk) = parse_chunk(&buf, pr.off);
+
                     let page = &mut self.page_dir.buf_pool[pr.idx];
                     let page_buf = page.raw_buffer_mut();
-                    page_buf[pr.len..pr.len + chunk.len()].copy_from_slice(chunk);
-                    pr.len += chunk.len();
-                    pr.off = next_off % self.block_size;
+
+                    match io::read_page_from_block(
+                        &buf,
+                        &mut page_buf[pr.len..],
+                        pr.off,
+                        (pr.off / self.block_size) * self.block_size,
+                    ) {
+                        Ok(written) => {
+                            // successfully read entire page
+                            pr.len += written;
+                            page_buf.copy_within(0..pr.len, page_buf.len() - pr.len);
+                            page.top = page_buf.len() - pr.len;
+                            page.flush = page.top;
+
+                            self.page_dir.cache.insert(pr.pid, pr.idx);
+                            self.pending_read = None;
+                        }
+                        Err((written, next_off)) => {
+                            // need to read more chunks in
+                            pr.len += written;
+                            pr.off = next_off;
+
+                            let next_block_start = (next_off / self.block_size) * self.block_size;
+                            self.io.register_sub(Sub::FileRead {
+                                buf: self.block_bufs.pop().unwrap(),
+                                offset: next_block_start as u64,
+                            });
+                        }
+                    }
 
                     buf.fill(0);
                     self.block_bufs.push(buf);
-
-                    if next_off == 0 {
-                        page_buf.copy_within(0..pr.len, page_buf.len() - pr.len);
-                        page.top = page_buf.len() - pr.len;
-                        self.page_dir.cache.insert(pr.pid, pr.idx);
-                        self.pending_read = None;
-                    } else {
-                        let next_block_start =
-                            ((next_off / self.block_size) * self.block_size) as u64;
-                        println!(
-                            "subbing read for {next_block_start}, got read, but need more for page"
-                        );
-                        self.io.register_sub(Sub::FileRead {
-                            buf: self.block_bufs.pop().unwrap(),
-                            offset: next_block_start,
-                        });
-                    }
                 }
                 Comp::FileWrite { mut buf } => {
                     buf.fill(0);
@@ -227,9 +237,12 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                             Some(pr) => {
                                 if pr.pid != pid {
                                     *self.read_prios.entry(pid).or_insert(0) += 1;
+                                } else {
                                 }
                             }
-                            None => *self.read_prios.entry(pid).or_insert(0) += 1,
+                            None => {
+                                *self.read_prios.entry(pid).or_insert(0) += 1;
+                            }
                         },
                     },
                     Req::Set(set_req) => {
@@ -238,9 +251,12 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                                 Some(pr) => {
                                     if pr.pid != pid {
                                         *self.read_prios.entry(pid).or_insert(0) += 1;
+                                    } else {
                                     }
                                 }
-                                None => *self.read_prios.entry(pid).or_insert(0) += 1,
+                                None => {
+                                    *self.read_prios.entry(pid).or_insert(0) += 1;
+                                }
                             }
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
@@ -310,73 +326,6 @@ impl<I: IO, M: Mesh> Shard<I, M> {
             conn_buf.drain(0..req_len);
         }
 
-        // tee up best page read if we can/need to
-        if self.pending_read.is_none() && !self.read_prios.is_empty() {
-            let best = *self
-                .read_prios
-                .iter()
-                .max_by(|(_, a), (_, b)| a.cmp(b))
-                .unwrap()
-                .0;
-            self.read_prios.remove(&best);
-
-            // PERF: power of 2 and bit ops
-            let offset = *self.offset_table.get(&best).unwrap() as usize;
-            let block = offset / self.block_size;
-            let block_off = offset % self.block_size;
-            let mut pr = PendingRead {
-                pid: best,
-                idx: self.page_dir.free_list.pop().unwrap(),
-                len: 0,
-                off: block_off,
-            };
-
-            println!("===STARTING PAGE READ===");
-            println!("  page: {best}");
-            println!("  offset: {offset}");
-            println!("  block: {block}");
-            println!("  block_off: {block_off}");
-
-            if block == self.write_block {
-                println!("  first page chunk in current write buf");
-                // most recent page chunk is in write buffer
-                let (next_off, chunk) = parse_chunk(&self.write_buf, block_off);
-                let page = &mut self.page_dir.buf_pool[pr.idx];
-                let buf = page.raw_buffer_mut();
-                buf[pr.len..pr.len + chunk.len()].copy_from_slice(chunk);
-                pr.len += chunk.len();
-                pr.off = next_off % self.block_size;
-
-                if next_off == 0 {
-                    // no more chunks
-                    buf.copy_within(0..pr.len, buf.len() - pr.len);
-                    page.top = buf.len() - pr.len;
-                    self.page_dir.cache.insert(pr.pid, pr.idx);
-                } else {
-                    // need to read more
-                    let next_block_start = ((next_off / self.block_size) * self.block_size) as u64;
-                    println!(
-                        "subbing read for {next_block_start}, getting next chunk for page in write buffer\nblock size: {}, next_off: {next_off}",
-                        self.block_size,
-                    );
-                    self.io.register_sub(Sub::FileRead {
-                        buf: self.block_bufs.pop().unwrap(),
-                        offset: next_block_start,
-                    });
-                    self.pending_read = Some(pr);
-                }
-            } else {
-                // need to read in the block
-                let block_start = (block * self.block_size) as u64;
-                println!("subbing read for {block_start}, page not in write buffer");
-                self.io.register_sub(Sub::FileRead {
-                    buf: self.block_bufs.pop().unwrap(),
-                    offset: block_start,
-                });
-                self.pending_read = Some(pr);
-            }
-        }
-
         // evict enough to have a nice full free list
         let mut evicts = Vec::new(); // PERF:
         {
@@ -421,6 +370,51 @@ impl<I: IO, M: Mesh> Shard<I, M> {
         }
         for pid in evicts.drain(..) {
             self.page_dir.cache.remove(pid);
+        }
+
+        // tee up best page read if we can/need to
+        if self.pending_read.is_none() && !self.read_prios.is_empty() {
+            let best = *self
+                .read_prios
+                .iter()
+                .max_by(|(_, a), (_, b)| a.cmp(b))
+                .unwrap()
+                .0;
+            self.read_prios.remove(&best);
+
+            let offset = *self.offset_table.get(&best).unwrap() as usize;
+            let block_start = (offset / self.block_size) * self.block_size;
+
+            let idx = self.page_dir.free_list.pop().unwrap();
+            let page = &mut self.page_dir.buf_pool[idx];
+            let page_buf = page.raw_buffer_mut();
+
+            match io::read_page_from_block(&self.write_buf, &mut page_buf[..], offset, block_start)
+            {
+                Ok(written) => {
+                    // successfully read entire page
+                    page_buf.copy_within(0..written, page_buf.len() - written);
+                    page.top = page_buf.len() - written;
+                    page.flush = page.top;
+                    self.page_dir.cache.insert(best, idx);
+                }
+                Err((written, next_off)) => {
+                    // need to read more chunks in
+                    let next_block_start = (next_off / self.block_size) * self.block_size;
+
+                    self.io.register_sub(Sub::FileRead {
+                        buf: self.block_bufs.pop().unwrap(),
+                        offset: next_block_start as u64,
+                    });
+
+                    self.pending_read = Some(PendingRead {
+                        pid: best,
+                        idx,
+                        len: written,
+                        off: next_off,
+                    });
+                }
+            }
         }
 
         // submit io
@@ -621,13 +615,6 @@ fn apply_write(page_dir: &mut PageDir, scratch: &mut WriteScratch, delta: Delta)
             new_page.pack(&mut page_dir.buf_pool[leaf_idx]);
         }
     }
-}
-
-pub fn parse_chunk(buf: &[u8], start: usize) -> (usize, &[u8]) {
-    let next_off = u64::from_be_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
-    let chunk_len = u64::from_be_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
-    println!("in parse chunk: next off: {next_off}, chunk_len: {chunk_len}, start: {start}");
-    (next_off, &buf[start + 16..start + 16 + chunk_len])
 }
 
 pub trait IO {
