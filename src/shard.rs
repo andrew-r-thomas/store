@@ -85,8 +85,8 @@ impl<I: IO, M: Mesh> Shard<I, M> {
         }
     }
 
+    // we're not resetting the offset table after compaction
     pub fn run_pipeline(&mut self) {
-        println!("===RUNNING PIPELINE===");
         // read inputs
         //
         // from other threads
@@ -237,7 +237,6 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                             Some(pr) => {
                                 if pr.pid != pid {
                                     *self.read_prios.entry(pid).or_insert(0) += 1;
-                                } else {
                                 }
                             }
                             None => {
@@ -251,7 +250,6 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                                 Some(pr) => {
                                     if pr.pid != pid {
                                         *self.read_prios.entry(pid).or_insert(0) += 1;
-                                    } else {
                                     }
                                 }
                                 None => {
@@ -274,6 +272,11 @@ impl<I: IO, M: Mesh> Shard<I, M> {
 
         // process reads
         let reads = std::mem::replace(&mut self.ops.reads, BTreeMap::new());
+        println!(
+            "processing {} reads, with {} waiting",
+            reads.len(),
+            self.read_prios.len()
+        );
         for (_, group) in reads {
             let mut page = self.page_dir.buf_pool[group.page_idx].read();
 
@@ -310,6 +313,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
         }
 
         // process writes
+        println!("processing {} writes", self.ops.writes.len());
         for (conn_id, req_len) in self.ops.writes.drain(..) {
             let conn_buf = &mut self.conns.get_mut(&conn_id).unwrap().buf;
             let delta = Delta::from_top(conn_buf);
@@ -332,6 +336,9 @@ impl<I: IO, M: Mesh> Shard<I, M> {
             let mut evict_cands = self.page_dir.cache.evict_cands();
             while self.page_dir.free_list.len() < self.free_cap_target {
                 let (pid, idx) = evict_cands.next().unwrap();
+                if self.read_prios.contains_key(&pid) {
+                    continue;
+                }
                 // for now we'll just evict the best candidates, but we may have some constraints
                 // later from things like txns that prevent us from evicting certain pages
                 let page = &mut self.page_dir.buf_pool[idx];
@@ -349,7 +356,15 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                     self.write_offset = 0;
                 }
 
-                let prev_offset = *self.offset_table.get(&pid).unwrap_or(&0);
+                let prev_offset = {
+                    if page.flush == page.cap {
+                        // includes base page
+                        0
+                    } else {
+                        // just deltas
+                        *self.offset_table.get(&pid).unwrap_or(&0)
+                    }
+                };
                 self.write_buf[self.write_offset..self.write_offset + 8]
                     .copy_from_slice(&prev_offset.to_be_bytes());
                 self.write_buf[self.write_offset + 8..self.write_offset + 16]
@@ -383,14 +398,17 @@ impl<I: IO, M: Mesh> Shard<I, M> {
             self.read_prios.remove(&best);
 
             let offset = *self.offset_table.get(&best).unwrap() as usize;
-            let block_start = (offset / self.block_size) * self.block_size;
 
             let idx = self.page_dir.free_list.pop().unwrap();
             let page = &mut self.page_dir.buf_pool[idx];
             let page_buf = page.raw_buffer_mut();
 
-            match io::read_page_from_block(&self.write_buf, &mut page_buf[..], offset, block_start)
-            {
+            match io::read_page_from_block(
+                &self.write_buf,
+                &mut page_buf[..],
+                offset,
+                self.write_block * self.block_size,
+            ) {
                 Ok(written) => {
                     // successfully read entire page
                     page_buf.copy_within(0..written, page_buf.len() - written);

@@ -27,7 +27,7 @@ fn scratch() {
     const NUM_BATCHES: usize = 2048;
 
     const PAGE_SIZE: usize = 16 * 1024;
-    const BUF_POOL_SIZE: usize = 4096;
+    const BUF_POOL_SIZE: usize = 4096 * 32;
     const FREE_CAP_TARGET: usize = BUF_POOL_SIZE / 5;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
@@ -124,6 +124,7 @@ pub fn run_sim(
                     val_len_range.clone(),
                 );
                 if conn.is_done(num_ingest, num_ops) {
+                    println!("conn {id} done!");
                     shard.io.conns.remove(&id).unwrap();
                 }
             }
@@ -240,7 +241,6 @@ impl TestConn {
                 _ => panic!(),
             }
         }
-
         // try to clear expecteds
         while let Some(e) = self.expected.pop_front() {
             if self.from_shard.len() >= e.len() {
@@ -256,7 +256,7 @@ impl TestConn {
         self.ticks += 1;
     }
     fn is_done(&self, num_ingest: usize, num_ops: usize) -> bool {
-        self.ticks >= num_ingest + num_ops && self.expected.is_empty()
+        (self.ticks >= num_ingest + num_ops) && self.expected.is_empty()
     }
 }
 
@@ -273,16 +273,11 @@ impl TestIO {
         for sub in self.subs.drain(..) {
             match sub {
                 Sub::FileRead { mut buf, offset } => {
-                    println!(
-                        "doing file read at offset {offset} with file len {}",
-                        self.file.metadata().unwrap().len()
-                    );
                     self.file.seek(SeekFrom::Start(offset)).unwrap();
                     self.file.read_exact(&mut buf).unwrap();
                     self.comps.push(Comp::FileRead { buf });
                 }
                 Sub::FileWrite { buf, offset } => {
-                    println!("doing file write");
                     self.file.seek(SeekFrom::Start(offset)).unwrap();
                     self.file.write_all(&buf).unwrap();
                     self.comps.push(Comp::FileWrite { buf });
