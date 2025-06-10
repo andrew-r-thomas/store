@@ -1,13 +1,3 @@
-//! # SHARD PIPELINE
-//!
-//! ## PHASE 0: SETUP
-//!
-//! ## PHASE 1: INPUT COLLECTION
-//!
-//! ## PHASE 2: OP PROCESSING
-//!
-//! ## PHASE 3: OUTPUT SHIPPING
-
 use crate::{
     PageId,
     cache::Cache,
@@ -19,7 +9,7 @@ use crate::{
 use std::collections::BTreeMap;
 
 // NOTE: for now using BTreeMap bc the iteration order is deterministic, need a better solution
-// though
+// eventually though
 pub struct Shard<I: IO, M: Mesh> {
     pub page_dir: PageDir,
 
@@ -35,11 +25,12 @@ pub struct Shard<I: IO, M: Mesh> {
     pub write_offset: usize,
     pub block_bufs: Vec<Vec<u8>>,
     pub write_buf: Vec<u8>,
-    pub read_prios: BTreeMap<PageId, u32>,
+    pub read_prios: BTreeMap<PageId, (u32, u32)>,
     pub offset_table: BTreeMap<PageId, u64>,
     pub io: I,
 
     pub mesh: M,
+    pub runs: usize,
 }
 impl<I: IO, M: Mesh> Shard<I, M> {
     pub fn new(
@@ -82,6 +73,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
             io,
 
             mesh,
+            runs: 0,
         }
     }
 
@@ -175,6 +167,23 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                             // successfully read entire page
                             pr.len += written;
                             page_buf.copy_within(0..pr.len, page_buf.len() - pr.len);
+
+                            // ===checking base len valid===
+                            let complete_page = &page_buf[page_buf.len() - pr.len..];
+                            let base_len = u64::from_be_bytes(
+                                complete_page[complete_page.len() - 8..].try_into().unwrap(),
+                            ) as usize;
+
+                            if 8 + base_len > complete_page.len() {
+                                panic!(
+                                    "Corrupted page data read from disk for page {}: base_len {} + 8 > page_len {}",
+                                    pr.pid,
+                                    base_len,
+                                    complete_page.len()
+                                );
+                            }
+                            // ===
+
                             page.top = page_buf.len() - pr.len;
                             page.flush = page.top;
 
@@ -185,7 +194,6 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                             // need to read more chunks in
                             pr.len += written;
                             pr.off = next_off;
-
                             let next_block_start = (next_off / self.block_size) * self.block_size;
                             self.io.register_sub(Sub::FileRead {
                                 buf: self.block_bufs.pop().unwrap(),
@@ -236,12 +244,20 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                         Err(pid) => match &self.pending_read {
                             Some(pr) => {
                                 if pr.pid != pid {
-                                    *self.read_prios.entry(pid).or_insert(0) += 1;
+                                    match self.read_prios.get_mut(&pid) {
+                                        Some((count, _)) => *count += 1,
+                                        None => {
+                                            self.read_prios.insert(pid, (1, *conn_id));
+                                        }
+                                    }
                                 }
                             }
-                            None => {
-                                *self.read_prios.entry(pid).or_insert(0) += 1;
-                            }
+                            None => match self.read_prios.get_mut(&pid) {
+                                Some((count, _)) => *count += 1,
+                                None => {
+                                    self.read_prios.insert(pid, (1, *conn_id));
+                                }
+                            },
                         },
                     },
                     Req::Set(set_req) => {
@@ -249,12 +265,20 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                             match &self.pending_read {
                                 Some(pr) => {
                                     if pr.pid != pid {
-                                        *self.read_prios.entry(pid).or_insert(0) += 1;
+                                        match self.read_prios.get_mut(&pid) {
+                                            Some((count, _)) => *count += 1,
+                                            None => {
+                                                self.read_prios.insert(pid, (1, *conn_id));
+                                            }
+                                        }
                                     }
                                 }
-                                None => {
-                                    *self.read_prios.entry(pid).or_insert(0) += 1;
-                                }
+                                None => match self.read_prios.get_mut(&pid) {
+                                    Some((count, _)) => *count += 1,
+                                    None => {
+                                        self.read_prios.insert(pid, (1, *conn_id));
+                                    }
+                                },
                             }
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
@@ -272,11 +296,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
 
         // process reads
         let reads = std::mem::replace(&mut self.ops.reads, BTreeMap::new());
-        println!(
-            "processing {} reads, with {} waiting",
-            reads.len(),
-            self.read_prios.len()
-        );
+        let read_len = reads.len();
         for (_, group) in reads {
             let mut page = self.page_dir.buf_pool[group.page_idx].read();
 
@@ -313,7 +333,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
         }
 
         // process writes
-        println!("processing {} writes", self.ops.writes.len());
+        let write_len = self.ops.writes.len();
         for (conn_id, req_len) in self.ops.writes.drain(..) {
             let conn_buf = &mut self.conns.get_mut(&conn_id).unwrap().buf;
             let delta = Delta::from_top(conn_buf);
@@ -359,10 +379,10 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 let prev_offset = {
                     if page.flush == page.cap {
                         // includes base page
-                        0
+                        u64::MAX
                     } else {
                         // just deltas
-                        *self.offset_table.get(&pid).unwrap_or(&0)
+                        *self.offset_table.get(&pid).unwrap()
                     }
                 };
                 self.write_buf[self.write_offset..self.write_offset + 8]
@@ -380,6 +400,19 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 page.clear();
                 self.page_dir.free_list.push(idx);
 
+                // // In eviction logic, right after flushing page 13113:
+                // if pid == 13113 {
+                //     let flushed_data =
+                //         &self.write_buf[self.write_offset + 16..self.write_offset + 16 + flush_len];
+                //     let base_len = u64::from_be_bytes(
+                //         flushed_data[flushed_data.len() - 8..].try_into().unwrap(),
+                //     ) as usize;
+                //     println!(
+                //         "DEBUG: Writing page 13113 - flush_len={}, base_len_in_data={}",
+                //         flush_len, base_len
+                //     );
+                // }
+
                 evicts.push(pid);
             }
         }
@@ -395,10 +428,14 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 .max_by(|(_, a), (_, b)| a.cmp(b))
                 .unwrap()
                 .0;
-            self.read_prios.remove(&best);
+            self.read_prios.remove(&best).unwrap();
 
             let offset = *self.offset_table.get(&best).unwrap() as usize;
 
+            // // When starting to read page 13113:
+            // if best == 13113 {
+            //     println!("DEBUG: Starting to read page 13113 from offset {}", offset);
+            // }
             let idx = self.page_dir.free_list.pop().unwrap();
             let page = &mut self.page_dir.buf_pool[idx];
             let page_buf = page.raw_buffer_mut();
@@ -412,6 +449,7 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                 Ok(written) => {
                     // successfully read entire page
                     page_buf.copy_within(0..written, page_buf.len() - written);
+
                     page.top = page_buf.len() - written;
                     page.flush = page.top;
                     self.page_dir.cache.insert(best, idx);
@@ -424,7 +462,6 @@ impl<I: IO, M: Mesh> Shard<I, M> {
                         buf: self.block_bufs.pop().unwrap(),
                         offset: next_block_start as u64,
                     });
-
                     self.pending_read = Some(PendingRead {
                         pid: best,
                         idx,
@@ -437,6 +474,15 @@ impl<I: IO, M: Mesh> Shard<I, M> {
 
         // submit io
         self.io.submit();
+
+        self.runs += 1;
+        println!(
+            "RAN PIPELINE {} with {} reads, {} writes, and {} pages in prio queue",
+            self.runs,
+            read_len,
+            write_len,
+            self.read_prios.len()
+        );
     }
 }
 

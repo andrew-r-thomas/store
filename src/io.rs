@@ -7,7 +7,7 @@ pub fn read_page_from_block(
     let mut total = 0;
     while offset < block_start + block.len() && offset >= block_start {
         let mut cursor = offset - block_start;
-        let next_off = u64::from_be_bytes(block[cursor..cursor + 8].try_into().unwrap()) as usize;
+        let next_off = u64::from_be_bytes(block[cursor..cursor + 8].try_into().unwrap());
         cursor += 8;
         let chunk_len = u64::from_be_bytes(block[cursor..cursor + 8].try_into().unwrap()) as usize;
         cursor += 8;
@@ -17,8 +17,8 @@ pub fn read_page_from_block(
         total += chunk.len();
 
         match next_off {
-            0 => return Ok(total),
-            n => offset = n,
+            u64::MAX => return Ok(total),
+            n => offset = n as usize,
         }
     }
 

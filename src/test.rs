@@ -3,9 +3,9 @@
 use crate::shard::{Comp, IO, Mesh, Msg, Shard, Sub};
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     ops::Range,
     path::Path,
 };
@@ -27,7 +27,7 @@ fn scratch() {
     const NUM_BATCHES: usize = 2048;
 
     const PAGE_SIZE: usize = 16 * 1024;
-    const BUF_POOL_SIZE: usize = 4096 * 32;
+    const BUF_POOL_SIZE: usize = 4 * 4096;
     const FREE_CAP_TARGET: usize = BUF_POOL_SIZE / 5;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
@@ -36,7 +36,6 @@ fn scratch() {
     const NUM_NET_BUFS: usize = 1024;
 
     run_sim(
-        Path::new("test.store"),
         SEED,
         KEY_LEN_RANGE,
         VAL_LEN_RANGE,
@@ -51,12 +50,9 @@ fn scratch() {
         NET_BUF_SIZE,
         FREE_CAP_TARGET,
     );
-
-    fs::remove_file("test.store").unwrap();
 }
 
 pub fn run_sim(
-    file_path: &Path,
     seed: u64,
     key_len_range: Range<usize>,
     val_len_range: Range<usize>,
@@ -76,12 +72,7 @@ pub fn run_sim(
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
     let io = TestIO {
-        file: OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(file_path)
-            .unwrap(),
+        file: Cursor::new(Vec::new()),
         comps: Vec::new(),
         pending_subs: Vec::new(),
         subs: Vec::new(),
@@ -129,6 +120,19 @@ pub fn run_sim(
                 }
             }
         }
+        // if shard.read_prios.len() > num_clients {
+        //     println!(
+        //         "read prios has {} entries, but max should be {}",
+        //         shard.read_prios.len(),
+        //         num_clients
+        //     );
+        //     let mut conn_page_counts = BTreeMap::new();
+        //     for (_, (_, conn_id)) in &shard.read_prios {
+        //         *conn_page_counts.entry(*conn_id).or_insert(0) += 1;
+        //     }
+        //     println!("Pages per connection: {:?}", conn_page_counts);
+        //     panic!();
+        // }
     }
 }
 
@@ -261,7 +265,7 @@ impl TestConn {
 }
 
 struct TestIO {
-    file: File,
+    file: Cursor<Vec<u8>>,
     conns: HashMap<u32, TestConn>,
 
     subs: Vec<Sub>,
