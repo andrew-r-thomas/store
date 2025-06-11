@@ -1,6 +1,4 @@
-pub mod cache;
 pub mod io;
-pub mod net_proto;
 pub mod page;
 pub mod shard;
 

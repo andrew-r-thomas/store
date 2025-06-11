@@ -1,10 +1,3 @@
-use std::{
-    alloc::{self, Layout},
-    collections::BTreeMap,
-    ops::Range,
-    slice,
-};
-
 use crate::PageId;
 
 pub struct PageBuffer {
@@ -15,10 +8,10 @@ pub struct PageBuffer {
 }
 impl PageBuffer {
     pub fn new(cap: usize) -> Self {
-        let layout = Layout::array::<u8>(cap).unwrap();
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        let layout = std::alloc::Layout::array::<u8>(cap).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
-            alloc::handle_alloc_error(layout)
+            std::alloc::handle_alloc_error(layout)
         }
         Self {
             ptr,
@@ -29,7 +22,9 @@ impl PageBuffer {
     }
 
     pub fn read(&self) -> Page {
-        Page::from(unsafe { slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top) })
+        Page::from(unsafe {
+            std::slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top)
+        })
     }
     pub fn write_delta(&mut self, delta: &Delta) -> bool {
         let len = delta.len();
@@ -38,7 +33,9 @@ impl PageBuffer {
             return false;
         }
 
-        delta.write_to_buf(unsafe { slice::from_raw_parts_mut(self.ptr.add(self.top - len), len) });
+        delta.write_to_buf(unsafe {
+            std::slice::from_raw_parts_mut(self.ptr.add(self.top - len), len)
+        });
         self.top -= len;
 
         true
@@ -46,11 +43,11 @@ impl PageBuffer {
 
     #[inline]
     pub fn raw_buffer_mut(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.ptr, self.cap) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
     }
     #[inline]
     pub fn raw_buffer(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr, self.cap) }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.cap) }
     }
     pub fn clear(&mut self) {
         self.raw_buffer_mut().fill(0);
@@ -69,7 +66,7 @@ impl PageBuffer {
 }
 impl Drop for PageBuffer {
     fn drop(&mut self) {
-        unsafe { alloc::dealloc(self.ptr, Layout::array::<u8>(self.cap).unwrap()) }
+        unsafe { std::alloc::dealloc(self.ptr, std::alloc::Layout::array::<u8>(self.cap).unwrap()) }
     }
 }
 
@@ -402,9 +399,9 @@ pub struct BasePage<'b> {
     pub entries: &'b [u8],
 }
 impl BasePage<'_> {
-    pub const NUM_ENTRIES_RANGE: Range<usize> = 0..2;
-    pub const LEFT_PID_RANGE: Range<usize> = 2..10;
-    pub const RIGHT_PID_RANGE: Range<usize> = 10..18;
+    pub const NUM_ENTRIES_RANGE: std::ops::Range<usize> = 0..2;
+    pub const LEFT_PID_RANGE: std::ops::Range<usize> = 2..10;
+    pub const RIGHT_PID_RANGE: std::ops::Range<usize> = 10..18;
     pub const ENTRIES_START: usize = 18;
 
     pub fn search_inner(&self, target: &[u8]) -> Option<(&[u8], PageId)> {
@@ -494,7 +491,7 @@ impl<'b> From<&'b [u8]> for BasePage<'b> {
 // make this better once i get a better sense of how it'll be used, and it definietly doesn't need
 // to be treated as a "page"
 pub struct PageMut {
-    pub entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     pub left_pid: PageId,
     pub right_pid: PageId,
     pub total_size: usize,
@@ -503,7 +500,7 @@ pub struct PageMut {
 impl PageMut {
     pub fn new(page_size: usize) -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: std::collections::BTreeMap::new(),
             left_pid: 0,
             right_pid: 0,
             total_size: BasePage::ENTRIES_START + BASE_LEN_SIZE,
