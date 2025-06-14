@@ -189,6 +189,9 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
             if let OpState::Pending = conn.op {
                 let req = io::parse_req(&conn.buf).unwrap();
                 let req_len = req.len();
+                // TODO: net io stuff here needs major refactor, lots of duplicate work, and we
+                // should really be tying the network stuff to the deltas, since they are they same
+                // for all writes
                 match req {
                     io::Req::Get(get_req) => {
                         match find_leaf(get_req.key, &mut self.page_dir, &mut self.buf_pool) {
@@ -259,6 +262,60 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                     io::Req::Set(set_req) => {
                         if let Err(pid) =
                             find_leaf(set_req.key, &mut self.page_dir, &mut self.buf_pool)
+                        {
+                            match self.pend_blocks.page_prios.get_mut(&pid) {
+                                Some(prio) => *prio += 1,
+                                None => {
+                                    self.pend_blocks.page_prios.insert(pid, 1);
+                                    let offsets = self.pend_blocks.offset_table.get(&pid).unwrap();
+                                    let block_id = (offsets.last().unwrap()
+                                        / self.block_size as u64
+                                        * self.block_size as u64)
+                                        as io::BlockId;
+                                    match self.pend_blocks.blocks.get_mut(&block_id) {
+                                        Some(pend_block) => {
+                                            pend_block.pending_pages.insert(
+                                                pid,
+                                                io::PendingPage {
+                                                    offsets: offsets.clone(),
+                                                    idx: self.free_list.pop().unwrap(),
+                                                    len: 0,
+                                                },
+                                            );
+                                        }
+                                        None => {
+                                            self.pend_blocks.blocks.insert(
+                                                block_id,
+                                                io::PendBlock {
+                                                    pending_pages: std::collections::BTreeMap::from(
+                                                        [(
+                                                            pid,
+                                                            io::PendingPage {
+                                                                offsets: offsets.clone(),
+                                                                idx: self.free_list.pop().unwrap(),
+                                                                len: 0,
+                                                            },
+                                                        )],
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            self.ops.writes.push((*conn_id, req_len));
+
+                            conn.op = OpState::Reading;
+                            self.io.register_sub(io::Sub::TcpRead {
+                                conn_id: *conn_id,
+                                buf: self.net_bufs.pop().unwrap(),
+                            });
+                        }
+                    }
+                    io::Req::Del(del_req) => {
+                        if let Err(pid) =
+                            find_leaf(del_req.key, &mut self.page_dir, &mut self.buf_pool)
                         {
                             match self.pend_blocks.page_prios.get_mut(&pid) {
                                 Some(prio) => *prio += 1,
@@ -400,9 +457,6 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                 }
 
                 let offset = ((self.write_block * self.block_size) + self.write_offset) as u64;
-                if pid == 7135 {
-                    println!("writing {pid}, flush len: {flush_len}, offset: {offset}");
-                }
                 match self.pend_blocks.offset_table.get_mut(&pid) {
                     Some(offsets) => {
                         if page.flush == page.cap {
@@ -465,10 +519,10 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
         self.io.submit();
 
         self.runs += 1;
-        // println!(
-        //     "completed pipeline {}, {read_len} reads, {writes} writes",
-        //     self.runs,
-        // );
+        println!(
+            "completed pipeline {}, {read_len} reads, {writes} writes",
+            self.runs,
+        );
     }
 }
 

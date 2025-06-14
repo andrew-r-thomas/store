@@ -39,6 +39,7 @@ pub enum Comp {
 pub enum Req<'r> {
     Get(GetReq<'r>),
     Set(SetReq<'r>),
+    Del(DelReq<'r>),
 }
 pub struct GetReq<'r> {
     pub key: &'r [u8],
@@ -47,17 +48,22 @@ pub struct SetReq<'r> {
     pub key: &'r [u8],
     pub val: &'r [u8],
 }
+pub struct DelReq<'r> {
+    pub key: &'r [u8],
+}
 impl Req<'_> {
     pub fn len(&self) -> usize {
         match self {
             Self::Get(get_req) => 1 + 4 + get_req.key.len(),
             Self::Set(set_req) => 1 + 4 + 4 + set_req.key.len() + set_req.val.len(),
+            Self::Del(del_req) => 1 + 4 + del_req.key.len(),
         }
     }
 }
 
 const GET_CODE: u8 = 1;
 const SET_CODE: u8 = 2;
+const DEL_CODE: u8 = 3;
 
 pub fn parse_req(req: &[u8]) -> Result<Req, ()> {
     match req.first() {
@@ -85,6 +91,17 @@ pub fn parse_req(req: &[u8]) -> Result<Req, ()> {
                 let key = &req[9..9 + key_len];
                 let val = &req[9 + key_len..9 + key_len + val_len];
                 Ok(Req::Set(SetReq { key, val }))
+            }
+            DEL_CODE => {
+                if req.len() < 5 {
+                    return Err(());
+                }
+                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
+                if req.len() < 5 + key_len {
+                    return Err(());
+                }
+                let key = &req[5..5 + key_len];
+                Ok(Req::Del(DelReq { key }))
             }
             n => panic!("{n} is not an op code"),
         },
@@ -144,9 +161,6 @@ pub fn read_block(
         let page = &mut buf_pool[pend_page.idx];
         let buf = page.raw_buffer_mut();
 
-        if pid == 7135 {
-            println!("reading {pid} from {block_id}");
-        }
         loop {
             let offset = pend_page.offsets.pop().unwrap();
             let mut cursor = (offset - block_id) as usize;
@@ -155,12 +169,6 @@ pub fn read_block(
                     as usize;
             cursor += CHUNK_LEN_SIZE;
             let chunk = &block[cursor..cursor + chunk_len];
-            if pid == 7135 {
-                println!(
-                    "  offset: {offset}, chunk len: {chunk_len}, pend page len: {}",
-                    pend_page.len
-                );
-            }
 
             buf[pend_page.len..pend_page.len + chunk.len()].copy_from_slice(chunk);
             pend_page.len += chunk.len();
@@ -173,9 +181,6 @@ pub fn read_block(
                     } else {
                         // next page chunk in another block, clean up the tracking
                         let b_idx = (o / block.len() as u64) * block.len() as u64;
-                        if pid == 7135 {
-                            println!("  next chunk in {b_idx}");
-                        }
                         match block_dir.blocks.get_mut(&b_idx) {
                             Some(pend_block) => {
                                 pend_block.pending_pages.insert(pid, pend_page);
@@ -195,9 +200,6 @@ pub fn read_block(
                     }
                 }
                 None => {
-                    if pid == 7135 {
-                        println!("  finished reading {pid}");
-                    }
                     // finished reading page
                     buf.copy_within(0..pend_page.len, buf.len() - pend_page.len);
                     page.top = buf.len() - pend_page.len;

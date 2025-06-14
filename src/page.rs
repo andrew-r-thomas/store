@@ -130,6 +130,11 @@ impl Page<'_> {
                         return Some(set_delta.val);
                     }
                 }
+                Delta::Del(del_delta) => {
+                    if del_delta.key == target {
+                        return None;
+                    }
+                }
                 _ => panic!(),
             }
         }
@@ -203,6 +208,7 @@ impl<'i> DoubleEndedIterator for DeltaIter<'i> {
 pub enum Delta<'d> {
     Set(SetDelta<'d>),
     Split(SplitDelta<'d>),
+    Del(DelDelta<'d>),
 }
 #[derive(Copy, Clone)]
 pub struct SetDelta<'d> {
@@ -214,8 +220,14 @@ pub struct SplitDelta<'d> {
     pub middle_key: &'d [u8],
     pub left_pid: PageId,
 }
+#[derive(Copy, Clone)]
+pub struct DelDelta<'d> {
+    pub key: &'d [u8],
+}
+
 impl<'d> Delta<'d> {
     const SET_CODE: u8 = 2;
+    const DEL_CODE: u8 = 3;
     const SPLIT_CODE: u8 = 10;
 
     pub fn from_top(buf: &'d [u8]) -> Self {
@@ -258,6 +270,17 @@ impl<'d> Delta<'d> {
                     middle_key,
                     left_pid,
                 })
+            }
+            Self::DEL_CODE => {
+                let key_len_start = CODE_SIZE;
+                let key_len_end = key_len_start + LEN_SIZE;
+                let key_len =
+                    u32::from_be_bytes(buf[key_len_start..key_len_end].try_into().unwrap())
+                        as usize;
+
+                let key = &buf[key_len_end..key_len_end + key_len];
+
+                Self::Del(DelDelta { key })
             }
             n => panic!("{n}"),
         }
@@ -303,6 +326,15 @@ impl<'d> Delta<'d> {
                     left_pid,
                 })
             }
+            Self::DEL_CODE => {
+                let key_len_end = buf.len() - CODE_SIZE;
+                let key_len_start = key_len_end - LEN_SIZE;
+                let key_len =
+                    u32::from_be_bytes(buf[key_len_start..key_len_end].try_into().unwrap())
+                        as usize;
+                let key = &buf[key_len_start - key_len..key_len_start];
+                Self::Del(DelDelta { key })
+            }
             _ => panic!(),
         }
     }
@@ -325,6 +357,9 @@ impl<'d> Delta<'d> {
                     + LEN_SIZE
                     + CODE_SIZE
             }
+            Self::Del(del_delta) => {
+                CODE_SIZE + LEN_SIZE + del_delta.key.len() + LEN_SIZE + CODE_SIZE
+            }
         }
     }
 
@@ -332,6 +367,7 @@ impl<'d> Delta<'d> {
         match self {
             Self::Set(s) => s.key,
             Self::Split(s) => s.middle_key,
+            Self::Del(s) => s.key,
         }
     }
 
@@ -387,6 +423,23 @@ impl<'d> Delta<'d> {
                 cursor += LEN_SIZE;
 
                 buf[cursor] = Self::SPLIT_CODE;
+            }
+            Self::Del(del_delta) => {
+                let key_len = &(del_delta.key.len() as u32).to_be_bytes();
+
+                buf[cursor] = Self::DEL_CODE;
+                cursor += CODE_SIZE;
+
+                buf[cursor..cursor + LEN_SIZE].copy_from_slice(key_len);
+                cursor += LEN_SIZE;
+
+                buf[cursor..cursor + del_delta.key.len()].copy_from_slice(del_delta.key);
+                cursor += del_delta.key.len();
+
+                buf[cursor..cursor + LEN_SIZE].copy_from_slice(key_len);
+                cursor += LEN_SIZE;
+
+                buf[cursor] = Self::DEL_CODE;
             }
         }
     }
@@ -577,6 +630,11 @@ impl PageMut {
                     Vec::from(&split_delta.left_pid.to_be_bytes()),
                 );
                 self.total_size += LEN_SIZE + split_delta.middle_key.len() + PID_SIZE;
+            }
+            Delta::Del(del_delta) => {
+                assert_ne!(self.left_pid, u64::MAX);
+                let old = self.entries.remove(del_delta.key).unwrap();
+                self.total_size -= (LEN_SIZE * 2) + del_delta.key.len() + old.len();
             }
         }
 

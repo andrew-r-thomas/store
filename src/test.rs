@@ -9,18 +9,21 @@ use rand::{
     seq::{IndexedMutRandom, IndexedRandom},
 };
 
+// TODO: errors (read after delete, etc) should be checked for correct values (i.e. read after
+// delete should return None)
+
 #[test]
 fn scratch() {
     const SEED: u64 = 420 ^ 69;
     const KEY_LEN_RANGE: std::ops::Range<usize> = 128..256;
     const VAL_LEN_RANGE: std::ops::Range<usize> = 512..1024;
 
-    const NUM_CLIENTS: usize = 128;
+    const NUM_CLIENTS: usize = 256;
     const NUM_INGEST: usize = 1024;
-    const NUM_BATCHES: usize = 2048;
+    const NUM_BATCHES: usize = 3072;
 
     const PAGE_SIZE: usize = 16 * 1024;
-    const BUF_POOL_SIZE: usize = 4 * 4096;
+    const BUF_POOL_SIZE: usize = 8 * 4096;
     const FREE_CAP_TARGET: usize = BUF_POOL_SIZE / 5;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
@@ -164,7 +167,7 @@ impl TestConn {
             self.expected.push_back(vec![0]);
         } else if self.ticks < num_ingest + num_ops {
             // do an op
-            let ops = ["insert", "update", "get"];
+            let ops = ["insert", "update", "get", "del"];
             let chosen_op = ops.choose(rng).unwrap();
             match *chosen_op {
                 "insert" => {
@@ -221,6 +224,18 @@ impl TestConn {
                     e.extend(&(val.len() as u32).to_be_bytes());
                     e.extend(&val[..]);
                     self.expected.push_back(e);
+                }
+                "del" => {
+                    let idx = rng.random_range(0..self.entries.len());
+                    let (key, _) = self.entries.remove(idx);
+
+                    self.to_shard.write_all(&[3]).unwrap();
+                    self.to_shard
+                        .write_all(&(key.len() as u32).to_be_bytes())
+                        .unwrap();
+                    self.to_shard.write_all(&key[..]).unwrap();
+
+                    self.expected.push_back(vec![0]);
                 }
                 _ => panic!(),
             }
