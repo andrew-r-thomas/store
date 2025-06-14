@@ -92,11 +92,12 @@ pub fn parse_req(req: &[u8]) -> Result<Req, ()> {
     }
 }
 
-pub struct PendBlocks {
+pub struct BlockDir {
     pub blocks: std::collections::BTreeMap<BlockId, PendBlock>,
     pub page_prios: std::collections::BTreeMap<PageId, u32>,
+    pub offset_table: std::collections::BTreeMap<PageId, Vec<u64>>,
 }
-impl PendBlocks {
+impl BlockDir {
     pub fn pop_best(&mut self) -> (BlockId, PendBlock) {
         let best = *self
             .blocks
@@ -124,71 +125,87 @@ pub struct PendBlock {
     pub pending_pages: std::collections::BTreeMap<PageId, PendingPage>,
 }
 pub struct PendingPage {
-    pub offset: usize,
+    pub offsets: Vec<u64>,
     pub len: usize,
     pub idx: usize,
 }
 
-pub const PREV_OFF_SIZE: usize = 8;
 pub const CHUNK_LEN_SIZE: usize = 8;
 
-/// TODO(alloc) does scratch allocation
 pub fn read_block(
     block: &[u8],
     block_id: BlockId,
     pend: PendBlock,
-    pends: &mut PendBlocks,
+    block_dir: &mut BlockDir,
     buf_pool: &mut Vec<page::PageBuffer>,
     page_dir: &mut shard::PageDir,
 ) {
-    let block_off = block_id as usize;
     for (pid, mut pend_page) in pend.pending_pages {
         let page = &mut buf_pool[pend_page.idx];
         let buf = page.raw_buffer_mut();
 
-        while pend_page.offset < block_off + block.len() && pend_page.offset >= block_off {
-            let mut cursor = pend_page.offset - block_off;
-
-            let prev_off =
-                u64::from_be_bytes(block[cursor..cursor + PREV_OFF_SIZE].try_into().unwrap())
-                    as usize;
-            cursor += PREV_OFF_SIZE;
+        if pid == 7135 {
+            println!("reading {pid} from {block_id}");
+        }
+        loop {
+            let offset = pend_page.offsets.pop().unwrap();
+            let mut cursor = (offset - block_id) as usize;
             let chunk_len =
                 u64::from_be_bytes(block[cursor..cursor + CHUNK_LEN_SIZE].try_into().unwrap())
                     as usize;
             cursor += CHUNK_LEN_SIZE;
             let chunk = &block[cursor..cursor + chunk_len];
+            if pid == 7135 {
+                println!(
+                    "  offset: {offset}, chunk len: {chunk_len}, pend page len: {}",
+                    pend_page.len
+                );
+            }
 
             buf[pend_page.len..pend_page.len + chunk.len()].copy_from_slice(chunk);
             pend_page.len += chunk.len();
 
-            pend_page.offset = prev_off;
-        }
-
-        match pend_page.offset as u64 {
-            u64::MAX => {
-                // page is done being read
-                buf.copy_within(0..pend_page.len, buf.len() - pend_page.len);
-                page.top = buf.len() - pend_page.len;
-                page.flush = page.top;
-
-                page_dir.insert(pid, pend_page.idx);
-                pends.page_prios.remove(&pid).unwrap();
-            }
-            n => {
-                let b_idx = (n / block.len() as u64) * block.len() as u64;
-                match pends.blocks.get_mut(&b_idx) {
-                    Some(pend_block) => {
-                        pend_block.pending_pages.insert(pid, pend_page);
+            match pend_page.offsets.last() {
+                Some(o) => {
+                    if *o >= block_id && *o < block_id + block.len() as u64 {
+                        // next page chunk still in this block
+                        continue;
+                    } else {
+                        // next page chunk in another block, clean up the tracking
+                        let b_idx = (o / block.len() as u64) * block.len() as u64;
+                        if pid == 7135 {
+                            println!("  next chunk in {b_idx}");
+                        }
+                        match block_dir.blocks.get_mut(&b_idx) {
+                            Some(pend_block) => {
+                                pend_block.pending_pages.insert(pid, pend_page);
+                            }
+                            None => {
+                                block_dir.blocks.insert(
+                                    b_idx,
+                                    PendBlock {
+                                        pending_pages: std::collections::BTreeMap::from([(
+                                            pid, pend_page,
+                                        )]),
+                                    },
+                                );
+                            }
+                        }
+                        break;
                     }
-                    None => {
-                        pends.blocks.insert(
-                            b_idx,
-                            PendBlock {
-                                pending_pages: std::collections::BTreeMap::from([(pid, pend_page)]),
-                            },
-                        );
+                }
+                None => {
+                    if pid == 7135 {
+                        println!("  finished reading {pid}");
                     }
+                    // finished reading page
+                    buf.copy_within(0..pend_page.len, buf.len() - pend_page.len);
+                    page.top = buf.len() - pend_page.len;
+                    page.flush = page.top;
+
+                    page_dir.insert(pid, pend_page.idx);
+                    block_dir.page_prios.remove(&pid).unwrap();
+                    break;
                 }
             }
         }

@@ -14,8 +14,7 @@ pub struct Shard<I: io::IO, M: Mesh> {
     // === io ===
     pub io: I,
     // disk
-    pub offset_table: std::collections::BTreeMap<PageId, u64>,
-    pub pend_blocks: io::PendBlocks,
+    pub pend_blocks: io::BlockDir,
     pub pend_block: Option<io::PendBlock>,
     pub write_buf: Vec<u8>,
     pub block_bufs: Vec<Vec<u8>>,
@@ -30,11 +29,10 @@ pub struct Shard<I: io::IO, M: Mesh> {
 
     // sys stuff
     pub mesh: M,
+    pub runs: usize,
 
     // scratch space (per pipeline)
     pub ops: Ops,
-
-    pub runs: usize,
 }
 impl<I: io::IO, M: Mesh> Shard<I, M> {
     pub fn new(
@@ -67,10 +65,10 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
 
             io,
 
-            offset_table: std::collections::BTreeMap::new(),
-            pend_blocks: io::PendBlocks {
+            pend_blocks: io::BlockDir {
                 blocks: std::collections::BTreeMap::new(),
                 page_prios: std::collections::BTreeMap::new(),
+                offset_table: std::collections::BTreeMap::new(),
             },
             pend_block: None,
             write_buf: vec![0; block_size],
@@ -220,17 +218,19 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                                 Some(prio) => *prio += 1,
                                 None => {
                                     self.pend_blocks.page_prios.insert(pid, 1);
-                                    let offset = *self.offset_table.get(&pid).unwrap() as usize;
-                                    let block_id =
-                                        (offset / self.block_size * self.block_size) as io::BlockId;
+                                    let offsets = self.pend_blocks.offset_table.get(&pid).unwrap();
+                                    let block_id = ((*offsets.last().unwrap()
+                                        / self.block_size as u64)
+                                        * self.block_size as u64)
+                                        as io::BlockId;
                                     match self.pend_blocks.blocks.get_mut(&block_id) {
                                         Some(pend_block) => {
                                             pend_block.pending_pages.insert(
                                                 pid,
                                                 io::PendingPage {
+                                                    offsets: offsets.clone(),
                                                     idx: self.free_list.pop().unwrap(),
                                                     len: 0,
-                                                    offset,
                                                 },
                                             );
                                         }
@@ -242,9 +242,9 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                                                         [(
                                                             pid,
                                                             io::PendingPage {
+                                                                offsets: offsets.clone(),
                                                                 idx: self.free_list.pop().unwrap(),
                                                                 len: 0,
-                                                                offset,
                                                             },
                                                         )],
                                                     ),
@@ -264,17 +264,19 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                                 Some(prio) => *prio += 1,
                                 None => {
                                     self.pend_blocks.page_prios.insert(pid, 1);
-                                    let offset = *self.offset_table.get(&pid).unwrap() as usize;
-                                    let block_id =
-                                        (offset / self.block_size * self.block_size) as io::BlockId;
+                                    let offsets = self.pend_blocks.offset_table.get(&pid).unwrap();
+                                    let block_id = (offsets.last().unwrap()
+                                        / self.block_size as u64
+                                        * self.block_size as u64)
+                                        as io::BlockId;
                                     match self.pend_blocks.blocks.get_mut(&block_id) {
                                         Some(pend_block) => {
                                             pend_block.pending_pages.insert(
                                                 pid,
                                                 io::PendingPage {
+                                                    offsets: offsets.clone(),
                                                     idx: self.free_list.pop().unwrap(),
                                                     len: 0,
-                                                    offset,
                                                 },
                                             );
                                         }
@@ -286,9 +288,9 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                                                         [(
                                                             pid,
                                                             io::PendingPage {
+                                                                offsets: offsets.clone(),
                                                                 idx: self.free_list.pop().unwrap(),
                                                                 len: 0,
-                                                                offset,
                                                             },
                                                         )],
                                                     ),
@@ -380,15 +382,12 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
             let mut evict_cands = self.page_dir.evict_cands();
             while self.free_list.len() < self.free_cap_target {
                 let (pid, idx) = evict_cands.next().unwrap();
-                if self.pend_blocks.page_prios.contains_key(&pid) {
-                    continue;
-                }
                 // for now we'll just evict the best candidates, but we may have some constraints
                 // later from things like txns that prevent us from evicting certain pages
                 let page = &mut self.buf_pool[idx];
                 let flush_len = page.flush_len();
 
-                if self.block_size - self.write_offset < flush_len + 16 {
+                if self.block_size - self.write_offset < flush_len + io::CHUNK_LEN_SIZE {
                     // not enough room in current write buffer
                     let mut write_buf = self.block_bufs.pop().unwrap();
                     std::mem::swap(&mut write_buf, &mut self.write_buf);
@@ -400,27 +399,30 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                     self.write_offset = 0;
                 }
 
-                let prev_offset = {
-                    if page.flush == page.cap {
-                        // includes base page
-                        u64::MAX
-                    } else {
-                        // just deltas
-                        *self.offset_table.get(&pid).unwrap()
+                let offset = ((self.write_block * self.block_size) + self.write_offset) as u64;
+                if pid == 7135 {
+                    println!("writing {pid}, flush len: {flush_len}, offset: {offset}");
+                }
+                match self.pend_blocks.offset_table.get_mut(&pid) {
+                    Some(offsets) => {
+                        if page.flush == page.cap {
+                            offsets.clear();
+                        }
+                        offsets.push(offset)
                     }
-                };
-                self.write_buf[self.write_offset..self.write_offset + 8]
-                    .copy_from_slice(&prev_offset.to_be_bytes());
-                self.write_buf[self.write_offset + 8..self.write_offset + 16]
+                    None => {
+                        self.pend_blocks.offset_table.insert(pid, vec![offset]);
+                    }
+                }
+
+                self.write_buf[self.write_offset..self.write_offset + io::CHUNK_LEN_SIZE]
                     .copy_from_slice(&(flush_len as u64).to_be_bytes());
                 page.flush(
-                    &mut self.write_buf[self.write_offset + 16..self.write_offset + 16 + flush_len],
+                    &mut self.write_buf[self.write_offset + io::CHUNK_LEN_SIZE
+                        ..self.write_offset + io::CHUNK_LEN_SIZE + flush_len],
                 );
-                self.offset_table.insert(
-                    pid,
-                    ((self.write_block * self.block_size) + self.write_offset) as u64,
-                );
-                self.write_offset += flush_len + 16;
+                self.write_offset += io::CHUNK_LEN_SIZE + flush_len;
+
                 page.clear();
                 self.free_list.push(idx);
 
@@ -438,9 +440,10 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
             .blocks
             .remove(&((self.write_block * self.block_size) as io::BlockId))
         {
+            let block_id = (self.write_block * self.block_size) as io::BlockId;
             io::read_block(
                 &self.write_buf,
-                (self.write_block * self.block_size) as io::BlockId,
+                block_id,
                 pend_block,
                 &mut self.pend_blocks,
                 &mut self.buf_pool,
@@ -462,10 +465,10 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
         self.io.submit();
 
         self.runs += 1;
-        println!(
-            "completed pipeline {}, {read_len} reads, {writes} writes",
-            self.runs,
-        );
+        // println!(
+        //     "completed pipeline {}, {read_len} reads, {writes} writes",
+        //     self.runs,
+        // );
     }
 }
 
