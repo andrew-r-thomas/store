@@ -317,7 +317,7 @@ impl TestIO {
         }
     }
 }
-impl io::IO for TestIO {
+impl io::IOFace for TestIO {
     fn poll(&mut self) -> Vec<io::Comp> {
         let out = self.comps.clone();
         self.comps.clear();

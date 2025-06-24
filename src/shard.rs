@@ -2,27 +2,16 @@ use crate::{PageId, io, page};
 
 // NOTE: for now using BTreeMap bc the iteration order is deterministic, need a better solution
 // eventually though
-//
-// TODO: probably gonna try to track *all* offsets for a page in the offset table, should make gc
-// wayyyyyy faster, and more simple, lose a bit of memory, but proabably not a huge deal
-pub struct Shard<I: io::IO, M: Mesh> {
+pub struct Shard<I: io::IOFace, M: Mesh> {
     // page cache
     pub page_dir: PageDir,
     pub buf_pool: Vec<page::PageBuffer>,
     pub free_list: Vec<usize>,
-
-    // === io ===
-    pub io: I,
-    // disk
-    pub pend_blocks: io::BlockDir,
-    pub pend_block: Option<io::PendBlock>,
-    pub write_buf: Vec<u8>,
-    pub block_bufs: Vec<Vec<u8>>,
-    pub write_offset: usize,
-    pub write_block: usize,
-    pub block_size: usize,
     pub free_cap_target: usize,
-    // network
+
+    // io
+    pub io: I,
+    pub disk_manager: io::DiskManager,
     pub conns: std::collections::BTreeMap<u32, Conn>,
     pub net_bufs: Vec<Vec<u8>>,
     pub net_buf_size: usize,
@@ -34,7 +23,7 @@ pub struct Shard<I: io::IO, M: Mesh> {
     // scratch space (per pipeline)
     pub ops: Ops,
 }
-impl<I: io::IO, M: Mesh> Shard<I, M> {
+impl<I: io::IOFace, M: Mesh> Shard<I, M> {
     pub fn new(
         page_size: usize,
         buf_pool_size: usize,
@@ -62,22 +51,10 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
             page_dir,
             buf_pool,
             free_list,
-
-            io,
-
-            pend_blocks: io::BlockDir {
-                blocks: std::collections::BTreeMap::new(),
-                page_prios: std::collections::BTreeMap::new(),
-                offset_table: std::collections::BTreeMap::new(),
-            },
-            pend_block: None,
-            write_buf: vec![0; block_size],
-            block_bufs: Vec::from_iter((0..num_block_bufs).map(|_| vec![0; block_size])),
-            write_block: 0,
-            write_offset: 0,
-            block_size,
             free_cap_target,
 
+            io,
+            disk_manager: io::DiskManager::new(block_size, num_block_bufs),
             conns: std::collections::BTreeMap::new(),
             net_bufs: Vec::from_iter((0..num_net_bufs).map(|_| vec![0; net_buf_size])),
             net_buf_size,
@@ -164,22 +141,17 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                     self.net_bufs.push(buf);
                 }
                 io::Comp::FileRead { mut buf, offset } => {
-                    let pending_block = self.pend_block.take().unwrap();
                     io::read_block(
-                        &buf,
+                        buf,
                         offset,
-                        pending_block,
-                        &mut self.pend_blocks,
+                        &mut self.disk_manager,
                         &mut self.buf_pool,
                         &mut self.page_dir,
                     );
-
-                    buf.fill(0);
-                    self.block_bufs.push(buf);
                 }
                 io::Comp::FileWrite { mut buf } => {
                     buf.fill(0);
-                    self.block_bufs.push(buf);
+                    self.disk_manager.block_bufs.push(buf);
                 }
             }
         }
@@ -217,92 +189,14 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                                     buf: self.net_bufs.pop().unwrap(),
                                 });
                             }
-                            Err(pid) => match self.pend_blocks.page_prios.get_mut(&pid) {
-                                Some(prio) => *prio += 1,
-                                None => {
-                                    self.pend_blocks.page_prios.insert(pid, 1);
-                                    let offsets = self.pend_blocks.offset_table.get(&pid).unwrap();
-                                    let block_id = ((*offsets.last().unwrap()
-                                        / self.block_size as u64)
-                                        * self.block_size as u64)
-                                        as io::BlockId;
-                                    match self.pend_blocks.blocks.get_mut(&block_id) {
-                                        Some(pend_block) => {
-                                            pend_block.pending_pages.insert(
-                                                pid,
-                                                io::PendingPage {
-                                                    offsets: offsets.clone(),
-                                                    idx: self.free_list.pop().unwrap(),
-                                                    len: 0,
-                                                },
-                                            );
-                                        }
-                                        None => {
-                                            self.pend_blocks.blocks.insert(
-                                                block_id,
-                                                io::PendBlock {
-                                                    pending_pages: std::collections::BTreeMap::from(
-                                                        [(
-                                                            pid,
-                                                            io::PendingPage {
-                                                                offsets: offsets.clone(),
-                                                                idx: self.free_list.pop().unwrap(),
-                                                                len: 0,
-                                                            },
-                                                        )],
-                                                    ),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            },
+                            Err(pid) => self.disk_manager.inc_prio(pid),
                         }
                     }
                     io::Req::Set(set_req) => {
                         if let Err(pid) =
                             find_leaf(set_req.key, &mut self.page_dir, &mut self.buf_pool)
                         {
-                            match self.pend_blocks.page_prios.get_mut(&pid) {
-                                Some(prio) => *prio += 1,
-                                None => {
-                                    self.pend_blocks.page_prios.insert(pid, 1);
-                                    let offsets = self.pend_blocks.offset_table.get(&pid).unwrap();
-                                    let block_id = (offsets.last().unwrap()
-                                        / self.block_size as u64
-                                        * self.block_size as u64)
-                                        as io::BlockId;
-                                    match self.pend_blocks.blocks.get_mut(&block_id) {
-                                        Some(pend_block) => {
-                                            pend_block.pending_pages.insert(
-                                                pid,
-                                                io::PendingPage {
-                                                    offsets: offsets.clone(),
-                                                    idx: self.free_list.pop().unwrap(),
-                                                    len: 0,
-                                                },
-                                            );
-                                        }
-                                        None => {
-                                            self.pend_blocks.blocks.insert(
-                                                block_id,
-                                                io::PendBlock {
-                                                    pending_pages: std::collections::BTreeMap::from(
-                                                        [(
-                                                            pid,
-                                                            io::PendingPage {
-                                                                offsets: offsets.clone(),
-                                                                idx: self.free_list.pop().unwrap(),
-                                                                len: 0,
-                                                            },
-                                                        )],
-                                                    ),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            self.disk_manager.inc_prio(pid);
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
 
@@ -317,46 +211,7 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                         if let Err(pid) =
                             find_leaf(del_req.key, &mut self.page_dir, &mut self.buf_pool)
                         {
-                            match self.pend_blocks.page_prios.get_mut(&pid) {
-                                Some(prio) => *prio += 1,
-                                None => {
-                                    self.pend_blocks.page_prios.insert(pid, 1);
-                                    let offsets = self.pend_blocks.offset_table.get(&pid).unwrap();
-                                    let block_id = (offsets.last().unwrap()
-                                        / self.block_size as u64
-                                        * self.block_size as u64)
-                                        as io::BlockId;
-                                    match self.pend_blocks.blocks.get_mut(&block_id) {
-                                        Some(pend_block) => {
-                                            pend_block.pending_pages.insert(
-                                                pid,
-                                                io::PendingPage {
-                                                    offsets: offsets.clone(),
-                                                    idx: self.free_list.pop().unwrap(),
-                                                    len: 0,
-                                                },
-                                            );
-                                        }
-                                        None => {
-                                            self.pend_blocks.blocks.insert(
-                                                block_id,
-                                                io::PendBlock {
-                                                    pending_pages: std::collections::BTreeMap::from(
-                                                        [(
-                                                            pid,
-                                                            io::PendingPage {
-                                                                offsets: offsets.clone(),
-                                                                idx: self.free_list.pop().unwrap(),
-                                                                len: 0,
-                                                            },
-                                                        )],
-                                                    ),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            self.disk_manager.inc_prio(pid);
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
 
@@ -442,44 +297,9 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
                 // for now we'll just evict the best candidates, but we may have some constraints
                 // later from things like txns that prevent us from evicting certain pages
                 let page = &mut self.buf_pool[idx];
-                let flush_len = page.flush_len();
-
-                if self.block_size - self.write_offset < flush_len + io::CHUNK_LEN_SIZE {
-                    // not enough room in current write buffer
-                    let mut write_buf = self.block_bufs.pop().unwrap();
-                    std::mem::swap(&mut write_buf, &mut self.write_buf);
-                    self.io.register_sub(io::Sub::FileWrite {
-                        buf: write_buf,
-                        offset: (self.write_block * self.block_size) as u64,
-                    });
-                    self.write_block += 1;
-                    self.write_offset = 0;
-                }
-
-                let offset = ((self.write_block * self.block_size) + self.write_offset) as u64;
-                match self.pend_blocks.offset_table.get_mut(&pid) {
-                    Some(offsets) => {
-                        if page.flush == page.cap {
-                            offsets.clear();
-                        }
-                        offsets.push(offset)
-                    }
-                    None => {
-                        self.pend_blocks.offset_table.insert(pid, vec![offset]);
-                    }
-                }
-
-                self.write_buf[self.write_offset..self.write_offset + io::CHUNK_LEN_SIZE]
-                    .copy_from_slice(&(flush_len as u64).to_be_bytes());
-                page.flush(
-                    &mut self.write_buf[self.write_offset + io::CHUNK_LEN_SIZE
-                        ..self.write_offset + io::CHUNK_LEN_SIZE + flush_len],
-                );
-                self.write_offset += io::CHUNK_LEN_SIZE + flush_len;
-
+                self.disk_manager.flush_page(page, pid, &mut self.io);
                 page.clear();
                 self.free_list.push(idx);
-
                 evicts.push(pid);
             }
         }
@@ -487,33 +307,7 @@ impl<I: io::IO, M: Mesh> Shard<I, M> {
             self.page_dir.remove(pid);
         }
 
-        // read anything in the write buffer if we need to (might want to do this somewhere else)
-        // TODO: gotta think about this one some more
-        if let Some(pend_block) = self
-            .pend_blocks
-            .blocks
-            .remove(&((self.write_block * self.block_size) as io::BlockId))
-        {
-            let block_id = (self.write_block * self.block_size) as io::BlockId;
-            io::read_block(
-                &self.write_buf,
-                block_id,
-                pend_block,
-                &mut self.pend_blocks,
-                &mut self.buf_pool,
-                &mut self.page_dir,
-            );
-        }
-
-        // tee up best page read if we can/need to
-        if self.pend_block.is_none() && !self.pend_blocks.blocks.is_empty() {
-            let (offset, pend_block) = self.pend_blocks.pop_best();
-            self.io.register_sub(io::Sub::FileRead {
-                buf: self.block_bufs.pop().unwrap(),
-                offset: offset as u64,
-            });
-            self.pend_block = Some(pend_block);
-        }
+        self.disk_manager.tick_reads(&mut self.io);
 
         // submit io
         self.io.submit();
