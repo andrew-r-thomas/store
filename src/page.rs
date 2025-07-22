@@ -1,3 +1,5 @@
+use std::{alloc, slice};
+
 use crate::PageId;
 
 pub struct PageBuffer {
@@ -22,9 +24,7 @@ impl PageBuffer {
     }
 
     pub fn read(&self) -> Page {
-        Page::from(unsafe {
-            std::slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top)
-        })
+        Page::from(unsafe { slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top) })
     }
     pub fn write_delta(&mut self, delta: &Delta) -> bool {
         let len = delta.len();
@@ -33,9 +33,7 @@ impl PageBuffer {
             return false;
         }
 
-        delta.write_to_buf(unsafe {
-            std::slice::from_raw_parts_mut(self.ptr.add(self.top - len), len)
-        });
+        delta.write_to_buf(unsafe { slice::from_raw_parts_mut(self.ptr.add(self.top - len), len) });
         self.top -= len;
 
         true
@@ -43,30 +41,22 @@ impl PageBuffer {
 
     #[inline]
     pub fn raw_buffer_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.cap) }
-    }
-    #[inline]
-    pub fn raw_buffer(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.cap) }
+        unsafe { slice::from_raw_parts_mut(self.ptr, self.cap) }
     }
     pub fn clear(&mut self) {
         self.raw_buffer_mut().fill(0);
         self.top = self.cap;
         self.flush = self.cap;
     }
-    #[inline]
-    pub fn flush_len(&self) -> usize {
-        self.flush - self.top
-    }
-    pub fn flush(&mut self, buf: &mut [u8]) {
-        assert_eq!(self.flush_len(), buf.len());
-        buf.copy_from_slice(&self.raw_buffer()[self.top..self.flush]);
+    pub fn flush(&mut self) -> &[u8] {
+        let out = &(unsafe { slice::from_raw_parts(self.ptr, self.cap) })[self.top..self.flush];
         self.flush = self.top;
+        out
     }
 }
 impl Drop for PageBuffer {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr, std::alloc::Layout::array::<u8>(self.cap).unwrap()) }
+        unsafe { alloc::dealloc(self.ptr, alloc::Layout::array::<u8>(self.cap).unwrap()) }
     }
 }
 

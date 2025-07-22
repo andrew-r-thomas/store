@@ -1,3 +1,5 @@
+use std::collections;
+
 use crate::{PageId, io, page};
 
 // NOTE: for now using BTreeMap bc the iteration order is deterministic, need a better solution
@@ -11,8 +13,8 @@ pub struct Shard<I: io::IOFace, M: Mesh> {
 
     // io
     pub io: I,
-    pub disk_manager: io::DiskManager,
-    pub conns: std::collections::BTreeMap<u32, Conn>,
+    pub storage_manager: io::StorageManager,
+    pub conns: collections::BTreeMap<u32, Conn>,
     pub net_bufs: Vec<Vec<u8>>,
     pub net_buf_size: usize,
 
@@ -32,6 +34,7 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
         num_net_bufs: usize,
         net_buf_size: usize,
         free_cap_target: usize,
+        block_cap: u64,
         io: I,
         mesh: M,
     ) -> Self {
@@ -54,8 +57,8 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
             free_cap_target,
 
             io,
-            disk_manager: io::DiskManager::new(block_size, num_block_bufs),
-            conns: std::collections::BTreeMap::new(),
+            storage_manager: io::StorageManager::new(block_size, num_block_bufs, block_cap),
+            conns: collections::BTreeMap::new(),
             net_bufs: Vec::from_iter((0..num_net_bufs).map(|_| vec![0; net_buf_size])),
             net_buf_size,
 
@@ -141,17 +144,18 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
                     self.net_bufs.push(buf);
                 }
                 io::Comp::FileRead { mut buf, offset } => {
-                    io::read_block(
-                        buf,
+                    self.storage_manager.read_block(
+                        &buf,
                         offset,
-                        &mut self.disk_manager,
                         &mut self.buf_pool,
                         &mut self.page_dir,
                     );
+                    buf.fill(0);
+                    self.storage_manager.block_bufs.push(buf);
                 }
                 io::Comp::FileWrite { mut buf } => {
                     buf.fill(0);
-                    self.disk_manager.block_bufs.push(buf);
+                    self.storage_manager.block_bufs.push(buf);
                 }
             }
         }
@@ -189,14 +193,14 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
                                     buf: self.net_bufs.pop().unwrap(),
                                 });
                             }
-                            Err(pid) => self.disk_manager.inc_prio(pid),
+                            Err(pid) => self.storage_manager.inc_prio(pid, &mut self.free_list),
                         }
                     }
                     io::Req::Set(set_req) => {
                         if let Err(pid) =
                             find_leaf(set_req.key, &mut self.page_dir, &mut self.buf_pool)
                         {
-                            self.disk_manager.inc_prio(pid);
+                            self.storage_manager.inc_prio(pid, &mut self.free_list);
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
 
@@ -211,7 +215,7 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
                         if let Err(pid) =
                             find_leaf(del_req.key, &mut self.page_dir, &mut self.buf_pool)
                         {
-                            self.disk_manager.inc_prio(pid);
+                            self.storage_manager.inc_prio(pid, &mut self.free_list);
                         } else {
                             self.ops.writes.push((*conn_id, req_len));
 
@@ -297,7 +301,14 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
                 // for now we'll just evict the best candidates, but we may have some constraints
                 // later from things like txns that prevent us from evicting certain pages
                 let page = &mut self.buf_pool[idx];
-                self.disk_manager.flush_page(page, pid, &mut self.io);
+                let total = page.cap - page.top;
+                let chunk = page.flush();
+                let base = chunk.len() == total;
+
+                self.storage_manager
+                    .write_chunk(pid, chunk, &mut self.io, base);
+
+                // cleanup
                 page.clear();
                 self.free_list.push(idx);
                 evicts.push(pid);
@@ -307,15 +318,18 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
             self.page_dir.remove(pid);
         }
 
-        self.disk_manager.tick_reads(&mut self.io);
+        // queue up any reads that we may want to do
+        self.storage_manager
+            .tick(&mut self.io, &mut self.buf_pool, &mut self.page_dir);
 
         // submit io
         self.io.submit();
 
         self.runs += 1;
         println!(
-            "completed pipeline {}, {read_len} reads, {writes} writes",
+            "completed pipeline {}, {read_len} reads, {writes} writes, {} queued pages",
             self.runs,
+            self.storage_manager.pend_blocks.page_requests.len(),
         );
     }
 }
@@ -564,6 +578,7 @@ pub enum OpState {
 
 pub trait Mesh {
     fn poll(&mut self) -> Vec<Msg>;
+    fn push(&mut self, msg: Msg);
 }
 #[derive(Clone)]
 pub enum Msg {

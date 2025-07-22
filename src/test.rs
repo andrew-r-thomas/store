@@ -25,6 +25,7 @@ fn scratch() {
     const PAGE_SIZE: usize = 16 * 1024;
     const BUF_POOL_SIZE: usize = 8 * 4096;
     const FREE_CAP_TARGET: usize = BUF_POOL_SIZE / 5;
+    const BLOCK_CAP: u64 = BLOCK_SIZE as u64 * 1024;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
     const NET_BUF_SIZE: usize = 1024;
@@ -45,6 +46,7 @@ fn scratch() {
         NUM_NET_BUFS,
         NET_BUF_SIZE,
         FREE_CAP_TARGET,
+        BLOCK_CAP,
     );
 }
 
@@ -64,11 +66,12 @@ pub fn run_sim(
     num_net_bufs: usize,
     net_buf_size: usize,
     free_cap_target: usize,
+    block_cap: u64,
 ) {
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
 
     let io = TestIO {
-        file: std::io::Cursor::new(Vec::new()),
+        file: std::io::Cursor::new(vec![0; block_cap as usize]),
         comps: Vec::new(),
         pending_subs: Vec::new(),
         subs: Vec::new(),
@@ -85,6 +88,7 @@ pub fn run_sim(
         num_net_bufs,
         net_buf_size,
         free_cap_target,
+        block_cap,
         io,
         mesh,
     );
@@ -339,5 +343,8 @@ impl shard::Mesh for TestMesh {
         let out = self.msgs.clone();
         self.msgs.clear();
         out
+    }
+    fn push(&mut self, msg: shard::Msg) {
+        self.msgs.push(msg);
     }
 }
