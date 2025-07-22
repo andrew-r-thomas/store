@@ -1,34 +1,31 @@
 #![cfg(test)]
 
-use crate::shard::{Comp, IO, Mesh, Msg, Shard, Sub};
+use crate::{io, shard};
 
-use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    fs::{self, File, OpenOptions},
-    io::{Cursor, Read, Seek, SeekFrom, Write},
-    ops::Range,
-    path::Path,
-};
+use std::io::{Read, Seek, Write};
 
 use rand::{
     Rng, SeedableRng,
     seq::{IndexedMutRandom, IndexedRandom},
 };
-use rand_chacha::ChaCha8Rng;
+
+// TODO: errors (read after delete, etc) should be checked for correct values (i.e. read after
+// delete should return None)
 
 #[test]
 fn scratch() {
     const SEED: u64 = 420 ^ 69;
-    const KEY_LEN_RANGE: Range<usize> = 128..256;
-    const VAL_LEN_RANGE: Range<usize> = 512..1024;
+    const KEY_LEN_RANGE: std::ops::Range<usize> = 128..256;
+    const VAL_LEN_RANGE: std::ops::Range<usize> = 512..1024;
 
-    const NUM_CLIENTS: usize = 128;
+    const NUM_CLIENTS: usize = 256;
     const NUM_INGEST: usize = 1024;
-    const NUM_BATCHES: usize = 2048;
+    const NUM_BATCHES: usize = 3072;
 
     const PAGE_SIZE: usize = 16 * 1024;
-    const BUF_POOL_SIZE: usize = 4 * 4096;
+    const BUF_POOL_SIZE: usize = 8 * 4096;
     const FREE_CAP_TARGET: usize = BUF_POOL_SIZE / 5;
+    const BLOCK_CAP: u64 = BLOCK_SIZE as u64 * 1024;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
     const NET_BUF_SIZE: usize = 1024;
@@ -49,13 +46,14 @@ fn scratch() {
         NUM_NET_BUFS,
         NET_BUF_SIZE,
         FREE_CAP_TARGET,
+        BLOCK_CAP,
     );
 }
 
 pub fn run_sim(
     seed: u64,
-    key_len_range: Range<usize>,
-    val_len_range: Range<usize>,
+    key_len_range: std::ops::Range<usize>,
+    val_len_range: std::ops::Range<usize>,
 
     num_clients: usize,
     num_ingest: usize,
@@ -68,20 +66,21 @@ pub fn run_sim(
     num_net_bufs: usize,
     net_buf_size: usize,
     free_cap_target: usize,
+    block_cap: u64,
 ) {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
 
     let io = TestIO {
-        file: Cursor::new(Vec::new()),
+        file: std::io::Cursor::new(vec![0; block_cap as usize]),
         comps: Vec::new(),
         pending_subs: Vec::new(),
         subs: Vec::new(),
-        conns: HashMap::new(),
+        conns: std::collections::HashMap::new(),
     };
     let mesh = TestMesh { msgs: Vec::new() };
 
     // setup shard
-    let mut shard = Shard::new(
+    let mut shard = shard::Shard::new(
         page_size,
         buf_pool_size,
         block_size,
@@ -89,6 +88,7 @@ pub fn run_sim(
         num_net_bufs,
         net_buf_size,
         free_cap_target,
+        block_cap,
         io,
         mesh,
     );
@@ -97,7 +97,7 @@ pub fn run_sim(
     for conn_id in 0..num_clients as u32 {
         let conn = TestConn::new();
         shard.io.conns.insert(conn_id, conn);
-        shard.mesh.msgs.push(Msg::NewConn(conn_id));
+        shard.mesh.msgs.push(shard::Msg::NewConn(conn_id));
     }
 
     while shard.io.conns.len() > 0 {
@@ -120,36 +120,23 @@ pub fn run_sim(
                 }
             }
         }
-        // if shard.read_prios.len() > num_clients {
-        //     println!(
-        //         "read prios has {} entries, but max should be {}",
-        //         shard.read_prios.len(),
-        //         num_clients
-        //     );
-        //     let mut conn_page_counts = BTreeMap::new();
-        //     for (_, (_, conn_id)) in &shard.read_prios {
-        //         *conn_page_counts.entry(*conn_id).or_insert(0) += 1;
-        //     }
-        //     println!("Pages per connection: {:?}", conn_page_counts);
-        //     panic!();
-        // }
     }
 }
 
 struct TestConn {
     entries: Vec<(Vec<u8>, Vec<u8>)>,
-    to_shard: VecDeque<u8>,
-    from_shard: VecDeque<u8>,
-    expected: VecDeque<Vec<u8>>,
+    to_shard: std::collections::VecDeque<u8>,
+    from_shard: std::collections::VecDeque<u8>,
+    expected: std::collections::VecDeque<Vec<u8>>,
     ticks: usize,
 }
 impl TestConn {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
-            to_shard: VecDeque::new(),
-            from_shard: VecDeque::new(),
-            expected: VecDeque::new(),
+            to_shard: std::collections::VecDeque::new(),
+            from_shard: std::collections::VecDeque::new(),
+            expected: std::collections::VecDeque::new(),
             ticks: 0,
         }
     }
@@ -157,9 +144,9 @@ impl TestConn {
         &mut self,
         num_ingest: usize,
         num_ops: usize,
-        rng: &mut ChaCha8Rng,
-        key_len_range: Range<usize>,
-        val_len_range: Range<usize>,
+        rng: &mut rand_chacha::ChaCha8Rng,
+        key_len_range: std::ops::Range<usize>,
+        val_len_range: std::ops::Range<usize>,
     ) {
         if self.ticks < num_ingest {
             // do an ingest
@@ -184,7 +171,7 @@ impl TestConn {
             self.expected.push_back(vec![0]);
         } else if self.ticks < num_ingest + num_ops {
             // do an op
-            let ops = ["insert", "update", "get"];
+            let ops = ["insert", "update", "get", "del"];
             let chosen_op = ops.choose(rng).unwrap();
             match *chosen_op {
                 "insert" => {
@@ -242,6 +229,18 @@ impl TestConn {
                     e.extend(&val[..]);
                     self.expected.push_back(e);
                 }
+                "del" => {
+                    let idx = rng.random_range(0..self.entries.len());
+                    let (key, _) = self.entries.remove(idx);
+
+                    self.to_shard.write_all(&[3]).unwrap();
+                    self.to_shard
+                        .write_all(&(key.len() as u32).to_be_bytes())
+                        .unwrap();
+                    self.to_shard.write_all(&key[..]).unwrap();
+
+                    self.expected.push_back(vec![0]);
+                }
                 _ => panic!(),
             }
         }
@@ -265,54 +264,54 @@ impl TestConn {
 }
 
 struct TestIO {
-    file: Cursor<Vec<u8>>,
-    conns: HashMap<u32, TestConn>,
+    file: std::io::Cursor<Vec<u8>>,
+    conns: std::collections::HashMap<u32, TestConn>,
 
-    subs: Vec<Sub>,
-    pending_subs: Vec<Sub>,
-    comps: Vec<Comp>,
+    subs: Vec<io::Sub>,
+    pending_subs: Vec<io::Sub>,
+    comps: Vec<io::Comp>,
 }
 impl TestIO {
     fn process_subs(&mut self) {
         for sub in self.subs.drain(..) {
             match sub {
-                Sub::FileRead { mut buf, offset } => {
-                    self.file.seek(SeekFrom::Start(offset)).unwrap();
+                io::Sub::FileRead { mut buf, offset } => {
+                    self.file.seek(std::io::SeekFrom::Start(offset)).unwrap();
                     self.file.read_exact(&mut buf).unwrap();
-                    self.comps.push(Comp::FileRead { buf });
+                    self.comps.push(io::Comp::FileRead { buf, offset });
                 }
-                Sub::FileWrite { buf, offset } => {
-                    self.file.seek(SeekFrom::Start(offset)).unwrap();
+                io::Sub::FileWrite { buf, offset } => {
+                    self.file.seek(std::io::SeekFrom::Start(offset)).unwrap();
                     self.file.write_all(&buf).unwrap();
-                    self.comps.push(Comp::FileWrite { buf });
+                    self.comps.push(io::Comp::FileWrite { buf });
                 }
-                Sub::TcpRead { mut buf, conn_id } => match self.conns.get_mut(&conn_id) {
+                io::Sub::TcpRead { mut buf, conn_id } => match self.conns.get_mut(&conn_id) {
                     Some(conn) => {
                         let bytes = conn.to_shard.read(&mut buf).unwrap();
-                        self.comps.push(Comp::TcpRead {
+                        self.comps.push(io::Comp::TcpRead {
                             buf,
                             conn_id,
                             res: 1,
                             bytes,
                         });
                     }
-                    None => self.comps.push(Comp::TcpRead {
+                    None => self.comps.push(io::Comp::TcpRead {
                         buf,
                         conn_id,
                         res: -1,
                         bytes: 0,
                     }),
                 },
-                Sub::TcpWrite { buf, conn_id } => match self.conns.get_mut(&conn_id) {
+                io::Sub::TcpWrite { buf, conn_id } => match self.conns.get_mut(&conn_id) {
                     Some(conn) => {
                         conn.from_shard.write_all(&buf).unwrap();
-                        self.comps.push(Comp::TcpWrite {
+                        self.comps.push(io::Comp::TcpWrite {
                             buf,
                             conn_id,
                             res: 1,
                         });
                     }
-                    None => self.comps.push(Comp::TcpWrite {
+                    None => self.comps.push(io::Comp::TcpWrite {
                         buf,
                         conn_id,
                         res: -1,
@@ -322,13 +321,13 @@ impl TestIO {
         }
     }
 }
-impl IO for TestIO {
-    fn poll(&mut self) -> Vec<Comp> {
+impl io::IOFace for TestIO {
+    fn poll(&mut self) -> Vec<io::Comp> {
         let out = self.comps.clone();
         self.comps.clear();
         out
     }
-    fn register_sub(&mut self, sub: Sub) {
+    fn register_sub(&mut self, sub: io::Sub) {
         self.pending_subs.push(sub);
     }
     fn submit(&mut self) {
@@ -337,12 +336,15 @@ impl IO for TestIO {
 }
 
 struct TestMesh {
-    msgs: Vec<Msg>,
+    msgs: Vec<shard::Msg>,
 }
-impl Mesh for TestMesh {
-    fn poll(&mut self) -> Vec<Msg> {
+impl shard::Mesh for TestMesh {
+    fn poll(&mut self) -> Vec<shard::Msg> {
         let out = self.msgs.clone();
         self.msgs.clear();
         out
+    }
+    fn push(&mut self, msg: shard::Msg) {
+        self.msgs.push(msg);
     }
 }

@@ -1,9 +1,4 @@
-use std::{
-    alloc::{self, Layout},
-    collections::BTreeMap,
-    ops::Range,
-    slice,
-};
+use std::{alloc, slice};
 
 use crate::PageId;
 
@@ -15,10 +10,10 @@ pub struct PageBuffer {
 }
 impl PageBuffer {
     pub fn new(cap: usize) -> Self {
-        let layout = Layout::array::<u8>(cap).unwrap();
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        let layout = std::alloc::Layout::array::<u8>(cap).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
-            alloc::handle_alloc_error(layout)
+            std::alloc::handle_alloc_error(layout)
         }
         Self {
             ptr,
@@ -48,28 +43,20 @@ impl PageBuffer {
     pub fn raw_buffer_mut(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.ptr, self.cap) }
     }
-    #[inline]
-    pub fn raw_buffer(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr, self.cap) }
-    }
     pub fn clear(&mut self) {
         self.raw_buffer_mut().fill(0);
         self.top = self.cap;
         self.flush = self.cap;
     }
-    #[inline]
-    pub fn flush_len(&self) -> usize {
-        self.flush - self.top
-    }
-    pub fn flush(&mut self, buf: &mut [u8]) {
-        assert_eq!(self.flush_len(), buf.len());
-        buf.copy_from_slice(&self.raw_buffer()[self.top..self.flush]);
+    pub fn flush(&mut self) -> &[u8] {
+        let out = &(unsafe { slice::from_raw_parts(self.ptr, self.cap) })[self.top..self.flush];
         self.flush = self.top;
+        out
     }
 }
 impl Drop for PageBuffer {
     fn drop(&mut self) {
-        unsafe { alloc::dealloc(self.ptr, Layout::array::<u8>(self.cap).unwrap()) }
+        unsafe { alloc::dealloc(self.ptr, alloc::Layout::array::<u8>(self.cap).unwrap()) }
     }
 }
 
@@ -131,6 +118,11 @@ impl Page<'_> {
                 Delta::Set(set_delta) => {
                     if set_delta.key == target {
                         return Some(set_delta.val);
+                    }
+                }
+                Delta::Del(del_delta) => {
+                    if del_delta.key == target {
+                        return None;
                     }
                 }
                 _ => panic!(),
@@ -206,6 +198,7 @@ impl<'i> DoubleEndedIterator for DeltaIter<'i> {
 pub enum Delta<'d> {
     Set(SetDelta<'d>),
     Split(SplitDelta<'d>),
+    Del(DelDelta<'d>),
 }
 #[derive(Copy, Clone)]
 pub struct SetDelta<'d> {
@@ -217,8 +210,14 @@ pub struct SplitDelta<'d> {
     pub middle_key: &'d [u8],
     pub left_pid: PageId,
 }
+#[derive(Copy, Clone)]
+pub struct DelDelta<'d> {
+    pub key: &'d [u8],
+}
+
 impl<'d> Delta<'d> {
     const SET_CODE: u8 = 2;
+    const DEL_CODE: u8 = 3;
     const SPLIT_CODE: u8 = 10;
 
     pub fn from_top(buf: &'d [u8]) -> Self {
@@ -261,6 +260,17 @@ impl<'d> Delta<'d> {
                     middle_key,
                     left_pid,
                 })
+            }
+            Self::DEL_CODE => {
+                let key_len_start = CODE_SIZE;
+                let key_len_end = key_len_start + LEN_SIZE;
+                let key_len =
+                    u32::from_be_bytes(buf[key_len_start..key_len_end].try_into().unwrap())
+                        as usize;
+
+                let key = &buf[key_len_end..key_len_end + key_len];
+
+                Self::Del(DelDelta { key })
             }
             n => panic!("{n}"),
         }
@@ -306,6 +316,15 @@ impl<'d> Delta<'d> {
                     left_pid,
                 })
             }
+            Self::DEL_CODE => {
+                let key_len_end = buf.len() - CODE_SIZE;
+                let key_len_start = key_len_end - LEN_SIZE;
+                let key_len =
+                    u32::from_be_bytes(buf[key_len_start..key_len_end].try_into().unwrap())
+                        as usize;
+                let key = &buf[key_len_start - key_len..key_len_start];
+                Self::Del(DelDelta { key })
+            }
             _ => panic!(),
         }
     }
@@ -328,6 +347,9 @@ impl<'d> Delta<'d> {
                     + LEN_SIZE
                     + CODE_SIZE
             }
+            Self::Del(del_delta) => {
+                CODE_SIZE + LEN_SIZE + del_delta.key.len() + LEN_SIZE + CODE_SIZE
+            }
         }
     }
 
@@ -335,6 +357,7 @@ impl<'d> Delta<'d> {
         match self {
             Self::Set(s) => s.key,
             Self::Split(s) => s.middle_key,
+            Self::Del(s) => s.key,
         }
     }
 
@@ -391,6 +414,23 @@ impl<'d> Delta<'d> {
 
                 buf[cursor] = Self::SPLIT_CODE;
             }
+            Self::Del(del_delta) => {
+                let key_len = &(del_delta.key.len() as u32).to_be_bytes();
+
+                buf[cursor] = Self::DEL_CODE;
+                cursor += CODE_SIZE;
+
+                buf[cursor..cursor + LEN_SIZE].copy_from_slice(key_len);
+                cursor += LEN_SIZE;
+
+                buf[cursor..cursor + del_delta.key.len()].copy_from_slice(del_delta.key);
+                cursor += del_delta.key.len();
+
+                buf[cursor..cursor + LEN_SIZE].copy_from_slice(key_len);
+                cursor += LEN_SIZE;
+
+                buf[cursor] = Self::DEL_CODE;
+            }
         }
     }
 }
@@ -402,9 +442,9 @@ pub struct BasePage<'b> {
     pub entries: &'b [u8],
 }
 impl BasePage<'_> {
-    pub const NUM_ENTRIES_RANGE: Range<usize> = 0..2;
-    pub const LEFT_PID_RANGE: Range<usize> = 2..10;
-    pub const RIGHT_PID_RANGE: Range<usize> = 10..18;
+    pub const NUM_ENTRIES_RANGE: std::ops::Range<usize> = 0..2;
+    pub const LEFT_PID_RANGE: std::ops::Range<usize> = 2..10;
+    pub const RIGHT_PID_RANGE: std::ops::Range<usize> = 10..18;
     pub const ENTRIES_START: usize = 18;
 
     pub fn search_inner(&self, target: &[u8]) -> Option<(&[u8], PageId)> {
@@ -494,7 +534,7 @@ impl<'b> From<&'b [u8]> for BasePage<'b> {
 // make this better once i get a better sense of how it'll be used, and it definietly doesn't need
 // to be treated as a "page"
 pub struct PageMut {
-    pub entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     pub left_pid: PageId,
     pub right_pid: PageId,
     pub total_size: usize,
@@ -503,7 +543,7 @@ pub struct PageMut {
 impl PageMut {
     pub fn new(page_size: usize) -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: std::collections::BTreeMap::new(),
             left_pid: 0,
             right_pid: 0,
             total_size: BasePage::ENTRIES_START + BASE_LEN_SIZE,
@@ -580,6 +620,11 @@ impl PageMut {
                     Vec::from(&split_delta.left_pid.to_be_bytes()),
                 );
                 self.total_size += LEN_SIZE + split_delta.middle_key.len() + PID_SIZE;
+            }
+            Delta::Del(del_delta) => {
+                assert_ne!(self.left_pid, u64::MAX);
+                let old = self.entries.remove(del_delta.key).unwrap();
+                self.total_size -= (LEN_SIZE * 2) + del_delta.key.len() + old.len();
             }
         }
 
