@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{io, shard};
+use crate::{io, mesh, shard};
 
 use std::io::{Read, Seek, Write};
 
@@ -97,7 +97,7 @@ pub fn run_sim(
     for conn_id in 0..num_clients as u32 {
         let conn = TestConn::new();
         shard.io.conns.insert(conn_id, conn);
-        shard.mesh.msgs.push(shard::Msg::NewConn(conn_id));
+        shard.mesh.msgs.push(mesh::Msg::NewConn(conn_id));
     }
 
     while shard.io.conns.len() > 0 {
@@ -317,6 +317,7 @@ impl TestIO {
                         res: -1,
                     }),
                 },
+                io::Sub::Accept { .. } => {}
             }
         }
     }
@@ -336,15 +337,21 @@ impl io::IOFace for TestIO {
 }
 
 struct TestMesh {
-    msgs: Vec<shard::Msg>,
+    to: Vec<Vec<mesh::Msg>>,
+    from: Vec<Vec<mesh::Msg>>,
 }
-impl shard::Mesh for TestMesh {
-    fn poll(&mut self) -> Vec<shard::Msg> {
-        let out = self.msgs.clone();
-        self.msgs.clear();
+impl TestMesh {
+    pub fn push_from(&mut self, msg: mesh::Msg, from: usize) {
+        self.from[from].push(msg);
+    }
+}
+impl mesh::Mesh for TestMesh {
+    fn poll(&mut self) -> Vec<Vec<mesh::Msg>> {
+        let out = self.from.clone();
+        self.from.clear();
         out
     }
-    fn push(&mut self, msg: shard::Msg) {
-        self.msgs.push(msg);
+    fn push(&mut self, msg: mesh::Msg, to: usize) {
+        self.to[to].push(msg);
     }
 }

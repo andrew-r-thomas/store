@@ -1,10 +1,10 @@
 use std::collections;
 
-use crate::{PageId, io, page};
+use crate::{PageId, io, mesh, page};
 
 // NOTE: for now using BTreeMap bc the iteration order is deterministic, need a better solution
 // eventually though
-pub struct Shard<I: io::IOFace, M: Mesh> {
+pub struct Shard<I: io::IOFace, M: mesh::Mesh> {
     // page cache
     pub page_dir: PageDir,
     pub buf_pool: Vec<page::PageBuffer>,
@@ -25,7 +25,7 @@ pub struct Shard<I: io::IOFace, M: Mesh> {
     // scratch space (per pipeline)
     pub ops: Ops,
 }
-impl<I: io::IOFace, M: Mesh> Shard<I, M> {
+impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
     pub fn new(
         page_size: usize,
         buf_pool_size: usize,
@@ -76,7 +76,7 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
         // from other threads
         for msg in self.mesh.poll() {
             match msg {
-                Msg::NewConn(conn_id) => {
+                mesh::Msg::NewConnection(conn_id) => {
                     let mut buf = self.net_bufs.pop().unwrap();
                     buf.clear();
 
@@ -157,6 +157,7 @@ impl<I: io::IOFace, M: Mesh> Shard<I, M> {
                     buf.fill(0);
                     self.storage_manager.block_bufs.push(buf);
                 }
+                _ => {}
             }
         }
 
@@ -574,13 +575,4 @@ pub struct Conn {
 pub enum OpState {
     Pending,
     Reading,
-}
-
-pub trait Mesh {
-    fn poll(&mut self) -> Vec<Msg>;
-    fn push(&mut self, msg: Msg);
-}
-#[derive(Clone)]
-pub enum Msg {
-    NewConn(u32),
 }

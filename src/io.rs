@@ -14,13 +14,17 @@ pub trait IOFace {
     fn poll(&mut self) -> Vec<Comp>;
 }
 pub enum Sub {
+    Accept {},
     TcpRead { buf: Vec<u8>, conn_id: u32 },
     TcpWrite { buf: Vec<u8>, conn_id: u32 },
     FileRead { buf: Vec<u8>, offset: u64 },
     FileWrite { buf: Vec<u8>, offset: u64 },
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Comp {
+    Accept {
+        conn_id: u32,
+    },
     TcpRead {
         buf: Vec<u8>,
         conn_id: u32,
