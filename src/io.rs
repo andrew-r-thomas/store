@@ -1,9 +1,6 @@
-use std::{collections, mem, ops::Deref};
+use std::{collections, io::Write, mem, ops::Deref};
 
 use crate::{page, shard};
-
-/// this is just the offset in the file of the start of the block
-pub type BlockId = u64;
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -45,79 +42,31 @@ pub enum Comp {
     },
 }
 
-pub enum Req<'r> {
-    Get(GetReq<'r>),
-    Set(SetReq<'r>),
-    Del(DelReq<'r>),
+// TODO: similar types for clients, see if there's a smooth way to represent the network protocol
+// as a whole
+
+pub struct Request {
+    txn_id: u64,
+    buf: Vec<u8>,
 }
-pub struct GetReq<'r> {
-    pub key: &'r [u8],
+pub struct Response {
+    buf: Vec<u8>,
 }
-pub struct SetReq<'r> {
-    pub key: &'r [u8],
-    pub val: &'r [u8],
+
+pub struct Conn {
+    buffer: collections::VecDeque<u8>,
 }
-pub struct DelReq<'r> {
-    pub key: &'r [u8],
-}
-impl Req<'_> {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Get(get_req) => 1 + 4 + get_req.key.len(),
-            Self::Set(set_req) => 1 + 4 + 4 + set_req.key.len() + set_req.val.len(),
-            Self::Del(del_req) => 1 + 4 + del_req.key.len(),
-        }
+impl Conn {
+    pub fn fill(&mut self, bytes: &[u8]) {
+        self.buffer.write(bytes).unwrap();
+    }
+    pub fn read(&mut self) -> Option<Vec<Request>> {
+        todo!()
     }
 }
 
-const GET_CODE: u8 = 1;
-const SET_CODE: u8 = 2;
-const DEL_CODE: u8 = 3;
-
-pub fn parse_req(req: &[u8]) -> Result<Req, ()> {
-    match req.first() {
-        Some(code) => match *code {
-            GET_CODE => {
-                if req.len() < 5 {
-                    return Err(());
-                }
-                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
-                if req.len() < 5 + key_len {
-                    return Err(());
-                }
-                let key = &req[5..5 + key_len];
-                Ok(Req::Get(GetReq { key }))
-            }
-            SET_CODE => {
-                if req.len() < 9 {
-                    return Err(());
-                }
-                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
-                let val_len = u32::from_be_bytes(req[5..9].try_into().unwrap()) as usize;
-                if req.len() < 9 + key_len + val_len {
-                    return Err(());
-                }
-                let key = &req[9..9 + key_len];
-                let val = &req[9 + key_len..9 + key_len + val_len];
-                Ok(Req::Set(SetReq { key, val }))
-            }
-            DEL_CODE => {
-                if req.len() < 5 {
-                    return Err(());
-                }
-                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
-                if req.len() < 5 + key_len {
-                    return Err(());
-                }
-                let key = &req[5..5 + key_len];
-                Ok(Req::Del(DelReq { key }))
-            }
-            n => panic!("{n} is not an op code"),
-        },
-        None => Err(()),
-    }
-}
-
+/// this is just the offset in the file of the start of the block
+pub type BlockId = u64;
 pub const CHUNK_LEN_SIZE: usize = mem::size_of::<u64>();
 pub const PID_SIZE: usize = mem::size_of::<u64>();
 

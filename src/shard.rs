@@ -2,8 +2,11 @@ use std::collections;
 
 use crate::{PageId, io, mesh, page};
 
-// NOTE: for now using BTreeMap bc the iteration order is deterministic, need a better solution
-// eventually though
+/// ## NOTE
+/// for now using BTreeMap bc the iteration order is deterministic, need a better solution
+/// eventually though
+///
+/// need to make sure we're keeping the ordering of txn ops, wrt to responses too
 pub struct Shard<I: io::IOFace, M: mesh::Mesh> {
     // page cache
     pub page_dir: PageDir,
@@ -14,7 +17,7 @@ pub struct Shard<I: io::IOFace, M: mesh::Mesh> {
     // io
     pub io: I,
     pub storage_manager: io::StorageManager,
-    pub conns: collections::BTreeMap<u32, Conn>,
+    pub conns: collections::BTreeMap<u32, io::Conn>,
     pub net_bufs: Vec<Vec<u8>>,
     pub net_buf_size: usize,
 
@@ -566,13 +569,4 @@ pub fn apply_write(
             new_page.pack(&mut buf_pool[leaf_idx]);
         }
     }
-}
-
-pub struct Conn {
-    buf: Vec<u8>,
-    op: OpState,
-}
-pub enum OpState {
-    Pending,
-    Reading,
 }

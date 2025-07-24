@@ -97,7 +97,7 @@ pub fn run_sim(
     for conn_id in 0..num_clients as u32 {
         let conn = TestConn::new();
         shard.io.conns.insert(conn_id, conn);
-        shard.mesh.msgs.push(mesh::Msg::NewConn(conn_id));
+        shard.mesh.msgs.push(mesh::Msg::NewConnection(conn_id));
     }
 
     while shard.io.conns.len() > 0 {
