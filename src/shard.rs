@@ -1,6 +1,11 @@
 use std::collections;
 
-use crate::{PageId, io, mesh, page};
+use crate::{
+    PageId, io, mesh, page,
+    ticker::{Sink, Ticker},
+};
+
+const CENTRAL_ID: usize = 0;
 
 /// ## NOTE
 /// for now using BTreeMap bc the iteration order is deterministic, need a better solution
@@ -77,24 +82,15 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
         // read inputs
         //
         // from other threads
-        for msg in self.mesh.poll() {
-            match msg {
-                mesh::Msg::NewConnection(conn_id) => {
-                    let mut buf = self.net_bufs.pop().unwrap();
-                    buf.clear();
-
-                    self.conns.insert(
-                        conn_id,
-                        Conn {
-                            buf,
-                            op: OpState::Reading,
-                        },
-                    );
-
-                    self.io.register_sub(io::Sub::TcpRead {
-                        buf: self.net_bufs.pop().unwrap(),
-                        conn_id,
-                    });
+        for msgs in self.mesh.poll() {
+            for msg in msgs {
+                match msg {
+                    mesh::Msg::NewConnection(conn_id) => {
+                        self.conns.insert(conn_id, io::Conn::new(conn_id));
+                    }
+                    mesh::Msg::CommitResponse { txn, success } => todo!(),
+                    mesh::Msg::WriteRequest { txn_id, deltas } => todo!(),
+                    m => panic!("invalid mesh msg in shard: {:?}", m),
                 }
             }
         }
@@ -111,19 +107,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                         // error, client disconnected
                         self.conns.remove(&conn_id).unwrap();
                     } else {
-                        let conn = self.conns.get_mut(&conn_id).unwrap();
-                        if let OpState::Pending = conn.op {
-                            panic!()
-                        }
-
-                        conn.buf.extend(&buf[..bytes]);
-                        match io::parse_req(&conn.buf) {
-                            Ok(_) => conn.op = OpState::Pending,
-                            Err(()) => self.io.register_sub(io::Sub::TcpRead {
-                                buf: self.net_bufs.pop().unwrap(),
-                                conn_id,
-                            }),
-                        }
+                        self.conns.get_mut(&conn_id).unwrap().push(&buf[..bytes]);
                     }
 
                     // reset the buf and add it back to the pool

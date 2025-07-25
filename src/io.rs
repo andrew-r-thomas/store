@@ -1,6 +1,11 @@
-use std::{collections, io::Write, mem, ops::Deref};
+use std::{
+    collections,
+    io::{Read, Write},
+    mem,
+    ops::Deref,
+};
 
-use crate::{page, shard};
+use crate::{io, page, shard, ticker, txn};
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -53,15 +58,55 @@ pub struct Response {
     buf: Vec<u8>,
 }
 
+const TXN_ID_SIZE: usize = mem::size_of::<u64>();
+
 pub struct Conn {
-    buffer: collections::VecDeque<u8>,
+    pub id: u32,
+    pub buffer: Vec<u8>,
+    pub txn_queues: collections::BTreeMap<u64, Vec<Vec<u8>>>,
 }
 impl Conn {
-    pub fn fill(&mut self, bytes: &[u8]) {
-        self.buffer.write(bytes).unwrap();
+    pub fn new(id: u32) -> Self {
+        Self {
+            id,
+            buffer: Vec::new(),
+            txn_queues: collections::BTreeMap::new(),
+        }
     }
-    pub fn read(&mut self) -> Option<Vec<Request>> {
+}
+impl<IO: IOFace> ticker::Ticker<(&mut IO, &mut Vec<Vec<u8>>)> for Conn {
+    type Output = Vec<(u64, Vec<u8>)>;
+    fn tick<S: ticker::Sink<Input = Self::Output>>(
+        &mut self,
+        (io, net_bufs): (&mut IO, &mut Vec<Vec<u8>>),
+        sink: &mut S,
+    ) {
+        // queue up a read for the connection
+        io.register_sub(io::Sub::TcpRead {
+            buf: net_bufs.pop().unwrap(),
+            conn_id: self.id,
+        });
+
+        // try to parse any requests
+        let mut cursor = 0;
+        while let Some(txn_id_buf) = self.buffer.get(cursor..TXN_ID_SIZE) {
+            let txn_id = u64::from_be_bytes(txn_id_buf.try_into().unwrap());
+            cursor += TXN_ID_SIZE;
+            let op_code = match self.buffer.get(cursor) {
+                Some(b) => b,
+                None => break,
+            };
+            cursor += page::CODE_SIZE;
+        }
+        self.buffer.drain(..cursor);
+
         todo!()
+    }
+}
+impl ticker::Sink for Conn {
+    type Input = [u8];
+    fn push(&mut self, input: &Self::Input) {
+        self.buffer.extend_from_slice(input);
     }
 }
 
