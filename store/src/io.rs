@@ -1,11 +1,9 @@
-use std::{
-    collections,
-    io::{Read, Write},
-    mem,
-    ops::Deref,
-};
+use std::{collections, mem, ops::Deref};
 
-use crate::{io, page, shard, ticker, txn};
+use crate::{
+    format::{self, Op},
+    page, shard,
+};
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -17,25 +15,37 @@ pub trait IOFace {
 }
 pub enum Sub {
     Accept {},
-    TcpRead { buf: Vec<u8>, conn_id: u32 },
-    TcpWrite { buf: Vec<u8>, conn_id: u32 },
-    FileRead { buf: Vec<u8>, offset: u64 },
-    FileWrite { buf: Vec<u8>, offset: u64 },
+    TcpRead {
+        buf: Vec<u8>,
+        conn_id: crate::ConnId,
+    },
+    TcpWrite {
+        buf: Vec<u8>,
+        conn_id: crate::ConnId,
+    },
+    FileRead {
+        buf: Vec<u8>,
+        offset: u64,
+    },
+    FileWrite {
+        buf: Vec<u8>,
+        offset: u64,
+    },
 }
 #[derive(Clone, Debug)]
 pub enum Comp {
     Accept {
-        conn_id: u32,
+        conn_id: crate::ConnId,
     },
     TcpRead {
         buf: Vec<u8>,
-        conn_id: u32,
+        conn_id: crate::ConnId,
         res: i32,
         bytes: usize,
     },
     TcpWrite {
         buf: Vec<u8>,
-        conn_id: u32,
+        conn_id: crate::ConnId,
         res: i32,
     },
     FileRead {
@@ -47,67 +57,76 @@ pub enum Comp {
     },
 }
 
-// TODO: similar types for clients, see if there's a smooth way to represent the network protocol
-// as a whole
-
-pub struct Request {
-    txn_id: u64,
-    buf: Vec<u8>,
-}
-pub struct Response {
-    buf: Vec<u8>,
-}
-
-const TXN_ID_SIZE: usize = mem::size_of::<u64>();
-
 pub struct Conn {
-    pub id: u32,
-    pub buffer: Vec<u8>,
-    pub txn_queues: collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    pub id: crate::ConnId,
+    pub buf: Vec<u8>,
+    pub txns: collections::BTreeMap<crate::ConnTxnId, TxnQueue>,
 }
 impl Conn {
-    pub fn new(id: u32) -> Self {
+    pub fn new(id: crate::ConnId) -> Self {
         Self {
             id,
-            buffer: Vec::new(),
-            txn_queues: collections::BTreeMap::new(),
+            buf: Vec::new(),
+            txns: collections::BTreeMap::new(),
         }
     }
-}
-impl<IO: IOFace> ticker::Ticker<(&mut IO, &mut Vec<Vec<u8>>)> for Conn {
-    type Output = Vec<(u64, Vec<u8>)>;
-    fn tick<S: ticker::Sink<Input = Self::Output>>(
-        &mut self,
-        (io, net_bufs): (&mut IO, &mut Vec<Vec<u8>>),
-        sink: &mut S,
-    ) {
-        // queue up a read for the connection
-        io.register_sub(io::Sub::TcpRead {
+    pub fn write(&mut self, buf: &[u8]) {
+        self.buf.extend_from_slice(buf);
+    }
+    pub fn tick<IO: IOFace>(&mut self, io: &mut IO, net_bufs: &mut Vec<Vec<u8>>) {
+        io.register_sub(Sub::TcpRead {
             buf: net_bufs.pop().unwrap(),
             conn_id: self.id,
         });
 
-        // try to parse any requests
-        let mut cursor = 0;
-        while let Some(txn_id_buf) = self.buffer.get(cursor..TXN_ID_SIZE) {
-            let txn_id = u64::from_be_bytes(txn_id_buf.try_into().unwrap());
-            cursor += TXN_ID_SIZE;
-            let op_code = match self.buffer.get(cursor) {
-                Some(b) => b,
-                None => break,
-            };
-            cursor += page::CODE_SIZE;
-        }
-        self.buffer.drain(..cursor);
+        if self.buf.len() > 0 {
+            let mut cursor = 0;
+            // TODO: error handling
+            // (eof means we just stop reading,
+            // but we also need to handle thing like malformed requests, etc)
+            while let Ok(request) = format::Request::from_bytes(&self.buf[cursor..]) {
+                cursor += request.len();
+                match self.txns.get_mut(&request.txn_id) {
+                    Some(txn_buf) => {
+                        let old_len = txn_buf.from.len();
+                        txn_buf.from.resize(old_len + request.op.len(), 0);
+                        request.op.write_to_buf(&mut txn_buf.from[old_len..]);
+                    }
+                    None => {
+                        // new txn
+                        let mut buf = vec![0; request.op.len()];
+                        request.op.write_to_buf(&mut buf);
+                        self.txns.insert(
+                            request.txn_id,
+                            TxnQueue {
+                                from: buf,
+                                from_head: 0,
+                                to: Vec::new(),
+                                to_head: 0,
+                            },
+                        );
+                    }
+                }
+            }
 
-        todo!()
+            self.buf.drain(..cursor);
+        }
+
+        todo!("send responses here too");
     }
 }
-impl ticker::Sink for Conn {
-    type Input = [u8];
-    fn push(&mut self, input: &Self::Input) {
-        self.buffer.extend_from_slice(input);
+
+pub struct TxnQueue {
+    from: Vec<u8>,
+    from_head: usize,
+    to: Vec<u8>,
+    to_head: usize,
+}
+impl TxnQueue {
+    pub fn iter(&self) -> format::OpIter<format::RequestOp> {
+        format::OpIter::<format::RequestOp>::from(&self.from[self.from_head..])
     }
+    pub fn push(&mut self, response: Result<format::OkOp, format::ErrOp>) {}
 }
 
 /// this is just the offset in the file of the start of the block
@@ -261,7 +280,7 @@ impl FlushBuf {
         let offset = self.off as u64;
 
         // write out the page chunk
-        self.buf[self.off..self.off + PID_SIZE].copy_from_slice(&pid.to_be_bytes());
+        self.buf[self.off..self.off + PID_SIZE].copy_from_slice(&pid.0.to_be_bytes());
         self.off += PID_SIZE;
         self.buf[self.off..self.off + CHUNK_LEN_SIZE]
             .copy_from_slice(&(chunk.len() as u64).to_be_bytes());
@@ -314,7 +333,7 @@ impl PendingBlocks {
                     let offset = page_request.offs.pop().unwrap();
                     let mut cursor = offset as usize % block.len();
                     assert_eq!(
-                        pid,
+                        pid.0,
                         u64::from_be_bytes(block[cursor..cursor + PID_SIZE].try_into().unwrap())
                     );
                     cursor += PID_SIZE;

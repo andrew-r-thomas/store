@@ -10,7 +10,7 @@ pub trait Mesh {
 /// mean we need to slightly modify some existing code
 #[derive(Clone, Debug)]
 pub enum Msg {
-    NewConnection(u32),
+    NewConnection(crate::ConnId),
 
     TxnStart(u64),
     CommitRequest(txn::Transaction),
