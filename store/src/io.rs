@@ -117,7 +117,8 @@ impl Conn {
                     op,
                 };
                 if cursor + resp.len() > net_buf.len() {
-                    todo!("need to use another netbuf or something");
+                    // TODO: figure out best thing to do here
+                    break;
                 }
                 resp.write_to_buf(&mut net_buf[cursor..cursor + resp.len()]);
                 cursor += resp.len();
@@ -126,6 +127,7 @@ impl Conn {
             }
         }
 
+        net_buf.drain(cursor..);
         io.register_sub(Sub::TcpWrite {
             buf: net_buf,
             conn_id: self.id,
@@ -134,10 +136,10 @@ impl Conn {
 }
 
 pub struct TxnQueue {
-    from: Vec<u8>,
-    from_head: usize,
-    to: Vec<u8>,
-    to_head: usize,
+    pub from: Vec<u8>,
+    pub from_head: usize,
+    pub to: Vec<u8>,
+    pub to_head: usize,
 }
 impl TxnQueue {
     pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {

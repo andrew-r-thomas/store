@@ -6,6 +6,9 @@ use crate::{
     io, mesh, page,
 };
 
+#[cfg(test)]
+use crate::test;
+
 // const CENTRAL_ID: usize = 0;
 
 /// ## NOTE
@@ -53,7 +56,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
 
         // make root
         let root_idx = free_list.pop().unwrap();
-        page::PageMut::new(page_size).pack(&mut buf_pool[root_idx]);
+        page::PageMut::new(page_size, crate::PageId(1)).pack(&mut buf_pool[root_idx]);
         page_dir.insert(page_dir.root, root_idx);
 
         Self {
@@ -93,6 +96,10 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                 match msg {
                     mesh::Msg::NewConnection(conn_id) => {
                         self.conns.insert(conn_id, io::Conn::new(conn_id));
+                        self.io.register_sub(io::Sub::TcpRead {
+                            buf: self.net_bufs.pop().unwrap(),
+                            conn_id,
+                        });
                     }
                     mesh::Msg::CommitResponse { .. } => todo!(),
                     mesh::Msg::WriteRequest { .. } => todo!(),
@@ -111,7 +118,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                 } => {
                     if res <= 0 {
                         // error, client disconnected
-                        self.conns.remove(&conn_id).unwrap();
+                        self.conns.remove(&conn_id);
                     } else {
                         self.io.register_sub(io::Sub::TcpRead {
                             buf: self.net_bufs.pop().unwrap(),
@@ -132,7 +139,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                 } => {
                     if res <= 0 {
                         // error, client disconnected
-                        self.conns.remove(&conn_id).unwrap();
+                        self.conns.remove(&conn_id);
                     }
 
                     // TODO: need to tell conns about successful writes,
@@ -250,12 +257,13 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
 
         // process writes
         let writes = ops.writes.len();
-        for (txn_id, write) in ops.writes {
+        for (txn_id, w) in ops.writes {
+            let write = format::WriteOp::from_bytes(&w).unwrap();
             apply_write(
                 &mut self.page_dir,
                 &mut self.buf_pool,
                 &mut self.free_list,
-                format::WriteOp::from_bytes(&write).unwrap(),
+                write,
                 self.page_size,
             );
 
@@ -302,10 +310,29 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
         self.io.submit();
 
         self.runs += 1;
+        let queued_request_bytes = self
+            .conns
+            .iter()
+            .map(|(conn_id, conn)| {
+                conn.txns
+                    .iter()
+                    .map(|(txn_id, txn_queue)| txn_queue.from.len() - txn_queue.from_head)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        let queued_response_bytes = self
+            .conns
+            .iter()
+            .map(|(conn_id, conn)| {
+                conn.txns
+                    .iter()
+                    .map(|(txn_id, txn_queue)| txn_queue.to.len() - txn_queue.to_head)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
         println!(
-            "completed pipeline {}, {read_len} reads, {writes} writes, {} queued pages",
-            self.runs,
-            self.storage_manager.pend_blocks.page_requests.len(),
+            "completed pipeline {}, {read_len} reads, {writes} writes, {} queued request bytes, {} queued response bytes",
+            self.runs, queued_request_bytes, queued_response_bytes
         );
     }
 }
@@ -416,14 +443,15 @@ pub fn apply_write(
     page_size: usize,
 ) {
     let mut path = Vec::new();
-    let mut page_mut = page::PageMut::new(page_size);
+    let mut page_mut = page::PageMut::new(page_size, crate::PageId(0));
 
     let op = format::PageOp::Write(write);
     let key = write.key();
 
     path.push((page_dir.root, page_dir.get(page_dir.root).unwrap()));
     loop {
-        let mut current = buf_pool[path.last().unwrap().1].read();
+        let (current_id, current_idx) = path.last().unwrap();
+        let mut current = buf_pool[*current_idx].read();
         if current.is_inner() {
             let id = current.search_inner(key);
             path.push((id, page_dir.get(id).unwrap()));
@@ -433,14 +461,18 @@ pub fn apply_write(
     }
 
     let (leaf_id, leaf_idx) = path.pop().unwrap();
+
     if !buf_pool[leaf_idx].write(&op) {
         let new_page = &mut page_mut;
         new_page.clear();
+        new_page.pid = leaf_id;
         new_page.compact(buf_pool[leaf_idx].read());
 
         if !new_page.apply_op(op) {
             let mut middle_key = Vec::new();
-            let mut to_page = new_page.split_leaf(&mut middle_key);
+
+            let to_page_id = page_dir.new_page_id();
+            let mut to_page = new_page.split_leaf(&mut middle_key, to_page_id);
 
             if key <= &middle_key {
                 to_page.apply_op(op);
@@ -448,14 +480,13 @@ pub fn apply_write(
                 new_page.apply_op(op);
             }
 
-            let to_page_id = page_dir.new_page_id();
             let to_page_idx = free_list.pop().unwrap();
             to_page.pack(&mut buf_pool[to_page_idx]);
             page_dir.insert(to_page_id, to_page_idx);
 
             new_page.pack(&mut buf_pool[leaf_idx]);
 
-            let mut parent_delta = format::SplitOp {
+            let mut parent_op = format::SplitOp {
                 middle_key: &middle_key,
                 left_pid: to_page_id,
             };
@@ -465,29 +496,31 @@ pub fn apply_write(
                 match path.pop() {
                     Some((parent_id, parent_idx)) => {
                         if !buf_pool[parent_idx]
-                            .write(&format::PageOp::SMO(format::SMOp::Split(parent_delta)))
+                            .write(&format::PageOp::SMO(format::SMOp::Split(parent_op)))
                         {
                             let new_parent = &mut page_mut;
                             new_parent.clear();
+                            new_parent.pid = parent_id;
                             new_parent.compact(buf_pool[parent_idx].read());
 
                             if !new_parent
-                                .apply_op(format::PageOp::SMO(format::SMOp::Split(parent_delta)))
+                                .apply_op(format::PageOp::SMO(format::SMOp::Split(parent_op)))
                             {
+                                let to_parent_id = page_dir.new_page_id();
                                 let mut temp_key = Vec::new();
-                                let mut to_parent = new_parent.split_inner(&mut temp_key);
+                                let mut to_parent =
+                                    new_parent.split_inner(&mut temp_key, to_parent_id);
 
                                 if &middle_key <= &temp_key {
                                     to_parent.apply_op(format::PageOp::SMO(format::SMOp::Split(
-                                        parent_delta,
+                                        parent_op,
                                     )));
                                 } else {
                                     new_parent.apply_op(format::PageOp::SMO(format::SMOp::Split(
-                                        parent_delta,
+                                        parent_op,
                                     )));
                                 }
 
-                                let to_parent_id = page_dir.new_page_id();
                                 let to_parent_idx = free_list.pop().unwrap();
                                 to_parent.pack(&mut buf_pool[to_parent_idx]);
                                 page_dir.insert(to_parent_id, to_parent_idx);
@@ -496,7 +529,7 @@ pub fn apply_write(
 
                                 middle_key.clear();
                                 middle_key.extend(temp_key);
-                                parent_delta = format::SplitOp {
+                                parent_op = format::SplitOp {
                                     middle_key: &middle_key,
                                     left_pid: to_parent_id,
                                 };
@@ -514,11 +547,12 @@ pub fn apply_write(
                     None => {
                         let new_root = &mut page_mut;
                         new_root.clear();
+                        let new_root_id = page_dir.new_page_id();
+                        new_root.pid = new_root_id;
                         new_root.set_right_pid(right);
                         new_root.set_left_pid(crate::PageId(u64::MAX));
-                        new_root.apply_op(format::PageOp::SMO(format::SMOp::Split(parent_delta)));
+                        new_root.apply_op(format::PageOp::SMO(format::SMOp::Split(parent_op)));
 
-                        let new_root_id = page_dir.new_page_id();
                         let new_root_idx = free_list.pop().unwrap();
                         page_dir.root = new_root_id;
 

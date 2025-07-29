@@ -19,8 +19,7 @@ pub trait Format<'f>: Copy + fmt::Debug {
     }
 }
 
-/// an infalible iterator of formated data of a certain type,
-/// error checking must be done before creating this
+/// an iterator of formated data of a certain type,
 ///
 /// format:
 /// `[ F 1 ][ F 2 ][ ... ][ F n ]`
@@ -41,10 +40,13 @@ impl<'f, F: Format<'f>> Iterator for FormatIter<'f, F> {
             return None;
         }
 
-        let f = F::from_bytes(&self.buf[self.cursor..]).unwrap();
-        self.cursor += f.len();
-
-        Some(f)
+        match F::from_bytes(&self.buf[self.cursor..]) {
+            Ok(f) => {
+                self.cursor += f.len();
+                Some(f)
+            }
+            Err(_) => None,
+        }
     }
 }
 impl<'f, F: Format<'f>> From<&'f [u8]> for FormatIter<'f, F> {
@@ -616,6 +618,19 @@ pub enum PageOp<'p> {
     Write(WriteOp<'p>),
     SMO(SMOp<'p>),
 }
+impl PageOp<'_> {
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Self::Write(write) => match write {
+                WriteOp::Set(set) => set.key,
+                WriteOp::Del(del) => del.key,
+            },
+            Self::SMO(smo) => match smo {
+                SMOp::Split(split) => split.middle_key,
+            },
+        }
+    }
+}
 impl<'p> Format<'p> for PageOp<'p> {
     fn len(&self) -> usize {
         match self {
@@ -730,8 +745,11 @@ impl<'p> From<&'p [u8]> for Page<'p> {
         ));
         cursor -= PID_SIZE;
 
-        let base_len =
-            u64::from_be_bytes(buf[cursor - Self::ENTRIES_LEN_SIZE..].try_into().unwrap()) as usize;
+        let base_len = u64::from_be_bytes(
+            buf[cursor - Self::ENTRIES_LEN_SIZE..cursor]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         cursor -= Self::ENTRIES_LEN_SIZE;
 
         let ops = FormatIter::from(&buf[..cursor - base_len]);
@@ -849,14 +867,14 @@ impl<'l> Format<'l> for LeafEntry<'l> {
             buf.get(cursor..cursor + LEN_SIZE)
                 .ok_or(Error::EOF)?
                 .try_into()
-                .map_err(|_| Error::EOF)?,
+                .map_err(|_| Error::CorruptData)?,
         ) as usize;
         cursor += LEN_SIZE;
         let val_len = u32::from_be_bytes(
             buf.get(cursor..cursor + LEN_SIZE)
                 .ok_or(Error::EOF)?
                 .try_into()
-                .map_err(|_| Error::EOF)?,
+                .map_err(|_| Error::CorruptData)?,
         ) as usize;
         cursor += LEN_SIZE;
 

@@ -31,7 +31,7 @@ fn scratch() {
     const BLOCK_CAP: u64 = BLOCK_SIZE as u64 * 1024;
 
     const BLOCK_SIZE: usize = 1024 * 1024;
-    const NET_BUF_SIZE: usize = 1024;
+    const NET_BUF_SIZE: usize = 2 * 1024;
     const NUM_BLOCK_BUFS: usize = 4;
     const NUM_NET_BUFS: usize = 1024;
 
@@ -173,7 +173,10 @@ impl TestConn {
             req.write_to_buf(&mut reqbuf);
             self.to_shard.extend(reqbuf);
 
-            let expected_resp: Result<format::Resp, format::Error> = Ok(format::Resp::Write);
+            let expected_resp = format::Response {
+                txn_id: crate::ConnTxnId(1),
+                op: Ok(format::Resp::Write),
+            };
 
             self.entries.push((key, val));
             self.expected.push_back(expected_resp.to_vec());
@@ -201,8 +204,10 @@ impl TestConn {
                     req.write_to_buf(&mut reqbuf);
                     self.to_shard.extend(reqbuf);
 
-                    let expected_resp: Result<format::Resp, format::Error> =
-                        Ok(format::Resp::Write);
+                    let expected_resp = format::Response {
+                        txn_id: crate::ConnTxnId(1),
+                        op: Ok(format::Resp::Write),
+                    };
 
                     self.entries.push((key, val));
                     self.expected.push_back(expected_resp.to_vec());
@@ -225,8 +230,10 @@ impl TestConn {
                     req.write_to_buf(&mut reqbuf);
                     self.to_shard.extend(reqbuf);
 
-                    let expected_resp: Result<format::Resp, format::Error> =
-                        Ok(format::Resp::Write);
+                    let expected_resp = format::Response {
+                        txn_id: crate::ConnTxnId(1),
+                        op: Ok(format::Resp::Write),
+                    };
 
                     self.expected.push_back(expected_resp.to_vec());
                 }
@@ -243,8 +250,10 @@ impl TestConn {
                     req.write_to_buf(&mut reqbuf);
                     self.to_shard.extend(reqbuf);
 
-                    let expected_resp: Result<format::Resp, format::Error> =
-                        Ok(format::Resp::Get(Some(&val)));
+                    let expected_resp = format::Response {
+                        txn_id: crate::ConnTxnId(1),
+                        op: Ok(format::Resp::Get(Some(&val))),
+                    };
 
                     self.expected.push_back(expected_resp.to_vec());
                 }
@@ -262,8 +271,10 @@ impl TestConn {
                     req.write_to_buf(&mut reqbuf);
                     self.to_shard.extend(reqbuf);
 
-                    let expected_resp: Result<format::Resp, format::Error> =
-                        Ok(format::Resp::Write);
+                    let expected_resp = format::Response {
+                        txn_id: crate::ConnTxnId(1),
+                        op: Ok(format::Resp::Write),
+                    };
 
                     self.expected.push_back(expected_resp.to_vec());
                 }
