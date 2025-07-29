@@ -6,7 +6,7 @@
 //
 // use crate::{
 //     io::{self, IOFace},
-//     mesh, page, ticker, txn,
+//     mesh, page, txn,
 // };
 //
 // /// this is the central coordinator for the entire system, it runs on the main thread, literally
@@ -48,8 +48,7 @@
 //
 //                     self.io.register_sub(io::Sub::Accept {});
 //                 }
-//                 io::Comp::FileRead { .. } => {}
-//                 io::Comp::FileWrite { .. } => {}
+//                 io::Comp::FileRead { .. } | io::Comp::FileWrite { .. } => todo!("wal stuff"),
 //                 c => panic!("invalid io completion in central {:?}", c),
 //             }
 //         }

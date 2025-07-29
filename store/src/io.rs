@@ -1,7 +1,7 @@
 use std::{collections, mem, ops::Deref};
 
 use crate::{
-    format::{self, Op},
+    format::{self, Format},
     page, shard,
 };
 
@@ -59,32 +59,25 @@ pub enum Comp {
 
 pub struct Conn {
     pub id: crate::ConnId,
-    pub buf: Vec<u8>,
+    pub in_buf: Vec<u8>,
     pub txns: collections::BTreeMap<crate::ConnTxnId, TxnQueue>,
 }
 impl Conn {
     pub fn new(id: crate::ConnId) -> Self {
         Self {
             id,
-            buf: Vec::new(),
+            in_buf: Vec::new(),
             txns: collections::BTreeMap::new(),
         }
     }
     pub fn write(&mut self, buf: &[u8]) {
-        self.buf.extend_from_slice(buf);
-    }
-    pub fn tick<IO: IOFace>(&mut self, io: &mut IO, net_bufs: &mut Vec<Vec<u8>>) {
-        io.register_sub(Sub::TcpRead {
-            buf: net_bufs.pop().unwrap(),
-            conn_id: self.id,
-        });
-
-        if self.buf.len() > 0 {
+        self.in_buf.extend_from_slice(buf);
+        if self.in_buf.len() > 0 {
             let mut cursor = 0;
             // TODO: error handling
             // (eof means we just stop reading,
             // but we also need to handle thing like malformed requests, etc)
-            while let Ok(request) = format::Request::from_bytes(&self.buf[cursor..]) {
+            while let Ok(request) = format::Request::from_bytes(&self.in_buf[cursor..]) {
                 cursor += request.len();
                 match self.txns.get_mut(&request.txn_id) {
                     Some(txn_buf) => {
@@ -109,10 +102,34 @@ impl Conn {
                 }
             }
 
-            self.buf.drain(..cursor);
+            self.in_buf.drain(..cursor);
+        }
+    }
+    pub fn tick<IO: IOFace>(&mut self, io: &mut IO, net_bufs: &mut Vec<Vec<u8>>) {
+        // write anything we can/have
+        let mut net_buf = net_bufs.pop().unwrap();
+        let mut cursor = 0;
+        // just round robin for fairness between txns for now
+        for (txn_id, txn_queue) in &mut self.txns {
+            if let Some(op) = txn_queue.iter_to().next() {
+                let resp = format::Response {
+                    txn_id: *txn_id,
+                    op,
+                };
+                if cursor + resp.len() > net_buf.len() {
+                    todo!("need to use another netbuf or something");
+                }
+                resp.write_to_buf(&mut net_buf[cursor..cursor + resp.len()]);
+                cursor += resp.len();
+
+                txn_queue.to_head += op.len();
+            }
         }
 
-        todo!("send responses here too");
+        io.register_sub(Sub::TcpWrite {
+            buf: net_buf,
+            conn_id: self.id,
+        });
     }
 }
 
@@ -123,10 +140,20 @@ pub struct TxnQueue {
     to_head: usize,
 }
 impl TxnQueue {
-    pub fn iter(&self) -> format::OpIter<format::RequestOp> {
-        format::OpIter::<format::RequestOp>::from(&self.from[self.from_head..])
+    pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {
+        format::FormatIter::<format::RequestOp>::from(&self.from[self.from_head..])
     }
-    pub fn push(&mut self, response: Result<format::OkOp, format::ErrOp>) {}
+    pub fn iter_to(&self) -> format::FormatIter<'_, Result<format::Resp<'_>, format::Error>> {
+        format::FormatIter::<Result<format::Resp, format::Error>>::from(&self.to[self.to_head..])
+    }
+    pub fn push_to(&mut self, response: Result<format::Resp, format::Error>) {
+        self.from_head += format::RequestOp::from_bytes(&self.from[self.from_head..])
+            .unwrap()
+            .len();
+        let to_len = self.to.len();
+        self.to.resize(to_len + response.len(), 0);
+        response.write_to_buf(&mut self.to[to_len..]);
+    }
 }
 
 /// this is just the offset in the file of the start of the block

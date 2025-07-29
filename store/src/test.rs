@@ -1,6 +1,9 @@
 #![cfg(test)]
 
-use crate::{io, mesh, shard};
+use crate::{
+    format::{self, Format},
+    io, mesh, shard,
+};
 
 use std::io::{Read, Seek, Write};
 
@@ -75,9 +78,9 @@ pub fn run_sim(
         comps: Vec::new(),
         pending_subs: Vec::new(),
         subs: Vec::new(),
-        conns: std::collections::HashMap::new(),
+        conns: std::collections::BTreeMap::new(),
     };
-    let mesh = TestMesh { msgs: Vec::new() };
+    let mesh = TestMesh::new(1);
 
     // setup shard
     let mut shard = shard::Shard::new(
@@ -96,17 +99,19 @@ pub fn run_sim(
     // for now we'll just set up all the clients up front
     for conn_id in 0..num_clients as u32 {
         let conn = TestConn::new();
-        shard.io.conns.insert(conn_id, conn);
-        shard.mesh.msgs.push(mesh::Msg::NewConnection(conn_id));
+        shard.io.conns.insert(crate::ConnId(conn_id), conn);
+        shard
+            .mesh
+            .push_from(mesh::Msg::NewConnection(crate::ConnId(conn_id)), 0);
     }
 
     while shard.io.conns.len() > 0 {
         let id = rng.random_range(0..num_clients as u32 + 1);
         if id >= num_clients as u32 {
-            shard.run_pipeline();
+            shard.tick();
             shard.io.process_subs();
         } else {
-            if let Some(conn) = shard.io.conns.get_mut(&id) {
+            if let Some(conn) = shard.io.conns.get_mut(&crate::ConnId(id)) {
                 conn.tick(
                     num_ingest,
                     num_ops,
@@ -116,7 +121,7 @@ pub fn run_sim(
                 );
                 if conn.is_done(num_ingest, num_ops) {
                     println!("conn {id} done!");
-                    shard.io.conns.remove(&id).unwrap();
+                    shard.io.conns.remove(&crate::ConnId(id)).unwrap();
                 }
             }
         }
@@ -157,18 +162,21 @@ impl TestConn {
             rng.fill(&mut key[..]);
             rng.fill(&mut val[..]);
 
-            self.to_shard.write_all(&[2]).unwrap();
-            self.to_shard
-                .write_all(&(key_len as u32).to_be_bytes())
-                .unwrap();
-            self.to_shard
-                .write_all(&(val_len as u32).to_be_bytes())
-                .unwrap();
-            self.to_shard.write_all(&key).unwrap();
-            self.to_shard.write_all(&val).unwrap();
+            let req = format::Request {
+                txn_id: crate::ConnTxnId(1),
+                op: format::RequestOp::Write(format::WriteOp::Set(format::SetOp {
+                    key: &key,
+                    val: &val,
+                })),
+            };
+            let mut reqbuf = vec![0; req.len()];
+            req.write_to_buf(&mut reqbuf);
+            self.to_shard.extend(reqbuf);
+
+            let expected_resp: Result<format::Resp, format::Error> = Ok(format::Resp::Write);
 
             self.entries.push((key, val));
-            self.expected.push_back(vec![0]);
+            self.expected.push_back(expected_resp.to_vec());
         } else if self.ticks < num_ingest + num_ops {
             // do an op
             let ops = ["insert", "update", "get", "del"];
@@ -182,18 +190,22 @@ impl TestConn {
                     rng.fill(&mut key[..]);
                     rng.fill(&mut val[..]);
 
-                    self.to_shard.write_all(&[2]).unwrap();
-                    self.to_shard
-                        .write_all(&(key_len as u32).to_be_bytes())
-                        .unwrap();
-                    self.to_shard
-                        .write_all(&(val_len as u32).to_be_bytes())
-                        .unwrap();
-                    self.to_shard.write_all(&key).unwrap();
-                    self.to_shard.write_all(&val).unwrap();
+                    let req = format::Request {
+                        txn_id: crate::ConnTxnId(1),
+                        op: format::RequestOp::Write(format::WriteOp::Set(format::SetOp {
+                            key: &key,
+                            val: &val,
+                        })),
+                    };
+                    let mut reqbuf = vec![0; req.len()];
+                    req.write_to_buf(&mut reqbuf);
+                    self.to_shard.extend(reqbuf);
+
+                    let expected_resp: Result<format::Resp, format::Error> =
+                        Ok(format::Resp::Write);
 
                     self.entries.push((key, val));
-                    self.expected.push_back(vec![0]);
+                    self.expected.push_back(expected_resp.to_vec());
                 }
                 "update" => {
                     let (key, val) = self.entries.choose_mut(rng).unwrap();
@@ -202,44 +214,58 @@ impl TestConn {
                     rng.fill(&mut new_val[..]);
                     *val = new_val;
 
-                    self.to_shard.write_all(&[2]).unwrap();
-                    self.to_shard
-                        .write_all(&(key.len() as u32).to_be_bytes())
-                        .unwrap();
-                    self.to_shard
-                        .write_all(&(val.len() as u32).to_be_bytes())
-                        .unwrap();
-                    self.to_shard.write_all(&key[..]).unwrap();
-                    self.to_shard.write_all(&val[..]).unwrap();
+                    let req = format::Request {
+                        txn_id: crate::ConnTxnId(1),
+                        op: format::RequestOp::Write(format::WriteOp::Set(format::SetOp {
+                            key: &key,
+                            val: &val,
+                        })),
+                    };
+                    let mut reqbuf = vec![0; req.len()];
+                    req.write_to_buf(&mut reqbuf);
+                    self.to_shard.extend(reqbuf);
 
-                    self.expected.push_back(vec![0]);
+                    let expected_resp: Result<format::Resp, format::Error> =
+                        Ok(format::Resp::Write);
+
+                    self.expected.push_back(expected_resp.to_vec());
                 }
                 "get" => {
                     let (key, val) = self.entries.choose(rng).unwrap();
 
-                    self.to_shard.write_all(&[1]).unwrap();
-                    self.to_shard
-                        .write_all(&(key.len() as u32).to_be_bytes())
-                        .unwrap();
-                    self.to_shard.write_all(&key[..]).unwrap();
+                    let req = format::Request {
+                        txn_id: crate::ConnTxnId(1),
+                        op: format::RequestOp::Read(format::ReadOp::Get(format::GetOp {
+                            key: &key,
+                        })),
+                    };
+                    let mut reqbuf = vec![0; req.len()];
+                    req.write_to_buf(&mut reqbuf);
+                    self.to_shard.extend(reqbuf);
 
-                    let mut e = Vec::new();
-                    e.push(0);
-                    e.extend(&(val.len() as u32).to_be_bytes());
-                    e.extend(&val[..]);
-                    self.expected.push_back(e);
+                    let expected_resp: Result<format::Resp, format::Error> =
+                        Ok(format::Resp::Get(Some(&val)));
+
+                    self.expected.push_back(expected_resp.to_vec());
                 }
                 "del" => {
                     let idx = rng.random_range(0..self.entries.len());
                     let (key, _) = self.entries.remove(idx);
 
-                    self.to_shard.write_all(&[3]).unwrap();
-                    self.to_shard
-                        .write_all(&(key.len() as u32).to_be_bytes())
-                        .unwrap();
-                    self.to_shard.write_all(&key[..]).unwrap();
+                    let req = format::Request {
+                        txn_id: crate::ConnTxnId(1),
+                        op: format::RequestOp::Write(format::WriteOp::Del(format::DelOp {
+                            key: &key,
+                        })),
+                    };
+                    let mut reqbuf = vec![0; req.len()];
+                    req.write_to_buf(&mut reqbuf);
+                    self.to_shard.extend(reqbuf);
 
-                    self.expected.push_back(vec![0]);
+                    let expected_resp: Result<format::Resp, format::Error> =
+                        Ok(format::Resp::Write);
+
+                    self.expected.push_back(expected_resp.to_vec());
                 }
                 _ => panic!(),
             }
@@ -265,7 +291,7 @@ impl TestConn {
 
 struct TestIO {
     file: std::io::Cursor<Vec<u8>>,
-    conns: std::collections::HashMap<u32, TestConn>,
+    conns: std::collections::BTreeMap<crate::ConnId, TestConn>,
 
     subs: Vec<io::Sub>,
     pending_subs: Vec<io::Sub>,
@@ -341,6 +367,12 @@ struct TestMesh {
     from: Vec<Vec<mesh::Msg>>,
 }
 impl TestMesh {
+    pub fn new(num_shards: usize) -> Self {
+        Self {
+            to: Vec::from_iter((0..num_shards + 1).map(|_| Vec::new())),
+            from: Vec::from_iter((0..num_shards + 1).map(|_| Vec::new())),
+        }
+    }
     pub fn push_from(&mut self, msg: mesh::Msg, from: usize) {
         self.from[from].push(msg);
     }

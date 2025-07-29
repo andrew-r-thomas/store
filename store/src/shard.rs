@@ -2,11 +2,11 @@ use std::collections;
 
 use crate::{
     PageId,
-    format::{self, Op},
+    format::{self, Format},
     io, mesh, page,
 };
 
-const CENTRAL_ID: usize = 0;
+// const CENTRAL_ID: usize = 0;
 
 /// ## NOTE
 /// for now using BTreeMap bc the iteration order is deterministic, need a better solution
@@ -94,8 +94,8 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                     mesh::Msg::NewConnection(conn_id) => {
                         self.conns.insert(conn_id, io::Conn::new(conn_id));
                     }
-                    mesh::Msg::CommitResponse { txn, success } => todo!(),
-                    mesh::Msg::WriteRequest { txn_id, deltas } => todo!(),
+                    mesh::Msg::CommitResponse { .. } => todo!(),
+                    mesh::Msg::WriteRequest { .. } => todo!(),
                     m => panic!("invalid mesh msg in shard: {:?}", m),
                 }
             }
@@ -113,6 +113,10 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                         // error, client disconnected
                         self.conns.remove(&conn_id).unwrap();
                     } else {
+                        self.io.register_sub(io::Sub::TcpRead {
+                            buf: self.net_bufs.pop().unwrap(),
+                            conn_id,
+                        });
                         self.conns.get_mut(&conn_id).unwrap().write(&buf[..bytes]);
                     }
 
@@ -131,7 +135,8 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                         self.conns.remove(&conn_id).unwrap();
                     }
 
-                    todo!("need to tell conns about successful writes");
+                    // TODO: need to tell conns about successful writes,
+                    // requires a little extra tracking
 
                     // reset the buf and add it back to the pool
                     buf.fill(0);
@@ -156,19 +161,21 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
             }
         }
 
+        // write anything out from conns
+        for (_, conn) in self.conns.iter_mut() {
+            conn.tick(&mut self.io, &mut self.net_bufs);
+        }
+
         // find ops that can be completed in this pipeline
         let mut ops = Ops::new();
         {
             for (conn_id, conn) in self.conns.iter() {
                 for (txn_id, txn_queue) in &conn.txns {
-                    if let Some(op) = txn_queue.iter().next() {
+                    if let Some(op) = txn_queue.iter_from().next() {
                         match op {
                             format::RequestOp::Read(read) => {
-                                match find_leaf(
-                                    read.key().unwrap(),
-                                    &mut self.page_dir,
-                                    &mut self.buf_pool,
-                                ) {
+                                match find_leaf(read.key(), &mut self.page_dir, &mut self.buf_pool)
+                                {
                                     Ok((pid, idx)) => match ops.reads.get_mut(&pid) {
                                         Some(read_group) => {
                                             read_group.reads.push((
@@ -201,11 +208,8 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                                 }
                             }
                             format::RequestOp::Write(write) => {
-                                match find_leaf(
-                                    write.key().unwrap(),
-                                    &mut self.page_dir,
-                                    &mut self.buf_pool,
-                                ) {
+                                match find_leaf(write.key(), &mut self.page_dir, &mut self.buf_pool)
+                                {
                                     Ok(_) => {
                                         ops.writes.push((
                                             crate::ShardTxnId {
@@ -238,9 +242,9 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                     .txns
                     .get_mut(&txn_id.conn_txn_id)
                     .unwrap()
-                    .push(Ok(format::OkOp::Get(page.search_leaf(
-                        format::ReadOp::from_bytes(&read).unwrap().key().unwrap(),
-                    ))));
+                    .push_to(Ok(format::Resp::Get(
+                        page.search_leaf(format::ReadOp::from_bytes(&read).unwrap().key()),
+                    )));
             }
         }
 
@@ -261,11 +265,11 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                 .txns
                 .get_mut(&txn_id.conn_txn_id)
                 .unwrap()
-                .push(Ok(format::OkOp::Success));
+                .push_to(Ok(format::Resp::Write));
         }
 
         // evict enough to have a nice full free list
-        let mut evicts = Vec::new(); // PERF:
+        let mut evicts = Vec::new();
         {
             let mut evict_cands = self.page_dir.evict_cands();
             while self.free_list.len() < self.free_cap_target {
@@ -415,7 +419,7 @@ pub fn apply_write(
     let mut page_mut = page::PageMut::new(page_size);
 
     let op = format::PageOp::Write(write);
-    let key = write.key().unwrap();
+    let key = write.key();
 
     path.push((page_dir.root, page_dir.get(page_dir.root).unwrap()));
     loop {
@@ -452,7 +456,7 @@ pub fn apply_write(
             new_page.pack(&mut buf_pool[leaf_idx]);
 
             let mut parent_delta = format::SplitOp {
-                middle_key: format::Key(&middle_key),
+                middle_key: &middle_key,
                 left_pid: to_page_id,
             };
             let mut right = leaf_id;
@@ -493,7 +497,7 @@ pub fn apply_write(
                                 middle_key.clear();
                                 middle_key.extend(temp_key);
                                 parent_delta = format::SplitOp {
-                                    middle_key: format::Key(&middle_key),
+                                    middle_key: &middle_key,
                                     left_pid: to_parent_id,
                                 };
                                 right = parent_id;

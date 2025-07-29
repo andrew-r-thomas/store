@@ -2,7 +2,7 @@ use std::{alloc, slice};
 
 use crate::{
     PageId,
-    format::{self, Op},
+    format::{self, Format},
 };
 
 pub struct PageBuffer {
@@ -26,7 +26,7 @@ impl PageBuffer {
         }
     }
 
-    pub fn read(&self) -> format::Page {
+    pub fn read(&self) -> format::Page<'_> {
         format::Page::from(unsafe {
             slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top)
         })
@@ -85,7 +85,7 @@ impl PageMut {
             entries: std::collections::BTreeMap::new(),
             left_pid: PageId(0),
             right_pid: PageId(0),
-            total_size: format::Page::ENTRIES_LEN_SIZE,
+            total_size: format::Page::ENTRIES_LEN_SIZE + (format::PID_SIZE * 2),
             page_size,
         }
     }
@@ -97,7 +97,7 @@ impl PageMut {
             true => {
                 for split in page.entries.iter_inner() {
                     self.entries.insert(
-                        Vec::from(split.middle_key.0),
+                        Vec::from(split.middle_key),
                         Vec::from(&split.left_pid.0.to_be_bytes()),
                     );
                     self.total_size += format::LEN_SIZE + split.middle_key.len() + format::PID_SIZE;
@@ -105,8 +105,7 @@ impl PageMut {
             }
             false => {
                 for set in page.entries.iter_leaf() {
-                    self.entries
-                        .insert(Vec::from(set.key.0), Vec::from(set.val.0));
+                    self.entries.insert(Vec::from(set.key), Vec::from(set.val));
                     self.total_size += (2 * format::LEN_SIZE) + set.key.len() + set.val.len();
                 }
             }
@@ -123,16 +122,13 @@ impl PageMut {
             format::PageOp::Write(write) => match write {
                 format::WriteOp::Set(set) => {
                     assert_ne!(self.left_pid.0, u64::MAX);
-                    match self
-                        .entries
-                        .insert(Vec::from(set.key.0), Vec::from(set.val.0))
-                    {
+                    match self.entries.insert(Vec::from(set.key), Vec::from(set.val)) {
                         Some(old_val) => {
                             if old_val.len() < set.val.len()
                                 && set.val.len() - old_val.len() > self.page_size - self.total_size
                             {
                                 // not enough space within the logical page size
-                                self.entries.insert(Vec::from(set.key.0), old_val);
+                                self.entries.insert(Vec::from(set.key), old_val);
                                 return false;
                             }
                             self.total_size -= old_val.len();
@@ -142,7 +138,7 @@ impl PageMut {
                             if (format::LEN_SIZE * 2) + set.key.len() + set.val.len()
                                 > self.page_size - self.total_size
                             {
-                                self.entries.remove(set.key.0);
+                                self.entries.remove(set.key);
                                 return false;
                             }
                             self.total_size +=
@@ -152,7 +148,7 @@ impl PageMut {
                 }
                 format::WriteOp::Del(del) => {
                     assert_ne!(self.left_pid.0, u64::MAX);
-                    let old = self.entries.remove(del.key.0).unwrap();
+                    let old = self.entries.remove(del.key).unwrap();
                     self.total_size -= (format::LEN_SIZE * 2) + del.key.len() + old.len();
                 }
             },
@@ -166,7 +162,7 @@ impl PageMut {
                         return false;
                     }
                     self.entries.insert(
-                        Vec::from(split.middle_key.0),
+                        Vec::from(split.middle_key),
                         Vec::from(&split.left_pid.0.to_be_bytes()),
                     );
                     self.total_size += format::LEN_SIZE + split.middle_key.len() + format::PID_SIZE;
@@ -236,9 +232,41 @@ impl PageMut {
         self.entries.clear();
         self.left_pid.0 = 0;
         self.right_pid.0 = 0;
-        self.total_size = format::Page::ENTRIES_LEN_SIZE;
+        self.total_size = format::Page::ENTRIES_LEN_SIZE + (format::PID_SIZE * 2);
     }
     pub fn pack(&mut self, page_buf: &mut PageBuffer) {
-        todo!()
+        assert_eq!(page_buf.cap, self.page_size);
+
+        page_buf.clear();
+        let top = page_buf.cap - self.total_size;
+        page_buf.top = top;
+        let buf = &mut page_buf.raw_buffer_mut()[top..];
+
+        let mut cursor = 0;
+        for entry in self.entries.iter() {
+            buf[cursor..cursor + format::LEN_SIZE]
+                .copy_from_slice(&(entry.0.len() as u32).to_be_bytes());
+            cursor += format::LEN_SIZE;
+            buf[cursor..cursor + entry.0.len()].copy_from_slice(entry.0);
+            cursor += entry.0.len();
+
+            if self.left_pid.0 == u64::MAX {
+                buf[cursor..cursor + format::PID_SIZE].copy_from_slice(entry.1);
+                cursor += format::PID_SIZE;
+            } else {
+                buf[cursor..cursor + format::LEN_SIZE]
+                    .copy_from_slice(&(entry.1.len() as u32).to_be_bytes());
+                cursor += format::LEN_SIZE;
+                buf[cursor..cursor + entry.1.len()].copy_from_slice(entry.1);
+                cursor += entry.1.len();
+            }
+        }
+
+        buf[cursor..cursor + format::Page::ENTRIES_LEN_SIZE]
+            .copy_from_slice(&(cursor as u64).to_be_bytes());
+        cursor += format::Page::ENTRIES_LEN_SIZE;
+        buf[cursor..cursor + format::PID_SIZE].copy_from_slice(&self.left_pid.0.to_be_bytes());
+        cursor += format::PID_SIZE;
+        buf[cursor..cursor + format::PID_SIZE].copy_from_slice(&self.right_pid.0.to_be_bytes());
     }
 }

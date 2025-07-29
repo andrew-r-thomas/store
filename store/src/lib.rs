@@ -1,3 +1,5 @@
+#![feature(phantom_variance_markers)]
+
 pub mod central;
 pub mod format;
 pub mod io;
