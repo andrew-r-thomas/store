@@ -1,5 +1,3 @@
-use crate::txn;
-
 pub trait Mesh {
     fn poll(&mut self) -> Vec<Vec<Msg>>;
     fn push(&mut self, msg: Msg, to: usize);
@@ -8,19 +6,30 @@ pub trait Mesh {
 /// ## PERF
 /// these are all messages dealing with single units of data, they should be batched, this will
 /// mean we need to slightly modify some existing code
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Msg {
     NewConnection(crate::ConnId),
 
-    TxnStart(u64),
-    CommitRequest(txn::Transaction),
+    TxnStart(crate::Timestamp),
+    CommitRequest {
+        txn_id: crate::ShardTxnId,
+        writes: Vec<u8>,
+    },
     CommitResponse {
-        txn: txn::Transaction,
-        success: bool,
+        txn_id: crate::ShardTxnId,
+        writes: Vec<u8>,
+        res: Result<(), ()>,
     },
-    WriteRequest {
-        txn_id: u64,
-        deltas: Vec<Vec<u8>>,
+    WriteRequest(Commit),
+    WriteResponse {
+        txn_id: crate::ShardTxnId,
+        writes: Vec<u8>,
     },
-    WriteResponse(Result<(u64, Vec<Vec<u8>>), ()>),
+}
+
+#[derive(Debug)]
+pub struct Commit {
+    pub txn_id: crate::ShardTxnId,
+    pub ts: crate::Timestamp,
+    pub writes: Vec<u8>,
 }

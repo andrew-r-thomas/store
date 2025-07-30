@@ -175,7 +175,7 @@ impl TestConn {
 
             let expected_resp = format::Response {
                 txn_id: crate::ConnTxnId(1),
-                op: Ok(format::Resp::Write),
+                op: Ok(format::Resp::Success),
             };
 
             self.entries.push((key, val));
@@ -206,7 +206,7 @@ impl TestConn {
 
                     let expected_resp = format::Response {
                         txn_id: crate::ConnTxnId(1),
-                        op: Ok(format::Resp::Write),
+                        op: Ok(format::Resp::Success),
                     };
 
                     self.entries.push((key, val));
@@ -232,7 +232,7 @@ impl TestConn {
 
                     let expected_resp = format::Response {
                         txn_id: crate::ConnTxnId(1),
-                        op: Ok(format::Resp::Write),
+                        op: Ok(format::Resp::Success),
                     };
 
                     self.expected.push_back(expected_resp.to_vec());
@@ -273,7 +273,7 @@ impl TestConn {
 
                     let expected_resp = format::Response {
                         txn_id: crate::ConnTxnId(1),
-                        op: Ok(format::Resp::Write),
+                        op: Ok(format::Resp::Success),
                     };
 
                     self.expected.push_back(expected_resp.to_vec());

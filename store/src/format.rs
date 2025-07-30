@@ -334,25 +334,33 @@ impl<'r> Format<'r> for Request<'r> {
 pub enum RequestOp<'r> {
     Read(ReadOp<'r>),
     Write(WriteOp<'r>),
+    Commit,
+}
+impl RequestOp<'_> {
+    pub const COMMIT_CODE: u8 = 9;
 }
 impl<'r> Format<'r> for RequestOp<'r> {
     fn len(&self) -> usize {
         match self {
             Self::Read(read) => read.len(),
             Self::Write(write) => write.len(),
+            Self::Commit => CODE_SIZE,
         }
     }
     fn from_bytes(buf: &'r [u8]) -> Result<Self, Error> {
         Ok(match *buf.first().ok_or(Error::EOF)? {
             GetOp::CODE => Self::Read(ReadOp::from_bytes(buf)?),
             SetOp::CODE | DelOp::CODE => Self::Write(WriteOp::from_bytes(buf)?),
+            Self::COMMIT_CODE => Self::Commit,
             _ => return Err(Error::InvalidCode),
         })
     }
     fn write_to_buf(&self, buf: &mut [u8]) {
+        assert_eq!(self.len(), buf.len());
         match self {
             Self::Read(read) => read.write_to_buf(buf),
             Self::Write(write) => write.write_to_buf(buf),
+            Self::Commit => buf[0] = Self::COMMIT_CODE,
         }
     }
 }
@@ -430,7 +438,7 @@ impl<'r> Format<'r> for Result<Resp<'r>, Error> {
 #[derive(Copy, Clone, Debug)]
 pub enum Resp<'r> {
     Get(Option<&'r [u8]>),
-    Write,
+    Success,
 }
 impl<'r> Format<'r> for Resp<'r> {
     fn len(&self) -> usize {
@@ -442,12 +450,12 @@ impl<'r> Format<'r> for Resp<'r> {
                         None => 0,
                     }
             }
-            Self::Write => 0,
+            Self::Success => 0,
         }
     }
     fn from_bytes(buf: &'r [u8]) -> Result<Self, Error> {
         if buf.len() == 0 {
-            return Ok(Self::Write);
+            return Ok(Self::Success);
         }
 
         let mut cursor = 0;
@@ -488,7 +496,7 @@ impl<'r> Format<'r> for Resp<'r> {
                     }
                 }
             }
-            Self::Write => {}
+            Self::Success => {}
         }
     }
 }
@@ -614,14 +622,45 @@ impl<'s> Format<'s> for SMOp<'s> {
 }
 
 #[derive(Copy, Clone, Debug)]
+pub struct PageWrite<'p> {
+    pub write: WriteOp<'p>,
+    pub ts: crate::Timestamp,
+}
+impl PageWrite<'_> {
+    pub fn key(&self) -> &[u8] {
+        self.write.key()
+    }
+}
+impl<'p> Format<'p> for PageWrite<'p> {
+    fn len(&self) -> usize {
+        self.ts.len() + self.write.len()
+    }
+    fn from_bytes(buf: &'p [u8]) -> Result<Self, Error> {
+        let mut cursor = 0;
+        let write = WriteOp::from_bytes(buf.get(cursor..).ok_or(Error::EOF)?)?;
+        cursor += write.len();
+        let ts = crate::Timestamp::from_bytes(buf.get(cursor..).ok_or(Error::EOF)?)?;
+        Ok(Self { ts, write })
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        assert_eq!(self.len(), buf.len());
+
+        let mut cursor = 0;
+        self.write.write_to_buf(&mut buf[cursor..]);
+        cursor += self.write.len();
+        self.ts
+            .write_to_buf(&mut buf[cursor..cursor + self.ts.len()]);
+    }
+}
+#[derive(Copy, Clone, Debug)]
 pub enum PageOp<'p> {
-    Write(WriteOp<'p>),
+    Write(PageWrite<'p>),
     SMO(SMOp<'p>),
 }
 impl PageOp<'_> {
     pub fn key(&self) -> &[u8] {
         match self {
-            Self::Write(write) => match write {
+            Self::Write(page_write) => match page_write.write {
                 WriteOp::Set(set) => set.key,
                 WriteOp::Del(del) => del.key,
             },
@@ -640,7 +679,7 @@ impl<'p> Format<'p> for PageOp<'p> {
     }
     fn from_bytes(buf: &'p [u8]) -> Result<Self, Error> {
         Ok(match *buf.first().ok_or(Error::EOF)? {
-            SetOp::CODE | DelOp::CODE => Self::Write(WriteOp::from_bytes(buf)?),
+            SetOp::CODE | DelOp::CODE => Self::Write(PageWrite::from_bytes(buf)?),
             SplitOp::CODE => Self::SMO(SMOp::from_bytes(buf)?),
             _ => return Err(Error::InvalidCode),
         })
@@ -703,23 +742,28 @@ impl Page<'_> {
             (None, None) => self.right_pid,
         }
     }
-    pub fn search_leaf(&mut self, target: &[u8]) -> Option<&[u8]> {
+    pub fn search_leaf(&mut self, target: &[u8], ts: crate::Timestamp) -> Option<&[u8]> {
         self.ops.reset();
 
         while let Some(op) = self.ops.next() {
             match op {
-                PageOp::Write(write) => match write {
-                    WriteOp::Set(set) => {
-                        if set.key == target {
-                            return Some(set.val);
+                PageOp::Write(write) => {
+                    if write.ts > ts {
+                        continue;
+                    }
+                    match write.write {
+                        WriteOp::Set(set) => {
+                            if set.key == target {
+                                return Some(set.val);
+                            }
+                        }
+                        WriteOp::Del(del) => {
+                            if del.key == target {
+                                return None;
+                            }
                         }
                     }
-                    WriteOp::Del(del) => {
-                        if del.key == target {
-                            return None;
-                        }
-                    }
-                },
+                }
                 o => panic!("{:?}", o),
             }
         }

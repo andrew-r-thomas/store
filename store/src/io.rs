@@ -60,6 +60,10 @@ pub enum Comp {
 pub struct Conn {
     pub id: crate::ConnId,
     pub in_buf: Vec<u8>,
+    /// ## TODO
+    /// need to answer the question of when txns get removed from this map, this is a little tricky
+    /// because it seems like two places need to think about when a txn is finished within a shard
+    /// both the connection itself, and the shard which owns it
     pub txns: collections::BTreeMap<crate::ConnTxnId, TxnQueue>,
 }
 impl Conn {
@@ -93,9 +97,7 @@ impl Conn {
                             request.txn_id,
                             TxnQueue {
                                 from: buf,
-                                from_head: 0,
                                 to: Vec::new(),
-                                to_head: 0,
                             },
                         );
                     }
@@ -123,7 +125,7 @@ impl Conn {
                 resp.write_to_buf(&mut net_buf[cursor..cursor + resp.len()]);
                 cursor += resp.len();
 
-                txn_queue.to_head += op.len();
+                txn_queue.to.drain(..op.len());
             }
         }
 
@@ -137,21 +139,22 @@ impl Conn {
 
 pub struct TxnQueue {
     pub from: Vec<u8>,
-    pub from_head: usize,
     pub to: Vec<u8>,
-    pub to_head: usize,
 }
 impl TxnQueue {
     pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {
-        format::FormatIter::<format::RequestOp>::from(&self.from[self.from_head..])
+        format::FormatIter::<format::RequestOp>::from(&self.from[..])
     }
     pub fn iter_to(&self) -> format::FormatIter<'_, Result<format::Resp<'_>, format::Error>> {
-        format::FormatIter::<Result<format::Resp, format::Error>>::from(&self.to[self.to_head..])
+        format::FormatIter::<Result<format::Resp, format::Error>>::from(&self.to[..])
+    }
+    pub fn pop_from(&mut self) {
+        let mut from_iter = self.iter_from();
+        if let Some(op) = from_iter.next() {
+            self.from.drain(..op.len());
+        }
     }
     pub fn push_to(&mut self, response: Result<format::Resp, format::Error>) {
-        self.from_head += format::RequestOp::from_bytes(&self.from[self.from_head..])
-            .unwrap()
-            .len();
         let to_len = self.to.len();
         self.to.resize(to_len + response.len(), 0);
         response.write_to_buf(&mut self.to[to_len..]);

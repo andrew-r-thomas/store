@@ -6,7 +6,7 @@
 //
 // use crate::{
 //     io::{self, IOFace},
-//     mesh, page, txn,
+//     mesh, page,
 // };
 //
 // /// this is the central coordinator for the entire system, it runs on the main thread, literally
@@ -38,6 +38,9 @@
 // }
 // impl<M: mesh::Mesh, IO: io::IOFace> Central<M, IO> {
 //     pub fn tick(&mut self) {
+//         // TODO: should probably move the initial accept logic to a setup function or something
+//         self.io.register_sub(io::Sub::Accept {});
+//
 //         // handle any io results
 //         for comp in self.io.poll() {
 //             match comp {
@@ -45,8 +48,6 @@
 //                     // just one shard for now, this will get swapped with load balancing logic
 //                     // eventually
 //                     self.mesh.push(mesh::Msg::NewConnection(conn_id), 1);
-//
-//                     self.io.register_sub(io::Sub::Accept {});
 //                 }
 //                 io::Comp::FileRead { .. } | io::Comp::FileWrite { .. } => todo!("wal stuff"),
 //                 c => panic!("invalid io completion in central {:?}", c),
@@ -98,7 +99,7 @@
 // impl TxnProcessor {
 //     pub fn process_commits<M: mesh::Mesh>(
 //         &mut self,
-//         commits: Vec<(usize, txn::Transaction)>,
+//         commits: Vec<(usize, Vec<u8>)>,
 //         commit_timestamp: u64,
 //         active_txns: &mut collections::BTreeMap<u64, (u64, collections::BTreeSet<Vec<u8>>)>,
 //         mesh: &mut M,
@@ -212,13 +213,7 @@
 //                     if commit.waiting_on.is_empty() {
 //                         let commit = self.queued_successful.remove(&txn_id).unwrap();
 //                         // TODO: we also will need to wait on WAL fsync
-//                         mesh.push(
-//                             mesh::Msg::CommitResponse {
-//                                 txn: commit.txn,
-//                                 success: true,
-//                             },
-//                             commit.from,
-//                         );
+//                         mesh.push(mesh::Msg::CommitResponse { success: true }, commit.from);
 //                     }
 //                 }
 //                 Err(_) => todo!("implement central error handling for txn write failures"),
@@ -229,7 +224,7 @@
 // pub struct Commit {
 //     from: usize,
 //     waiting_on: collections::BTreeSet<usize>,
-//     txn: txn::Transaction,
+//     writes: Vec<u8>,
 // }
 //
 // /// NOTE this function adds 1 to the final output, since the 0 index is used for [`Central`]
