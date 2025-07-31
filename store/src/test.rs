@@ -1,11 +1,16 @@
 #![cfg(test)]
 
 use crate::{
+    central,
     format::{self, Format},
-    io, mesh, shard,
+    io::{self, IOFace},
+    mesh, shard,
 };
 
-use std::io::{Read, Seek, Write};
+use std::{
+    io::{Read, Seek, Write},
+    sync::{self, atomic},
+};
 
 use rand::{
     Rng, SeedableRng,
@@ -35,6 +40,8 @@ fn scratch() {
     const NUM_BLOCK_BUFS: usize = 4;
     const NUM_NET_BUFS: usize = 1024;
 
+    const QUEUE_SIZE: usize = 128;
+
     run_sim(
         SEED,
         KEY_LEN_RANGE,
@@ -50,6 +57,7 @@ fn scratch() {
         NET_BUF_SIZE,
         FREE_CAP_TARGET,
         BLOCK_CAP,
+        QUEUE_SIZE,
     );
 }
 
@@ -70,20 +78,23 @@ pub fn run_sim(
     net_buf_size: usize,
     free_cap_target: usize,
     block_cap: u64,
+    queue_size: usize,
 ) {
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
 
+    let committed_ts = sync::Arc::new(atomic::AtomicU64::new(0));
+    let oldest_active_ts = sync::Arc::new(atomic::AtomicU64::new(0));
+
+    let mut meshes = mesh::Mesh::new(queue_size, 1);
+
+    // setup shard
     let io = TestIO {
         file: std::io::Cursor::new(vec![0; block_cap as usize]),
         comps: Vec::new(),
         pending_subs: Vec::new(),
         subs: Vec::new(),
-        conns: std::collections::BTreeMap::new(),
     };
-    let mesh = TestMesh::new(1);
-
-    // setup shard
-    let mut shard = shard::Shard::new(
+    let shard = shard::Shard::new(
         page_size,
         buf_pool_size,
         block_size,
@@ -93,38 +104,69 @@ pub fn run_sim(
         free_cap_target,
         block_cap,
         io,
-        mesh,
+        meshes.pop().unwrap(),
+        committed_ts.clone(),
+        oldest_active_ts.clone(),
     );
 
-    // for now we'll just set up all the clients up front
-    for conn_id in 0..num_clients as u32 {
-        let conn = TestConn::new();
-        shard.io.conns.insert(crate::ConnId(conn_id), conn);
-        shard
-            .mesh
-            .push_from(mesh::Msg::NewConnection(crate::ConnId(conn_id)), 0);
-    }
+    let io = TestIO {
+        file: std::io::Cursor::new(vec![0; block_cap as usize]),
+        comps: Vec::new(),
+        pending_subs: Vec::new(),
+        subs: Vec::new(),
+    };
 
-    while shard.io.conns.len() > 0 {
-        let id = rng.random_range(0..num_clients as u32 + 1);
-        if id >= num_clients as u32 {
-            shard.tick();
-            shard.io.process_subs();
+    // setup central
+    let central = central::Central::new(
+        committed_ts.clone(),
+        oldest_active_ts.clone(),
+        io,
+        meshes.pop().unwrap(),
+    );
+
+    let mut store_node = Node {
+        workers: vec![
+            StoreNodeWorker::Central(central),
+            StoreNodeWorker::Shard(shard),
+        ],
+    };
+
+    let mut query_node = Node {
+        workers: Vec::from_iter((0..num_clients).map(|_| {
+            TestConn::new(
+                num_ingest,
+                num_ops,
+                seed,
+                key_len_range.clone(),
+                val_len_range.clone(),
+            )
+        })),
+    };
+
+    loop {
+        // run one of the nodes
+        if rng.random() {
+            // run store
+            let worker = store_node.workers.choose_mut(&mut rng).unwrap();
+            worker.tick();
+            match worker {
+                StoreNodeWorker::Central(central) => central.io.process_subs(),
+                StoreNodeWorker::Shard(shard) => shard.io.process_subs(),
+            }
         } else {
-            if let Some(conn) = shard.io.conns.get_mut(&crate::ConnId(id)) {
-                conn.tick(
-                    num_ingest,
-                    num_ops,
-                    &mut rng,
-                    key_len_range.clone(),
-                    val_len_range.clone(),
-                );
-                if conn.is_done(num_ingest, num_ops) {
-                    println!("conn {id} done!");
-                    shard.io.conns.remove(&crate::ConnId(id)).unwrap();
-                }
+            // run query node
+            if query_node.workers.len() == 0 {
+                break;
+            }
+            let i = rng.random_range(0..query_node.workers.len());
+            let worker = &mut query_node.workers[i];
+            worker.tick();
+            if worker.is_done() {
+                query_node.workers.remove(i);
             }
         }
+
+        // run io (this will get more creative later)
     }
 }
 
@@ -134,33 +176,48 @@ struct TestConn {
     from_shard: std::collections::VecDeque<u8>,
     expected: std::collections::VecDeque<Vec<u8>>,
     ticks: usize,
+    num_ingest: usize,
+    num_ops: usize,
+    key_len_range: std::ops::Range<usize>,
+    val_len_range: std::ops::Range<usize>,
+    rng: rand_chacha::ChaCha8Rng,
 }
 impl TestConn {
-    fn new() -> Self {
+    fn new(
+        num_ingest: usize,
+        num_ops: usize,
+        seed: u64,
+        key_len_range: std::ops::Range<usize>,
+        val_len_range: std::ops::Range<usize>,
+    ) -> Self {
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
         Self {
             entries: Vec::new(),
             to_shard: std::collections::VecDeque::new(),
             from_shard: std::collections::VecDeque::new(),
             expected: std::collections::VecDeque::new(),
             ticks: 0,
+            num_ingest,
+            num_ops,
+            key_len_range,
+            val_len_range,
+            rng,
         }
     }
-    fn tick(
-        &mut self,
-        num_ingest: usize,
-        num_ops: usize,
-        rng: &mut rand_chacha::ChaCha8Rng,
-        key_len_range: std::ops::Range<usize>,
-        val_len_range: std::ops::Range<usize>,
-    ) {
-        if self.ticks < num_ingest {
+    fn is_done(&self) -> bool {
+        (self.ticks >= self.num_ingest + self.num_ops) && self.expected.is_empty()
+    }
+}
+impl Tick for TestConn {
+    fn tick(&mut self) {
+        if self.ticks < self.num_ingest {
             // do an ingest
-            let key_len = rng.random_range(key_len_range);
-            let val_len = rng.random_range(val_len_range);
+            let key_len = self.rng.random_range(self.key_len_range.clone());
+            let val_len = self.rng.random_range(self.val_len_range.clone());
             let mut key = vec![0; key_len];
             let mut val = vec![0; val_len];
-            rng.fill(&mut key[..]);
-            rng.fill(&mut val[..]);
+            self.rng.fill(&mut key[..]);
+            self.rng.fill(&mut val[..]);
 
             let req = format::Request {
                 txn_id: crate::ConnTxnId(1),
@@ -180,18 +237,18 @@ impl TestConn {
 
             self.entries.push((key, val));
             self.expected.push_back(expected_resp.to_vec());
-        } else if self.ticks < num_ingest + num_ops {
+        } else if self.ticks < self.num_ingest + self.num_ops {
             // do an op
             let ops = ["insert", "update", "get", "del"];
-            let chosen_op = ops.choose(rng).unwrap();
+            let chosen_op = ops.choose(&mut self.rng).unwrap();
             match *chosen_op {
                 "insert" => {
-                    let key_len = rng.random_range(key_len_range.clone());
-                    let val_len = rng.random_range(val_len_range.clone());
+                    let key_len = self.rng.random_range(self.key_len_range.clone());
+                    let val_len = self.rng.random_range(self.val_len_range.clone());
                     let mut key = vec![0; key_len];
                     let mut val = vec![0; val_len];
-                    rng.fill(&mut key[..]);
-                    rng.fill(&mut val[..]);
+                    self.rng.fill(&mut key[..]);
+                    self.rng.fill(&mut val[..]);
 
                     let req = format::Request {
                         txn_id: crate::ConnTxnId(1),
@@ -213,10 +270,10 @@ impl TestConn {
                     self.expected.push_back(expected_resp.to_vec());
                 }
                 "update" => {
-                    let (key, val) = self.entries.choose_mut(rng).unwrap();
-                    let new_val_len = rng.random_range(val_len_range.clone());
+                    let (key, val) = self.entries.choose_mut(&mut self.rng).unwrap();
+                    let new_val_len = self.rng.random_range(self.val_len_range.clone());
                     let mut new_val = vec![0; new_val_len];
-                    rng.fill(&mut new_val[..]);
+                    self.rng.fill(&mut new_val[..]);
                     *val = new_val;
 
                     let req = format::Request {
@@ -238,7 +295,7 @@ impl TestConn {
                     self.expected.push_back(expected_resp.to_vec());
                 }
                 "get" => {
-                    let (key, val) = self.entries.choose(rng).unwrap();
+                    let (key, val) = self.entries.choose(&mut self.rng).unwrap();
 
                     let req = format::Request {
                         txn_id: crate::ConnTxnId(1),
@@ -258,7 +315,7 @@ impl TestConn {
                     self.expected.push_back(expected_resp.to_vec());
                 }
                 "del" => {
-                    let idx = rng.random_range(0..self.entries.len());
+                    let idx = self.rng.random_range(0..self.entries.len());
                     let (key, _) = self.entries.remove(idx);
 
                     let req = format::Request {
@@ -295,14 +352,10 @@ impl TestConn {
 
         self.ticks += 1;
     }
-    fn is_done(&self, num_ingest: usize, num_ops: usize) -> bool {
-        (self.ticks >= num_ingest + num_ops) && self.expected.is_empty()
-    }
 }
 
 struct TestIO {
     file: std::io::Cursor<Vec<u8>>,
-    conns: std::collections::BTreeMap<crate::ConnId, TestConn>,
 
     subs: Vec<io::Sub>,
     pending_subs: Vec<io::Sub>,
@@ -373,28 +426,25 @@ impl io::IOFace for TestIO {
     }
 }
 
-struct TestMesh {
-    to: Vec<Vec<mesh::Msg>>,
-    from: Vec<Vec<mesh::Msg>>,
+/// a logical "node" in a network
+pub struct Node<T: Tick> {
+    workers: Vec<T>,
 }
-impl TestMesh {
-    pub fn new(num_shards: usize) -> Self {
-        Self {
-            to: Vec::from_iter((0..num_shards + 1).map(|_| Vec::new())),
-            from: Vec::from_iter((0..num_shards + 1).map(|_| Vec::new())),
+
+pub trait Tick {
+    fn tick(&mut self);
+}
+
+pub enum StoreNodeWorker<IO: IOFace> {
+    Central(central::Central<IO>),
+    Shard(shard::Shard<IO>),
+}
+
+impl<IO: IOFace> Tick for StoreNodeWorker<IO> {
+    fn tick(&mut self) {
+        match self {
+            Self::Central(central) => central.tick(),
+            Self::Shard(shard) => shard.tick(),
         }
-    }
-    pub fn push_from(&mut self, msg: mesh::Msg, from: usize) {
-        self.from[from].push(msg);
-    }
-}
-impl mesh::Mesh for TestMesh {
-    fn poll(&mut self) -> Vec<Vec<mesh::Msg>> {
-        let out = self.from.clone();
-        self.from.clear();
-        out
-    }
-    fn push(&mut self, msg: mesh::Msg, to: usize) {
-        self.to[to].push(msg);
     }
 }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    PageId,
+    PageId, central,
     format::{self, Format},
     io, mesh, page,
 };
@@ -19,7 +19,7 @@ const CENTRAL_ID: usize = 0;
 /// eventually though
 ///
 /// need to make sure we're keeping the ordering of txn ops, wrt to responses too
-pub struct Shard<I: io::IOFace, M: mesh::Mesh> {
+pub struct Shard<I: io::IOFace> {
     // page cache
     pub page_dir: PageDir,
     pub buf_pool: Vec<page::PageBuffer>,
@@ -36,13 +36,13 @@ pub struct Shard<I: io::IOFace, M: mesh::Mesh> {
     pub net_buf_size: usize,
 
     // sys stuff
-    pub mesh: M,
+    pub mesh: mesh::Mesh,
     pub runs: usize,
     pub committed_ts: sync::Arc<atomic::AtomicU64>,
     pub oldest_active_ts: sync::Arc<atomic::AtomicU64>,
-    pub pending_commits: collections::BTreeMap<crate::Timestamp, Vec<mesh::Commit>>,
+    pub pending_commits: collections::BTreeMap<crate::Timestamp, Vec<central::Commit>>,
 }
-impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
+impl<I: io::IOFace> Shard<I> {
     pub fn new(
         page_size: usize,
         buf_pool_size: usize,
@@ -53,7 +53,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
         free_cap_target: usize,
         block_cap: u64,
         io: I,
-        mesh: M,
+        mesh: mesh::Mesh,
         committed_ts: sync::Arc<atomic::AtomicU64>,
         oldest_active_ts: sync::Arc<atomic::AtomicU64>,
     ) -> Self {
@@ -116,10 +116,10 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                     }
                     mesh::Msg::CommitResponse { .. } => todo!(),
                     mesh::Msg::WriteRequest(commit) => {
-                        match self.pending_commits.get_mut(&commit.ts) {
+                        match self.pending_commits.get_mut(&commit.commit_ts) {
                             Some(v) => v.push(commit),
                             None => {
-                                self.pending_commits.insert(commit.ts, vec![commit]);
+                                self.pending_commits.insert(commit.commit_ts, vec![commit]);
                             }
                         }
                     }
@@ -287,6 +287,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                                 self.mesh.push(
                                     mesh::Msg::CommitRequest {
                                         txn_id,
+                                        start_ts: txn.start_ts,
                                         writes: txn.writes.clone(),
                                     },
                                     CENTRAL_ID,
@@ -350,7 +351,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                     for write_op in format::FormatIter::<format::WriteOp>::from(&commit.writes[..])
                     {
                         let write = format::PageWrite {
-                            ts: commit.ts,
+                            ts: commit.commit_ts,
                             write: write_op,
                         };
                         apply_write(
@@ -363,13 +364,7 @@ impl<I: io::IOFace, M: mesh::Mesh> Shard<I, M> {
                         );
                     }
 
-                    self.mesh.push(
-                        mesh::Msg::WriteResponse {
-                            txn_id: commit.txn_id,
-                            writes: commit.writes,
-                        },
-                        CENTRAL_ID,
-                    );
+                    self.mesh.push(mesh::Msg::WriteResponse(commit), CENTRAL_ID);
                 }
             } else {
                 self.pending_commits.insert(ts, commits);
@@ -480,18 +475,6 @@ impl PageDir {
     }
 }
 
-pub struct Ops {
-    reads: collections::BTreeMap<crate::PageId, ReadGroup>,
-    // writes: Vec<(crate::ShardTxnId, Vec<u8>)>,
-}
-impl Ops {
-    pub fn new() -> Self {
-        Self {
-            reads: collections::BTreeMap::new(),
-            // writes: Vec::new(),
-        }
-    }
-}
 /// a bunch of [`format::ReadOp`]s for keys in the same page
 pub struct ReadGroup {
     page_idx: usize,

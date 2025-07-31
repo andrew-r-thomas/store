@@ -1,6 +1,9 @@
 #![feature(phantom_variance_markers)]
 
-use std::mem;
+use std::{
+    hash::{Hash, Hasher},
+    mem,
+};
 
 pub mod central;
 pub mod format;
@@ -39,9 +42,6 @@ impl<'f> format::Format<'f> for PageId {
 pub struct ConnId(u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ShardId(usize);
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConnTxnId(u64);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,7 +53,7 @@ pub struct ShardTxnId {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GlobalTxnId {
     shard_txn_id: ShardTxnId,
-    shard_id: ShardId,
+    shard_id: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
@@ -77,4 +77,13 @@ impl<'f> format::Format<'f> for Timestamp {
         assert_eq!(buf.len(), self.len());
         buf[0..Self::SIZE].copy_from_slice(&self.0.to_be_bytes());
     }
+}
+
+/// NOTE this function adds 1 to the final output, since the 0 index is used for [`Central`]
+#[inline]
+pub fn find_shard(key: &[u8], num_shards: usize) -> usize {
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    key.hash(&mut hasher);
+    let hash = hasher.finish();
+    ((hash as usize) % num_shards) + 1
 }

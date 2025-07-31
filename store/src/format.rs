@@ -23,6 +23,7 @@ pub trait Format<'f>: Copy + fmt::Debug {
 ///
 /// format:
 /// `[ F 1 ][ F 2 ][ ... ][ F n ]`
+#[derive(Clone, Copy)]
 pub struct FormatIter<'f, F: Format<'f>> {
     buf: &'f [u8],
     cursor: usize,
