@@ -58,7 +58,7 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
         conn_bufs: collections::BTreeMap::new(),
     }));
     let storage_manager = rc::Rc::new(cell::RefCell::new(TestStorageManager {
-        shard_files: collections::BTreeMap::new(),
+        shard_files: collections::BTreeMap::from([(1, std::io::Cursor::new(Vec::new()))]),
     }));
 
     // setup shard
@@ -140,17 +140,19 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
             }
         }
 
-        let nm = network_manager.borrow();
-        let mut total_from_conns = 0;
-        let mut total_to_conns = 0;
-        for (_, cb) in &nm.conn_bufs {
-            total_from_conns += cb.from_conn.len();
-            total_to_conns += cb.to_conn.len();
-        }
-        if total_from_conns > 0 || total_to_conns > 0 {
-            println!("total from: {total_from_conns}, total to: {total_to_conns}");
-        }
+        // let nm = network_manager.borrow();
+        // let mut total_from_conns = 0;
+        // let mut total_to_conns = 0;
+        // for (_, cb) in &nm.conn_bufs {
+        //     total_from_conns += cb.from_conn.len();
+        //     total_to_conns += cb.to_conn.len();
+        // }
+        // if total_from_conns > 0 || total_to_conns > 0 {
+        //     println!("total from: {total_from_conns}, total to: {total_to_conns}");
+        // }
     }
+
+    println!("test completed successfully!");
 }
 
 struct TestConn {
@@ -427,6 +429,7 @@ impl TestIO {
         for sub in self.subs.drain(..) {
             match sub {
                 io::Sub::FileRead { mut buf, offset } => {
+                    println!("reading from file!");
                     let mut storage_manager = self.storage_manager.borrow_mut();
                     let file = storage_manager.shard_files.get_mut(&self.id).unwrap();
                     file.seek(std::io::SeekFrom::Start(offset)).unwrap();
@@ -434,6 +437,7 @@ impl TestIO {
                     self.comps.push(io::Comp::FileRead { buf, offset });
                 }
                 io::Sub::FileWrite { buf, offset } => {
+                    println!("writing to file!");
                     let mut storage_manager = self.storage_manager.borrow_mut();
                     let file = storage_manager.shard_files.get_mut(&self.id).unwrap();
                     file.seek(std::io::SeekFrom::Start(offset)).unwrap();

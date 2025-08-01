@@ -119,8 +119,8 @@ impl<I: io::IOFace> Shard<I> {
                                 txn_queue.push_to(Err(format::Error::Conflict));
                             }
                         }
+                        txn_queue.pop_from();
                         txn_queue.sealed = false;
-                        println!("got commit response!");
                         self.txns.remove(&txn_id).unwrap();
                     }
                     mesh::Msg::WriteRequest(commit) => {
@@ -295,7 +295,6 @@ impl<I: io::IOFace> Shard<I> {
                                 txn_queue.pop_from();
                             }
                             format::RequestOp::Commit => {
-                                txn_queue.pop_from();
                                 txn_queue.sealed = true;
                                 self.mesh.push(
                                     mesh::Msg::CommitRequest {
@@ -418,11 +417,11 @@ impl<I: io::IOFace> Shard<I> {
 
         self.runs += 1;
 
-        // println!(
-        //     "completed pipeline {}, {read_len} reads, {commit_len} commits, {} queued pages",
-        //     self.runs,
-        //     self.storage_manager.pend_blocks.page_requests.len(),
-        // );
+        println!(
+            "completed pipeline {}, {read_len} reads, {commit_len} commits, {} queued pages",
+            self.runs,
+            self.storage_manager.pend_blocks.page_requests.len(),
+        );
         // let mut total_live_txns = 0;
         // let mut total_live_from = 0;
         // let mut total_live_to = 0;

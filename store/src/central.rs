@@ -84,10 +84,19 @@ impl<IO: io::IOFace> Central<IO> {
                         start_ts,
                         writes,
                     } => {
-                        // first check for conflicts
                         let mut keys_iter =
                             format::FormatIter::<format::WriteOp>::from(&writes[..]);
-                        if keys_iter.any(|w| {
+                        if writes.len() == 0 {
+                            self.mesh.push(
+                                mesh::Msg::CommitResponse {
+                                    txn_id,
+                                    res: Ok(()),
+                                },
+                                from,
+                            );
+                        } else if keys_iter.any(|w| {
+                            // check for conflicts
+                            //
                             // if anything has been committed for any of the keys in this txn since
                             // it started, fail the commit (write-write conflict)
                             self.recent_commits

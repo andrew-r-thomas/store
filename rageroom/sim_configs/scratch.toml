@@ -4,4 +4,4 @@ val_len_range = { start = 512, end = 1024 }
 
 num_clients = 8
 num_ingest = 1024
-num_batches = 4096
+num_batches = 8192
