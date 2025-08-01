@@ -98,6 +98,7 @@ impl Conn {
                             TxnQueue {
                                 from: buf,
                                 to: Vec::new(),
+                                sealed: false,
                             },
                         );
                     }
@@ -140,6 +141,7 @@ impl Conn {
 pub struct TxnQueue {
     pub from: Vec<u8>,
     pub to: Vec<u8>,
+    pub sealed: bool,
 }
 impl TxnQueue {
     pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {

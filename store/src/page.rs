@@ -1,12 +1,9 @@
-use std::{alloc, slice};
+use std::{alloc, collections, slice};
 
 use crate::{
     PageId,
     format::{self, Format},
 };
-
-#[cfg(test)]
-use crate::test;
 
 pub struct PageBuffer {
     ptr: *mut u8,
@@ -98,6 +95,8 @@ impl PageMut {
         }
     }
     pub fn compact(&mut self, mut page: format::Page, oldest_active_ts: crate::Timestamp) {
+        assert!(self.ops.len() == 0);
+        assert!(self.entries.len() == 0);
         // build up the base page
         self.left_pid = page.left_pid;
         self.right_pid = page.right_pid;
@@ -125,10 +124,12 @@ impl PageMut {
                 }
 
                 // add anything newer than oldest active to self.ops
+                let mut last = None;
                 while let Some(op) = page.ops.next() {
                     match op {
                         format::PageOp::Write(page_write) => {
                             if page_write.ts < oldest_active_ts {
+                                last = Some(op);
                                 break;
                             }
                             let old_len = self.ops.len();
@@ -142,6 +143,9 @@ impl PageMut {
                 // apply ops older than oldest active to entries (actual compaction)
                 let mut remaining = page.ops.collect::<Vec<_>>();
                 while let Some(op) = remaining.pop() {
+                    self.apply_op(op);
+                }
+                if let Some(op) = last {
                     self.apply_op(op);
                 }
             }
@@ -255,25 +259,37 @@ impl PageMut {
         let mut other = Self::new(self.page_size, to_pid);
         other.left_pid = self.left_pid;
 
-        let middle_entry_i = self.entries.len() / 2;
-        let mut i = 0;
-        while i < middle_entry_i {
-            let (k, v) = self.entries.pop_first().unwrap();
+        // first we find the middle key
+        let mut keys = collections::BTreeSet::new();
+        let op_iter = format::FormatIter::<format::PageWrite>::from(&self.ops[..]);
+        for op in op_iter {
+            keys.insert(op.key().to_vec());
+        }
+        for (key, _) in &self.entries {
+            keys.insert(key.clone());
+        }
+
+        let middle_key_i = keys.len() / 2;
+        while keys.len() > middle_key_i + 1 {
+            keys.pop_first().unwrap();
+        }
+        let middle_key = keys.pop_first().unwrap();
+        middle_key_buf.extend(&middle_key);
+
+        while let Some((k, v)) = self.entries.pop_first() {
+            if k > middle_key {
+                self.entries.insert(k, v);
+                break;
+            }
             let entry = format::LeafEntry { key: &k, val: &v };
             self.total_compacted_size -= entry.len();
             other.total_compacted_size += entry.len();
             other.entries.insert(k, v);
-            i += 1;
         }
-        let (k, v) = self.entries.pop_first().unwrap();
-        let middle_entry = format::LeafEntry { key: &k, val: &v };
-        middle_key_buf.extend(middle_entry.key);
-        self.total_compacted_size -= middle_entry.len();
-        other.total_compacted_size += middle_entry.len();
 
         let mut new_self_ops = Vec::new();
         for op in format::FormatIter::<'_, format::PageWrite<'_>>::from(&self.ops[..]) {
-            if op.key() <= &k {
+            if op.key() <= &middle_key[..] {
                 let old_len = other.ops.len();
                 other.ops.resize(old_len + op.len(), 0);
                 op.write_to_buf(&mut other.ops[old_len..old_len + op.len()]);
@@ -284,7 +300,7 @@ impl PageMut {
             }
         }
 
-        other.entries.insert(k, v);
+        self.ops = new_self_ops;
 
         other
     }
@@ -315,6 +331,7 @@ impl PageMut {
         buf[cursor..cursor + self.ops.len()].copy_from_slice(&self.ops);
         cursor += self.ops.len();
 
+        let entries_start = cursor;
         for (k, v) in self.entries.iter() {
             if self.left_pid.0 == u64::MAX {
                 let entry = format::InnerEntry {
@@ -331,7 +348,7 @@ impl PageMut {
         }
 
         buf[cursor..cursor + format::Page::ENTRIES_LEN_SIZE]
-            .copy_from_slice(&(cursor as u64).to_be_bytes());
+            .copy_from_slice(&((cursor - entries_start) as u64).to_be_bytes());
         cursor += format::Page::ENTRIES_LEN_SIZE;
         buf[cursor..cursor + format::PID_SIZE].copy_from_slice(&self.left_pid.0.to_be_bytes());
         cursor += format::PID_SIZE;

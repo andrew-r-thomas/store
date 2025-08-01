@@ -26,13 +26,8 @@ use crate::{
 pub struct Central<IO: io::IOFace> {
     pub committed_ts: sync::Arc<atomic::AtomicU64>,
     pub oldest_active_ts: sync::Arc<atomic::AtomicU64>,
-    /// map from timestamp to (count, writes)
-    /// when count == 0, we remove (no more active txns which started at this ts)
-    /// writes are used for conflict detection when processing commit requests
-    ///
-    /// TODO this is a bad name
-    pub active_committed:
-        collections::BTreeMap<crate::Timestamp, (u64, collections::BTreeSet<Vec<u8>>)>,
+    pub active_timestamps: collections::BTreeMap<crate::Timestamp, u64>,
+    pub recent_commits: collections::BTreeMap<crate::Timestamp, collections::BTreeSet<Vec<u8>>>,
     pub txn_processor: TxnProcessor,
     /// ok so we need some incremental state for successful txns because they will involve waiting
     /// for io potentially, and waiting on responses from shards
@@ -54,7 +49,8 @@ impl<IO: io::IOFace> Central<IO> {
             txn_processor: TxnProcessor {
                 queued_successful: collections::BTreeMap::new(),
             },
-            active_committed: collections::BTreeMap::new(),
+            active_timestamps: collections::BTreeMap::new(),
+            recent_commits: collections::BTreeMap::new(),
         }
     }
     pub fn tick(&mut self) {
@@ -94,9 +90,9 @@ impl<IO: io::IOFace> Central<IO> {
                         if keys_iter.any(|w| {
                             // if anything has been committed for any of the keys in this txn since
                             // it started, fail the commit (write-write conflict)
-                            self.active_committed
+                            self.recent_commits
                                 .range(crate::Timestamp(start_ts.0 + 1)..)
-                                .any(|(_, (_, keys))| keys.contains(w.key()))
+                                .any(|(_, keys)| keys.contains(w.key()))
                         }) {
                             self.mesh.push(
                                 mesh::Msg::CommitResponse {
@@ -106,10 +102,10 @@ impl<IO: io::IOFace> Central<IO> {
                                 from,
                             );
                         } else {
-                            let (_, commit_ts_writes) = self
-                                .active_committed
+                            let commit_ts_writes = self
+                                .recent_commits
                                 .entry(commit_timestamp)
-                                .or_insert((0, collections::BTreeSet::new()));
+                                .or_insert(collections::BTreeSet::new());
                             for key in keys_iter {
                                 commit_ts_writes.insert(key.to_vec());
                             }
@@ -123,18 +119,18 @@ impl<IO: io::IOFace> Central<IO> {
                             });
                         }
 
-                        if let Some((count, _)) = self.active_committed.get_mut(&start_ts) {
+                        if let Some(count) = self.active_timestamps.get_mut(&start_ts) {
                             *count -= 1;
                             if *count == 0 {
-                                self.active_committed.remove(&start_ts);
+                                self.active_timestamps.remove(&start_ts);
                             }
                         }
                     }
                     mesh::Msg::TxnStart(timestamp) => {
-                        self.active_committed
+                        self.active_timestamps
                             .entry(timestamp)
-                            .and_modify(|(count, _)| *count += 1)
-                            .or_insert((1, collections::BTreeSet::new()));
+                            .and_modify(|count| *count += 1)
+                            .or_insert(1);
                     }
                     mesh::Msg::WriteResponse(commit) => {
                         finished_writes.push((from, commit));
@@ -145,9 +141,10 @@ impl<IO: io::IOFace> Central<IO> {
         }
 
         // update oldest active timestamp
-        if let Some(oldest_active) = self.active_committed.first_key_value() {
+        if let Some(oldest_active) = self.active_timestamps.first_key_value() {
             self.oldest_active_ts
                 .store(oldest_active.0.0, atomic::Ordering::Release);
+            self.recent_commits = self.recent_commits.split_off(oldest_active.0);
         }
 
         // process batch of commits and writes

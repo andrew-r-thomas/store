@@ -4,14 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# literally only used in one place for sorting an iterator,
+# probably want to try and get rid of this
 itertools = "0.14.0"
-libc = "0.2.172"
+# spsc wait free fifo, used in mesh
 rtrb = "0.3.2"
+# hash function for finding which shards are responsible for which keys
 twox-hash = "2.1.1"
+# the next two are only used for config parsing/updating
+serde = { version = "1.0.219", features = ["derive"] }
+toml = "0.9.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# tokio's io_uring library, seems pretty minimal and has a reasonable interface
 io-uring = "0.7"
-
-[dev-dependencies]
-rand = "0.9.0"
-rand_chacha = "0.9.0"
+# for memory management and linux stuff
+libc = "0.2.172"

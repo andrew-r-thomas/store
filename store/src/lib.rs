@@ -1,19 +1,15 @@
-#![feature(phantom_variance_markers)]
-
 use std::{
     hash::{Hash, Hasher},
     mem,
 };
 
 pub mod central;
+pub mod config;
 pub mod format;
 pub mod io;
 pub mod mesh;
 pub mod page;
 pub mod shard;
-
-#[cfg(test)]
-pub mod test;
 
 #[derive(Copy, Clone, Debug, Ord, Eq, PartialEq, PartialOrd)]
 pub struct PageId(u64);
@@ -39,27 +35,27 @@ impl<'f> format::Format<'f> for PageId {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConnId(u32);
+pub struct ConnId(pub u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConnTxnId(u64);
+pub struct ConnTxnId(pub u64);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShardTxnId {
-    conn_txn_id: ConnTxnId,
-    conn_id: ConnId,
+    pub conn_txn_id: ConnTxnId,
+    pub conn_id: ConnId,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GlobalTxnId {
-    shard_txn_id: ShardTxnId,
-    shard_id: usize,
+    pub shard_txn_id: ShardTxnId,
+    pub shard_id: usize,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq, Ord)]
-pub struct Timestamp(u64);
+pub struct Timestamp(pub u64);
 impl Timestamp {
-    const SIZE: usize = mem::size_of::<u64>();
+    pub const SIZE: usize = mem::size_of::<u64>();
 }
 impl<'f> format::Format<'f> for Timestamp {
     fn len(&self) -> usize {

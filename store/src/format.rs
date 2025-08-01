@@ -506,11 +506,13 @@ pub enum Error {
     EOF,
     InvalidCode,
     CorruptData,
+    Conflict,
 }
 impl Error {
     const EOF_CODE: u8 = 101;
     const INVALID_CODE_CODE: u8 = 102;
     const CORRUPT_DATA_CODE: u8 = 103;
+    const CONFLICT_CODE: u8 = 104;
 }
 impl<'e> Format<'e> for Error {
     fn len(&self) -> usize {
@@ -522,6 +524,7 @@ impl<'e> Format<'e> for Error {
             Self::EOF_CODE => Ok(Self::EOF),
             Self::INVALID_CODE_CODE => Ok(Self::InvalidCode),
             Self::CORRUPT_DATA_CODE => Ok(Self::CorruptData),
+            Self::CONFLICT_CODE => Ok(Self::Conflict),
             _ => Err(Error::InvalidCode),
         }
     }
@@ -531,6 +534,7 @@ impl<'e> Format<'e> for Error {
             Self::EOF => buf[0] = Self::EOF_CODE,
             Self::InvalidCode => buf[0] = Self::INVALID_CODE_CODE,
             Self::CorruptData => buf[0] = Self::CORRUPT_DATA_CODE,
+            Self::Conflict => buf[0] = Self::CONFLICT_CODE,
         }
     }
 }
@@ -647,7 +651,7 @@ impl<'p> Format<'p> for PageWrite<'p> {
         assert_eq!(self.len(), buf.len());
 
         let mut cursor = 0;
-        self.write.write_to_buf(&mut buf[cursor..]);
+        self.write.write_to_buf(&mut buf[cursor..self.write.len()]);
         cursor += self.write.len();
         self.ts
             .write_to_buf(&mut buf[cursor..cursor + self.ts.len()]);
@@ -797,8 +801,29 @@ impl<'p> From<&'p [u8]> for Page<'p> {
         ) as usize;
         cursor -= Self::ENTRIES_LEN_SIZE;
 
-        let ops = FormatIter::from(&buf[..cursor - base_len]);
+        let mut ops = FormatIter::from(&buf[..cursor - base_len]);
         let entries = Entries::from(&buf[cursor - base_len..cursor]);
+
+        // invariant
+        if left_pid.0 != u64::MAX {
+            // leaf pages need ops to be in timestamp order
+            if let Some(op) = ops.next() {
+                let mut prev = match op {
+                    PageOp::Write(page_write) => page_write.ts,
+                    PageOp::SMO(_) => panic!("smo in leaf page!"),
+                };
+                for op in ops {
+                    match op {
+                        PageOp::Write(page_write) => {
+                            assert!(page_write.ts <= prev);
+                            prev = page_write.ts;
+                        }
+                        PageOp::SMO(_) => panic!("smo in leaf page!"),
+                    }
+                }
+                ops.reset();
+            }
+        }
 
         Self {
             ops,

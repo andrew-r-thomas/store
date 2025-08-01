@@ -4,13 +4,10 @@ use std::{
 };
 
 use crate::{
-    PageId, central,
+    PageId, central, config,
     format::{self, Format},
     io, mesh, page,
 };
-
-#[cfg(test)]
-use crate::test;
 
 const CENTRAL_ID: usize = 0;
 
@@ -24,8 +21,8 @@ pub struct Shard<I: io::IOFace> {
     pub page_dir: PageDir,
     pub buf_pool: Vec<page::PageBuffer>,
     pub free_list: Vec<usize>,
-    pub free_cap_target: usize,
-    pub page_size: usize,
+
+    pub config: config::Config,
 
     // io
     pub io: I,
@@ -33,7 +30,6 @@ pub struct Shard<I: io::IOFace> {
     pub conns: collections::BTreeMap<crate::ConnId, io::Conn>,
     pub txns: collections::BTreeMap<crate::ShardTxnId, Txn>,
     pub net_bufs: Vec<Vec<u8>>,
-    pub net_buf_size: usize,
 
     // sys stuff
     pub mesh: mesh::Mesh,
@@ -44,43 +40,39 @@ pub struct Shard<I: io::IOFace> {
 }
 impl<I: io::IOFace> Shard<I> {
     pub fn new(
-        page_size: usize,
-        buf_pool_size: usize,
-        block_size: usize,
-        num_block_bufs: usize,
-        num_net_bufs: usize,
-        net_buf_size: usize,
-        free_cap_target: usize,
-        block_cap: u64,
+        config: config::Config,
         io: I,
         mesh: mesh::Mesh,
         committed_ts: sync::Arc<atomic::AtomicU64>,
         oldest_active_ts: sync::Arc<atomic::AtomicU64>,
     ) -> Self {
-        let mut page_dir = PageDir::new(buf_pool_size, crate::PageId(1), crate::PageId(2));
-        let mut buf_pool: Vec<page::PageBuffer> = (0..buf_pool_size)
-            .map(|_| page::PageBuffer::new(page_size))
+        let mut page_dir = PageDir::new(config.buf_pool_size, crate::PageId(1), crate::PageId(2));
+        let mut buf_pool: Vec<page::PageBuffer> = (0..config.buf_pool_size)
+            .map(|_| page::PageBuffer::new(config.page_size))
             .collect();
-        let mut free_list = Vec::from_iter(0..buf_pool_size);
+        let mut free_list = Vec::from_iter(0..config.buf_pool_size);
 
         // make root
         let root_idx = free_list.pop().unwrap();
-        page::PageMut::new(page_size, crate::PageId(1)).pack(&mut buf_pool[root_idx]);
+        page::PageMut::new(config.page_size, crate::PageId(1)).pack(&mut buf_pool[root_idx]);
         page_dir.insert(page_dir.root, root_idx);
 
         Self {
             page_dir,
             buf_pool,
             free_list,
-            free_cap_target,
-            page_size,
 
             io,
-            storage_manager: io::StorageManager::new(block_size, num_block_bufs, block_cap),
+            storage_manager: io::StorageManager::new(
+                config.block_size,
+                config.num_block_bufs,
+                config.block_cap,
+            ),
             conns: collections::BTreeMap::new(),
             txns: collections::BTreeMap::new(),
-            net_bufs: Vec::from_iter((0..num_net_bufs).map(|_| vec![0; net_buf_size])),
-            net_buf_size,
+            net_bufs: Vec::from_iter(
+                (0..config.num_net_bufs).map(|_| vec![0; config.net_buf_size]),
+            ),
 
             mesh,
 
@@ -88,6 +80,8 @@ impl<I: io::IOFace> Shard<I> {
             committed_ts,
             oldest_active_ts,
             pending_commits: collections::BTreeMap::new(),
+
+            config,
         }
     }
 
@@ -114,7 +108,21 @@ impl<I: io::IOFace> Shard<I> {
                             conn_id,
                         });
                     }
-                    mesh::Msg::CommitResponse { .. } => todo!(),
+                    mesh::Msg::CommitResponse { txn_id, res } => {
+                        let conn = self.conns.get_mut(&txn_id.conn_id).unwrap();
+                        let txn_queue = conn.txns.get_mut(&txn_id.conn_txn_id).unwrap();
+                        match res {
+                            Ok(()) => {
+                                txn_queue.push_to(Ok(format::Resp::Success));
+                            }
+                            Err(()) => {
+                                txn_queue.push_to(Err(format::Error::Conflict));
+                            }
+                        }
+                        txn_queue.sealed = false;
+                        println!("got commit response!");
+                        self.txns.remove(&txn_id).unwrap();
+                    }
                     mesh::Msg::WriteRequest(commit) => {
                         match self.pending_commits.get_mut(&commit.commit_ts) {
                             Some(v) => v.push(commit),
@@ -127,6 +135,7 @@ impl<I: io::IOFace> Shard<I> {
                 }
             }
         }
+
         // from io
         for comp in self.io.poll() {
             match comp {
@@ -149,7 +158,7 @@ impl<I: io::IOFace> Shard<I> {
 
                     // reset the buf and add it back to the pool
                     buf.fill(0);
-                    buf.resize(self.net_buf_size, 0);
+                    buf.resize(self.config.net_buf_size, 0);
                     self.net_bufs.push(buf);
                 }
                 io::Comp::TcpWrite {
@@ -164,7 +173,7 @@ impl<I: io::IOFace> Shard<I> {
 
                     // reset the buf and add it back to the pool
                     buf.fill(0);
-                    buf.resize(self.net_buf_size, 0);
+                    buf.resize(self.config.net_buf_size, 0);
                     self.net_bufs.push(buf);
                 }
                 io::Comp::FileRead { mut buf, offset } => {
@@ -198,6 +207,9 @@ impl<I: io::IOFace> Shard<I> {
         {
             for (conn_id, conn) in self.conns.iter_mut() {
                 for (txn_id, txn_queue) in &mut conn.txns {
+                    if txn_queue.sealed {
+                        continue;
+                    }
                     let txn_id = crate::ShardTxnId {
                         conn_txn_id: *txn_id,
                         conn_id: *conn_id,
@@ -284,6 +296,7 @@ impl<I: io::IOFace> Shard<I> {
                             }
                             format::RequestOp::Commit => {
                                 txn_queue.pop_from();
+                                txn_queue.sealed = true;
                                 self.mesh.push(
                                     mesh::Msg::CommitRequest {
                                         txn_id,
@@ -292,7 +305,6 @@ impl<I: io::IOFace> Shard<I> {
                                     },
                                     CENTRAL_ID,
                                 );
-                                todo!("implement commit")
                             }
                         }
                     }
@@ -360,7 +372,7 @@ impl<I: io::IOFace> Shard<I> {
                             &mut self.free_list,
                             write,
                             tick_oldest_active_ts,
-                            self.page_size,
+                            self.config.page_size,
                         );
                     }
 
@@ -375,7 +387,7 @@ impl<I: io::IOFace> Shard<I> {
         let mut evicts = Vec::new();
         {
             let mut evict_cands = self.page_dir.evict_cands();
-            while self.free_list.len() < self.free_cap_target {
+            while self.free_list.len() < self.config.free_cap_target {
                 let (pid, idx) = evict_cands.next().unwrap();
                 // for now we'll just evict the best candidates, but we may have some constraints
                 // later from things like txns that prevent us from evicting certain pages
@@ -405,10 +417,37 @@ impl<I: io::IOFace> Shard<I> {
         self.io.submit();
 
         self.runs += 1;
-        println!(
-            "completed pipeline {}, {read_len} reads, {commit_len} commits",
-            self.runs
-        );
+
+        // println!(
+        //     "completed pipeline {}, {read_len} reads, {commit_len} commits, {} queued pages",
+        //     self.runs,
+        //     self.storage_manager.pend_blocks.page_requests.len(),
+        // );
+        // let mut total_live_txns = 0;
+        // let mut total_live_from = 0;
+        // let mut total_live_to = 0;
+        // let mut total_dead_txns = 0;
+        // let mut total_dead_from = 0;
+        // let mut total_dead_to = 0;
+        // for (_, conn) in &self.conns {
+        //     for (_, queue) in &conn.txns {
+        //         match queue.sealed {
+        //             true => {
+        //                 total_dead_txns += 1;
+        //                 total_dead_from += queue.from.len();
+        //                 total_dead_to += queue.to.len();
+        //             }
+        //             false => {
+        //                 total_live_txns += 1;
+        //                 total_live_from += queue.from.len();
+        //                 total_live_to += queue.to.len();
+        //             }
+        //         }
+        //     }
+        // }
+        // println!(
+        //     "total live: {total_live_txns} ({total_live_from} from, {total_live_to} to), total dead: {total_dead_txns} ({total_dead_from} from, {total_dead_to} to)"
+        // );
     }
 }
 
@@ -545,7 +584,7 @@ pub fn apply_write(
             let to_page_id = page_dir.new_page_id();
             let mut to_page = new_page.split_leaf(&mut middle_key, to_page_id);
 
-            if key <= &middle_key {
+            if key <= &middle_key[..] {
                 to_page.write_op(op).unwrap();
             } else {
                 new_page.write_op(op).unwrap();

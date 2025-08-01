@@ -1,0 +1,13 @@
+page_size = 16384      # 16kb
+buf_pool_size = 32768  # ~512mb total buffer pool memory
+free_cap_target = 6553 # ~20% of total buffer pool size
+
+block_size = 1048576 # 1mb blocks
+num_block_bufs = 4
+# 1tb total file capacity (this is a hack for now and will be removed when gc is implemented
+block_cap = 1073741824
+
+net_buf_size = 2048 # 2kb net bufs
+num_net_bufs = 1024 # lots of these
+
+queue_size = 1024
