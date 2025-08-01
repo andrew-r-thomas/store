@@ -1,9 +1,9 @@
 use std::{collections, mem, ops::Deref};
 
-use crate::{page, shard};
-
-/// this is just the offset in the file of the start of the block
-pub type BlockId = u64;
+use crate::{
+    format::{self, Format},
+    page, shard,
+};
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -14,22 +14,38 @@ pub trait IOFace {
     fn poll(&mut self) -> Vec<Comp>;
 }
 pub enum Sub {
-    TcpRead { buf: Vec<u8>, conn_id: u32 },
-    TcpWrite { buf: Vec<u8>, conn_id: u32 },
-    FileRead { buf: Vec<u8>, offset: u64 },
-    FileWrite { buf: Vec<u8>, offset: u64 },
-}
-#[derive(Clone)]
-pub enum Comp {
+    Accept {},
     TcpRead {
         buf: Vec<u8>,
-        conn_id: u32,
+        conn_id: crate::ConnId,
+    },
+    TcpWrite {
+        buf: Vec<u8>,
+        conn_id: crate::ConnId,
+    },
+    FileRead {
+        buf: Vec<u8>,
+        offset: u64,
+    },
+    FileWrite {
+        buf: Vec<u8>,
+        offset: u64,
+    },
+}
+#[derive(Clone, Debug)]
+pub enum Comp {
+    Accept {
+        conn_id: crate::ConnId,
+    },
+    TcpRead {
+        buf: Vec<u8>,
+        conn_id: crate::ConnId,
         res: i32,
         bytes: usize,
     },
     TcpWrite {
         buf: Vec<u8>,
-        conn_id: u32,
+        conn_id: crate::ConnId,
         res: i32,
     },
     FileRead {
@@ -41,79 +57,114 @@ pub enum Comp {
     },
 }
 
-pub enum Req<'r> {
-    Get(GetReq<'r>),
-    Set(SetReq<'r>),
-    Del(DelReq<'r>),
+pub struct Conn {
+    pub id: crate::ConnId,
+    pub in_buf: Vec<u8>,
+    /// ## TODO
+    /// need to answer the question of when txns get removed from this map, this is a little tricky
+    /// because it seems like two places need to think about when a txn is finished within a shard
+    /// both the connection itself, and the shard which owns it
+    pub txns: collections::BTreeMap<crate::ConnTxnId, TxnQueue>,
 }
-pub struct GetReq<'r> {
-    pub key: &'r [u8],
-}
-pub struct SetReq<'r> {
-    pub key: &'r [u8],
-    pub val: &'r [u8],
-}
-pub struct DelReq<'r> {
-    pub key: &'r [u8],
-}
-impl Req<'_> {
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Get(get_req) => 1 + 4 + get_req.key.len(),
-            Self::Set(set_req) => 1 + 4 + 4 + set_req.key.len() + set_req.val.len(),
-            Self::Del(del_req) => 1 + 4 + del_req.key.len(),
+impl Conn {
+    pub fn new(id: crate::ConnId) -> Self {
+        Self {
+            id,
+            in_buf: Vec::new(),
+            txns: collections::BTreeMap::new(),
         }
     }
-}
+    pub fn write(&mut self, buf: &[u8]) {
+        self.in_buf.extend_from_slice(buf);
+        if self.in_buf.len() > 0 {
+            let mut cursor = 0;
+            // TODO: error handling
+            // (eof means we just stop reading,
+            // but we also need to handle thing like malformed requests, etc)
+            while let Ok(request) = format::Request::from_bytes(&self.in_buf[cursor..]) {
+                cursor += request.len();
+                match self.txns.get_mut(&request.txn_id) {
+                    Some(txn_buf) => {
+                        let old_len = txn_buf.from.len();
+                        txn_buf.from.resize(old_len + request.op.len(), 0);
+                        request.op.write_to_buf(&mut txn_buf.from[old_len..]);
+                    }
+                    None => {
+                        // new txn
+                        let mut buf = vec![0; request.op.len()];
+                        request.op.write_to_buf(&mut buf);
+                        self.txns.insert(
+                            request.txn_id,
+                            TxnQueue {
+                                from: buf,
+                                to: Vec::new(),
+                                sealed: false,
+                            },
+                        );
+                    }
+                }
+            }
 
-const GET_CODE: u8 = 1;
-const SET_CODE: u8 = 2;
-const DEL_CODE: u8 = 3;
+            self.in_buf.drain(..cursor);
+        }
+    }
+    pub fn tick<IO: IOFace>(&mut self, io: &mut IO, net_bufs: &mut Vec<Vec<u8>>) {
+        // write anything we can/have
+        let mut net_buf = net_bufs.pop().unwrap();
+        let mut cursor = 0;
+        // just round robin for fairness between txns for now
+        for (txn_id, txn_queue) in &mut self.txns {
+            if let Some(op) = txn_queue.iter_to().next() {
+                let resp = format::Response {
+                    txn_id: *txn_id,
+                    op,
+                };
+                if cursor + resp.len() > net_buf.len() {
+                    // TODO: figure out best thing to do here
+                    break;
+                }
+                resp.write_to_buf(&mut net_buf[cursor..cursor + resp.len()]);
+                cursor += resp.len();
 
-pub fn parse_req(req: &[u8]) -> Result<Req, ()> {
-    match req.first() {
-        Some(code) => match *code {
-            GET_CODE => {
-                if req.len() < 5 {
-                    return Err(());
-                }
-                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
-                if req.len() < 5 + key_len {
-                    return Err(());
-                }
-                let key = &req[5..5 + key_len];
-                Ok(Req::Get(GetReq { key }))
+                txn_queue.to.drain(..op.len());
             }
-            SET_CODE => {
-                if req.len() < 9 {
-                    return Err(());
-                }
-                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
-                let val_len = u32::from_be_bytes(req[5..9].try_into().unwrap()) as usize;
-                if req.len() < 9 + key_len + val_len {
-                    return Err(());
-                }
-                let key = &req[9..9 + key_len];
-                let val = &req[9 + key_len..9 + key_len + val_len];
-                Ok(Req::Set(SetReq { key, val }))
-            }
-            DEL_CODE => {
-                if req.len() < 5 {
-                    return Err(());
-                }
-                let key_len = u32::from_be_bytes(req[1..5].try_into().unwrap()) as usize;
-                if req.len() < 5 + key_len {
-                    return Err(());
-                }
-                let key = &req[5..5 + key_len];
-                Ok(Req::Del(DelReq { key }))
-            }
-            n => panic!("{n} is not an op code"),
-        },
-        None => Err(()),
+        }
+
+        net_buf.drain(cursor..);
+        io.register_sub(Sub::TcpWrite {
+            buf: net_buf,
+            conn_id: self.id,
+        });
     }
 }
 
+pub struct TxnQueue {
+    pub from: Vec<u8>,
+    pub to: Vec<u8>,
+    pub sealed: bool,
+}
+impl TxnQueue {
+    pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {
+        format::FormatIter::<format::RequestOp>::from(&self.from[..])
+    }
+    pub fn iter_to(&self) -> format::FormatIter<'_, Result<format::Resp<'_>, format::Error>> {
+        format::FormatIter::<Result<format::Resp, format::Error>>::from(&self.to[..])
+    }
+    pub fn pop_from(&mut self) {
+        let mut from_iter = self.iter_from();
+        if let Some(op) = from_iter.next() {
+            self.from.drain(..op.len());
+        }
+    }
+    pub fn push_to(&mut self, response: Result<format::Resp, format::Error>) {
+        let to_len = self.to.len();
+        self.to.resize(to_len + response.len(), 0);
+        response.write_to_buf(&mut self.to[to_len..]);
+    }
+}
+
+/// this is just the offset in the file of the start of the block
+pub type BlockId = u64;
 pub const CHUNK_LEN_SIZE: usize = mem::size_of::<u64>();
 pub const PID_SIZE: usize = mem::size_of::<u64>();
 
@@ -263,7 +314,7 @@ impl FlushBuf {
         let offset = self.off as u64;
 
         // write out the page chunk
-        self.buf[self.off..self.off + PID_SIZE].copy_from_slice(&pid.to_be_bytes());
+        self.buf[self.off..self.off + PID_SIZE].copy_from_slice(&pid.0.to_be_bytes());
         self.off += PID_SIZE;
         self.buf[self.off..self.off + CHUNK_LEN_SIZE]
             .copy_from_slice(&(chunk.len() as u64).to_be_bytes());
@@ -316,7 +367,7 @@ impl PendingBlocks {
                     let offset = page_request.offs.pop().unwrap();
                     let mut cursor = offset as usize % block.len();
                     assert_eq!(
-                        pid,
+                        pid.0,
                         u64::from_be_bytes(block[cursor..cursor + PID_SIZE].try_into().unwrap())
                     );
                     cursor += PID_SIZE;
