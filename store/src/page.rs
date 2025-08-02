@@ -1,66 +1,8 @@
-use std::{alloc, collections, slice};
+use std::collections;
 
 use format::{self, Format, op, page};
 
-pub struct PageBuffer {
-    ptr: *mut u8,
-    pub top: usize,
-    pub cap: usize,
-    pub flush: usize,
-}
-impl PageBuffer {
-    pub fn new(cap: usize) -> Self {
-        let layout = std::alloc::Layout::array::<u8>(cap).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout)
-        }
-        Self {
-            ptr,
-            cap,
-            top: cap,
-            flush: cap,
-        }
-    }
-
-    pub fn read(&self) -> page::Page<'_> {
-        page::Page::from(unsafe {
-            slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top)
-        })
-    }
-    pub fn write(&mut self, op: &page::PageOp) -> bool {
-        let len = op.len();
-
-        if len > self.top {
-            return false;
-        }
-
-        op.write_to_buf(unsafe { slice::from_raw_parts_mut(self.ptr.add(self.top - len), len) });
-        self.top -= len;
-
-        true
-    }
-
-    #[inline]
-    pub fn raw_buffer_mut(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.ptr, self.cap) }
-    }
-    pub fn clear(&mut self) {
-        self.raw_buffer_mut().fill(0);
-        self.top = self.cap;
-        self.flush = self.cap;
-    }
-    pub fn flush(&mut self) -> &[u8] {
-        let out = &(unsafe { slice::from_raw_parts(self.ptr, self.cap) })[self.top..self.flush];
-        self.flush = self.top;
-        out
-    }
-}
-impl Drop for PageBuffer {
-    fn drop(&mut self) {
-        unsafe { alloc::dealloc(self.ptr, alloc::Layout::array::<u8>(self.cap).unwrap()) }
-    }
-}
+use crate::page_cache;
 
 // TODO: this is gonna need another pass after messing with format
 // PERF: im just gonna be sloppy and allocate/free all over the place here, for some reason this
@@ -316,7 +258,7 @@ impl PageMut {
         self.right_pid.0 = 0;
         self.total_compacted_size = page::Page::ENTRIES_LEN_SIZE + (format::PageId::SIZE * 2);
     }
-    pub fn pack(&mut self, page_buf: &mut PageBuffer) {
+    pub fn pack(&mut self, page_buf: &mut page_cache::PageBuffer) {
         assert_eq!(page_buf.cap, self.page_size);
 
         page_buf.clear();

@@ -5,7 +5,7 @@ use std::{
 
 use format::{Format, net, op};
 
-use crate::{central, config, io, mesh, page};
+use crate::{central, config, io, mesh, page, page_cache};
 
 const CENTRAL_ID: usize = 0;
 
@@ -15,16 +15,13 @@ const CENTRAL_ID: usize = 0;
 ///
 /// need to make sure we're keeping the ordering of txn ops, wrt to responses too
 pub struct Shard<I: io::IOFace> {
-    // page cache
-    pub page_dir: PageDir,
-    pub buf_pool: Vec<page::PageBuffer>,
-    pub free_list: Vec<usize>,
-
     pub config: config::Config,
+
+    pub page_cache: page_cache::PageCache,
 
     // io
     pub io: I,
-    pub storage_manager: io::StorageManager,
+    pub page_store: io::PageStore,
     pub conns: collections::BTreeMap<crate::ConnId, io::Conn>,
     pub txns: collections::BTreeMap<crate::ShardTxnId, Txn>,
     pub net_bufs: Vec<Vec<u8>>,
@@ -44,24 +41,21 @@ impl<I: io::IOFace> Shard<I> {
         committed_ts: sync::Arc<atomic::AtomicU64>,
         oldest_active_ts: sync::Arc<atomic::AtomicU64>,
     ) -> Self {
-        let mut page_dir = PageDir::new(config.buf_pool_size, format::PageId(1), format::PageId(2));
-        let mut buf_pool: Vec<page::PageBuffer> = (0..config.buf_pool_size)
-            .map(|_| page::PageBuffer::new(config.page_size))
-            .collect();
-        let mut free_list = Vec::from_iter(0..config.buf_pool_size);
+        let mut page_cache = page_cache::PageCache::new(
+            config.page_size,
+            config.buf_pool_size,
+            config.free_cap_target,
+        );
 
         // make root
-        let root_idx = free_list.pop().unwrap();
-        page::PageMut::new(config.page_size, format::PageId(1)).pack(&mut buf_pool[root_idx]);
-        page_dir.insert(page_dir.root, root_idx);
+        let root_idx = page_cache.pop_free();
+        page::PageMut::new(config.page_size, format::PageId(1)).pack(&mut page_cache[root_idx]);
+        page_cache.insert(format::PageId(1), root_idx);
 
         Self {
-            page_dir,
-            buf_pool,
-            free_list,
-
+            page_cache,
             io,
-            storage_manager: io::StorageManager::new(
+            page_store: io::PageStore::new(
                 config.block_size,
                 config.num_block_bufs,
                 config.block_cap,
@@ -91,6 +85,7 @@ impl<I: io::IOFace> Shard<I> {
     ///     - maybe cache, for evictions
     ///     - future:
     ///         - gc
+    ///         - maybe compaction
     ///
     pub fn tick(&mut self) {
         // read inputs
@@ -175,18 +170,14 @@ impl<I: io::IOFace> Shard<I> {
                     self.net_bufs.push(buf);
                 }
                 io::Comp::FileRead { mut buf, offset } => {
-                    self.storage_manager.read_block(
-                        &buf,
-                        offset,
-                        &mut self.buf_pool,
-                        &mut self.page_dir,
-                    );
+                    self.page_store
+                        .read_block(&buf, offset, &mut self.page_cache);
                     buf.fill(0);
-                    self.storage_manager.block_bufs.push(buf);
+                    self.page_store.block_bufs.push(buf);
                 }
                 io::Comp::FileWrite { mut buf } => {
                     buf.fill(0);
-                    self.storage_manager.block_bufs.push(buf);
+                    self.page_store.block_bufs.push(buf);
                 }
                 _ => {}
             }
@@ -256,8 +247,11 @@ impl<I: io::IOFace> Shard<I> {
                                 }
 
                                 // if we can't, queue it up for searching the actual index
-                                match find_leaf(read.key(), &mut self.page_dir, &mut self.buf_pool)
-                                {
+                                match find_leaf(
+                                    read.key(),
+                                    &mut self.page_cache,
+                                    self.page_store.root,
+                                ) {
                                     Ok((pid, idx)) => match reads.get_mut(&pid) {
                                         Some(read_group) => {
                                             read_group.reads.push((
@@ -280,9 +274,7 @@ impl<I: io::IOFace> Shard<I> {
                                             );
                                         }
                                     },
-                                    Err(pid) => {
-                                        self.storage_manager.inc_prio(pid, &mut self.free_list)
-                                    }
+                                    Err(pid) => self.page_store.inc_prio(pid, &mut self.page_cache),
                                 }
                             }
                             net::RequestOp::Write(write) => {
@@ -312,7 +304,7 @@ impl<I: io::IOFace> Shard<I> {
         // process reads
         let read_len = reads.len();
         for (_, group) in reads {
-            let mut page = self.buf_pool[group.page_idx].read();
+            let mut page = self.page_cache[group.page_idx].read();
 
             for (txn_id, start_ts, read) in group.reads {
                 let queue = self
@@ -343,10 +335,11 @@ impl<I: io::IOFace> Shard<I> {
                 let mut out = true;
                 for commit in &commits {
                     for write in format::FormatIter::<op::WriteOp>::from(&commit.writes[..]) {
-                        if let Err(pid) = find_leaf(write.key(), &mut self.page_dir, &self.buf_pool)
+                        if let Err(pid) =
+                            find_leaf(write.key(), &mut self.page_cache, self.page_store.root)
                         {
                             out = false;
-                            self.storage_manager.inc_prio(pid, &mut self.free_list);
+                            self.page_store.inc_prio(pid, &mut self.page_cache);
                         }
                     }
                 }
@@ -362,9 +355,8 @@ impl<I: io::IOFace> Shard<I> {
                             write: write_op,
                         };
                         apply_write(
-                            &mut self.page_dir,
-                            &mut self.buf_pool,
-                            &mut self.free_list,
+                            &mut self.page_cache,
+                            &mut self.page_store,
                             write,
                             tick_oldest_active_ts,
                             self.config.page_size,
@@ -378,35 +370,11 @@ impl<I: io::IOFace> Shard<I> {
             }
         }
 
-        // evict enough to have a nice full free list
-        let mut evicts = Vec::new();
-        {
-            let mut evict_cands = self.page_dir.evict_cands();
-            while self.free_list.len() < self.config.free_cap_target {
-                let (pid, idx) = evict_cands.next().unwrap();
-                // for now we'll just evict the best candidates, but we may have some constraints
-                // later from things like txns that prevent us from evicting certain pages
-                let page = &mut self.buf_pool[idx];
-                let total = page.cap - page.top;
-                let chunk = page.flush();
-                let base = chunk.len() == total;
-
-                self.storage_manager
-                    .write_chunk(pid, chunk, &mut self.io, base);
-
-                // cleanup
-                page.clear();
-                self.free_list.push(idx);
-                evicts.push(pid);
-            }
-        }
-        for pid in evicts.drain(..) {
-            self.page_dir.remove(pid);
-        }
+        // do any evictions if we need to
+        self.page_cache.tick(&mut self.page_store, &mut self.io);
 
         // queue up any reads that we may want to do
-        self.storage_manager
-            .tick(&mut self.io, &mut self.buf_pool, &mut self.page_dir);
+        self.page_store.tick(&mut self.io, &mut self.page_cache);
 
         // submit io
         self.io.submit();
@@ -416,7 +384,7 @@ impl<I: io::IOFace> Shard<I> {
         println!(
             "completed pipeline {}, {read_len} reads, {commit_len} commits, {} queued pages",
             self.runs,
-            self.storage_manager.pend_blocks.page_requests.len(),
+            self.page_store.pend_blocks.page_requests.len(),
         );
         // let mut total_live_txns = 0;
         // let mut total_live_from = 0;
@@ -453,63 +421,7 @@ pub struct Txn {
     writes: Vec<u8>,
 }
 
-pub struct PageDir {
-    pub id_map: std::collections::BTreeMap<format::PageId, usize>,
-    pub hits: Vec<[u64; 2]>,
-    pub root: format::PageId,
-    pub next_pid: format::PageId,
-    pub hit: u64,
-}
-impl PageDir {
-    pub fn new(buf_pool_size: usize, root: format::PageId, next_pid: format::PageId) -> Self {
-        Self {
-            id_map: std::collections::BTreeMap::new(),
-            hits: vec![[u64::MAX, 0]; buf_pool_size],
-            root,
-            next_pid,
-            hit: 0,
-        }
-    }
-    pub fn new_page_id(&mut self) -> format::PageId {
-        let pid = self.next_pid;
-        self.next_pid.0 += 1;
-        pid
-    }
-    pub fn get(&mut self, page_id: format::PageId) -> Option<usize> {
-        match self.id_map.get(&page_id) {
-            Some(idx) => {
-                self.hits[*idx][1] = self.hits[*idx][0];
-                self.hits[*idx][0] = self.hit;
-                self.hit += 1;
-                Some(*idx)
-            }
-            None => None,
-        }
-    }
-    pub fn insert(&mut self, page_id: format::PageId, idx: usize) {
-        if let Some(_) = self.id_map.insert(page_id, idx) {
-            panic!()
-        }
-        self.hits[idx][0] = self.hit;
-        self.hits[idx][1] = 0;
-        self.hit += 1;
-    }
-    pub fn remove(&mut self, page_id: format::PageId) {
-        self.id_map.remove(&page_id).unwrap();
-    }
-    pub fn evict_cands(&self) -> impl Iterator<Item = (format::PageId, usize)> {
-        itertools::Itertools::sorted_by(
-            self.id_map
-                .iter()
-                .map(|(pid, idx)| (self.hits[*idx][0] - self.hits[*idx][1], (*pid, *idx))),
-            |a, b| a.0.cmp(&b.0),
-        )
-        .rev()
-        .map(|(_, out)| out)
-    }
-}
-
-/// a bunch of [`format::ReadOp`]s for keys in the same page
+/// a bunch of [`op::ReadOp`]s for keys in the same page
 pub struct ReadGroup {
     page_idx: usize,
     reads: Vec<(crate::ShardTxnId, format::Timestamp, Vec<u8>)>,
@@ -517,20 +429,20 @@ pub struct ReadGroup {
 
 fn find_leaf(
     target: &[u8],
-    page_dir: &mut PageDir,
-    buf_pool: &Vec<page::PageBuffer>,
+    page_cache: &mut page_cache::PageCache,
+    root: format::PageId,
 ) -> Result<(format::PageId, usize), format::PageId> {
-    let (mut current, mut current_id, mut current_idx) = match page_dir.get(page_dir.root) {
-        Some(idx) => (buf_pool[idx].read(), page_dir.root, idx),
-        None => return Err(page_dir.root),
+    let (mut current, mut current_id, mut current_idx) = match page_cache.get(root) {
+        Some(idx) => (page_cache[idx].read(), root, idx),
+        None => return Err(root),
     };
 
     while current.is_inner() {
         current_id = current.search_inner(target);
-        current = match page_dir.get(current_id) {
+        current = match page_cache.get(current_id) {
             Some(idx) => {
                 current_idx = idx;
-                buf_pool[idx].read()
+                page_cache[idx].read()
             }
             None => return Err(current_id),
         };
@@ -540,9 +452,8 @@ fn find_leaf(
 }
 
 pub fn apply_write(
-    page_dir: &mut PageDir,
-    buf_pool: &mut Vec<page::PageBuffer>,
-    free_list: &mut Vec<usize>,
+    page_cache: &mut page_cache::PageCache,
+    page_store: &mut io::PageStore,
     write: format::page::PageWrite,
     oldest_active_ts: format::Timestamp,
     page_size: usize,
@@ -553,13 +464,13 @@ pub fn apply_write(
     let op = format::page::PageOp::Write(write);
     let key = write.key();
 
-    path.push((page_dir.root, page_dir.get(page_dir.root).unwrap()));
+    path.push((page_store.root, page_cache.get(page_store.root).unwrap()));
     loop {
         let (_, current_idx) = path.last().unwrap();
-        let mut current = buf_pool[*current_idx].read();
+        let mut current = page_cache[*current_idx].read();
         if current.is_inner() {
             let id = current.search_inner(key);
-            path.push((id, page_dir.get(id).unwrap()));
+            path.push((id, page_cache.get(id).unwrap()));
         } else {
             break;
         }
@@ -567,16 +478,16 @@ pub fn apply_write(
 
     let (leaf_id, leaf_idx) = path.pop().unwrap();
 
-    if !buf_pool[leaf_idx].write(&op) {
+    if !page_cache[leaf_idx].write(&op) {
         let new_page = &mut page_mut;
         new_page.clear();
         new_page.pid = leaf_id;
-        new_page.compact(buf_pool[leaf_idx].read(), oldest_active_ts);
+        new_page.compact(page_cache[leaf_idx].read(), oldest_active_ts);
 
         if let Err(()) = new_page.write_op(op) {
             let mut middle_key = Vec::new();
 
-            let to_page_id = page_dir.new_page_id();
+            let to_page_id = page_store.new_page_id();
             let mut to_page = new_page.split_leaf(&mut middle_key, to_page_id);
 
             if key <= &middle_key[..] {
@@ -585,11 +496,11 @@ pub fn apply_write(
                 new_page.write_op(op).unwrap();
             }
 
-            let to_page_idx = free_list.pop().unwrap();
-            to_page.pack(&mut buf_pool[to_page_idx]);
-            page_dir.insert(to_page_id, to_page_idx);
+            let to_page_idx = page_cache.pop_free();
+            to_page.pack(&mut page_cache[to_page_idx]);
+            page_cache.insert(to_page_id, to_page_idx);
 
-            new_page.pack(&mut buf_pool[leaf_idx]);
+            new_page.pack(&mut page_cache[leaf_idx]);
 
             let mut parent_op = format::page::SplitOp {
                 middle_key: &middle_key,
@@ -600,18 +511,18 @@ pub fn apply_write(
             'split: loop {
                 match path.pop() {
                     Some((parent_id, parent_idx)) => {
-                        if !buf_pool[parent_idx].write(&format::page::PageOp::SMO(
+                        if !page_cache[parent_idx].write(&format::page::PageOp::SMO(
                             format::page::SMOp::Split(parent_op),
                         )) {
                             let new_parent = &mut page_mut;
                             new_parent.clear();
                             new_parent.pid = parent_id;
-                            new_parent.compact(buf_pool[parent_idx].read(), oldest_active_ts);
+                            new_parent.compact(page_cache[parent_idx].read(), oldest_active_ts);
 
                             if let Err(()) = new_parent.write_op(format::page::PageOp::SMO(
                                 format::page::SMOp::Split(parent_op),
                             )) {
-                                let to_parent_id = page_dir.new_page_id();
+                                let to_parent_id = page_store.new_page_id();
                                 let mut temp_key = Vec::new();
                                 let mut to_parent =
                                     new_parent.split_inner(&mut temp_key, to_parent_id);
@@ -630,11 +541,11 @@ pub fn apply_write(
                                         .unwrap();
                                 }
 
-                                let to_parent_idx = free_list.pop().unwrap();
-                                to_parent.pack(&mut buf_pool[to_parent_idx]);
-                                page_dir.insert(to_parent_id, to_parent_idx);
+                                let to_parent_idx = page_cache.pop_free();
+                                to_parent.pack(&mut page_cache[to_parent_idx]);
+                                page_cache.insert(to_parent_id, to_parent_idx);
 
-                                new_parent.pack(&mut buf_pool[parent_idx]);
+                                new_parent.pack(&mut page_cache[parent_idx]);
 
                                 middle_key.clear();
                                 middle_key.extend(temp_key);
@@ -646,7 +557,7 @@ pub fn apply_write(
 
                                 continue 'split;
                             } else {
-                                new_parent.pack(&mut buf_pool[parent_idx]);
+                                new_parent.pack(&mut page_cache[parent_idx]);
                                 break 'split;
                             }
                         } else {
@@ -656,7 +567,7 @@ pub fn apply_write(
                     None => {
                         let new_root = &mut page_mut;
                         new_root.clear();
-                        let new_root_id = page_dir.new_page_id();
+                        let new_root_id = page_store.new_page_id();
                         new_root.pid = new_root_id;
                         new_root.set_right_pid(right);
                         new_root.set_left_pid(format::PageId(u64::MAX));
@@ -666,18 +577,18 @@ pub fn apply_write(
                             )))
                             .unwrap();
 
-                        let new_root_idx = free_list.pop().unwrap();
-                        page_dir.root = new_root_id;
+                        let new_root_idx = page_cache.pop_free();
+                        page_store.root = new_root_id;
 
-                        new_root.pack(&mut buf_pool[new_root_idx]);
-                        page_dir.insert(new_root_id, new_root_idx);
+                        new_root.pack(&mut page_cache[new_root_idx]);
+                        page_cache.insert(new_root_id, new_root_idx);
 
                         break 'split;
                     }
                 }
             }
         } else {
-            new_page.pack(&mut buf_pool[leaf_idx]);
+            new_page.pack(&mut page_cache[leaf_idx]);
         }
     }
 }

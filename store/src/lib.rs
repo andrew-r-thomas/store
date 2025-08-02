@@ -5,6 +5,7 @@ pub mod config;
 pub mod io;
 pub mod mesh;
 pub mod page;
+pub mod page_cache;
 pub mod shard;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,7 +23,9 @@ pub struct GlobalTxnId {
     pub shard_id: usize,
 }
 
-/// NOTE this function adds 1 to the final output, since the 0 index is used for [`Central`]
+/// ## NOTE
+/// this function adds 1 to the final output,
+/// since the 0 index is used for [`central::Central`]
 #[inline]
 pub fn find_shard(key: &[u8], num_shards: usize) -> usize {
     let mut hasher = twox_hash::XxHash64::with_seed(0);
