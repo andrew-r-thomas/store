@@ -1,9 +1,8 @@
 use std::{collections, mem, ops::Deref};
 
-use crate::{
-    format::{self, Format},
-    page, shard,
-};
+use format::{self, Format, net};
+
+use crate::{page, shard};
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -64,7 +63,7 @@ pub struct Conn {
     /// need to answer the question of when txns get removed from this map, this is a little tricky
     /// because it seems like two places need to think about when a txn is finished within a shard
     /// both the connection itself, and the shard which owns it
-    pub txns: collections::BTreeMap<crate::ConnTxnId, TxnQueue>,
+    pub txns: collections::BTreeMap<format::ConnTxnId, TxnQueue>,
 }
 impl Conn {
     pub fn new(id: crate::ConnId) -> Self {
@@ -81,7 +80,7 @@ impl Conn {
             // TODO: error handling
             // (eof means we just stop reading,
             // but we also need to handle thing like malformed requests, etc)
-            while let Ok(request) = format::Request::from_bytes(&self.in_buf[cursor..]) {
+            while let Ok(request) = net::Request::from_bytes(&self.in_buf[cursor..]) {
                 cursor += request.len();
                 match self.txns.get_mut(&request.txn_id) {
                     Some(txn_buf) => {
@@ -115,7 +114,7 @@ impl Conn {
         // just round robin for fairness between txns for now
         for (txn_id, txn_queue) in &mut self.txns {
             if let Some(op) = txn_queue.iter_to().next() {
-                let resp = format::Response {
+                let resp = net::Response {
                     txn_id: *txn_id,
                     op,
                 };
@@ -144,11 +143,11 @@ pub struct TxnQueue {
     pub sealed: bool,
 }
 impl TxnQueue {
-    pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {
-        format::FormatIter::<format::RequestOp>::from(&self.from[..])
+    pub fn iter_from(&self) -> format::FormatIter<'_, net::RequestOp<'_>> {
+        format::FormatIter::<net::RequestOp>::from(&self.from[..])
     }
-    pub fn iter_to(&self) -> format::FormatIter<'_, Result<format::Resp<'_>, format::Error>> {
-        format::FormatIter::<Result<format::Resp, format::Error>>::from(&self.to[..])
+    pub fn iter_to(&self) -> format::FormatIter<'_, Result<net::Resp<'_>, format::Error>> {
+        format::FormatIter::<Result<net::Resp, format::Error>>::from(&self.to[..])
     }
     pub fn pop_from(&mut self) {
         let mut from_iter = self.iter_from();
@@ -156,7 +155,7 @@ impl TxnQueue {
             self.from.drain(..op.len());
         }
     }
-    pub fn push_to(&mut self, response: Result<format::Resp, format::Error>) {
+    pub fn push_to(&mut self, response: Result<net::Resp, format::Error>) {
         let to_len = self.to.len();
         self.to.resize(to_len + response.len(), 0);
         response.write_to_buf(&mut self.to[to_len..]);
@@ -171,7 +170,7 @@ pub const PID_SIZE: usize = mem::size_of::<u64>();
 pub struct StorageManager {
     pub flush_buf: FlushBuf,
     pub block_bufs: Vec<Vec<u8>>,
-    pub offset_table: collections::BTreeMap<crate::PageId, Vec<u64>>,
+    pub offset_table: collections::BTreeMap<format::PageId, Vec<u64>>,
     pub pend_blocks: PendingBlocks,
 }
 impl StorageManager {
@@ -239,7 +238,7 @@ impl StorageManager {
             self.pend_blocks.pend_block = Some(*block_id);
         }
     }
-    pub fn inc_prio(&mut self, pid: crate::PageId, free_list: &mut Vec<usize>) {
+    pub fn inc_prio(&mut self, pid: format::PageId, free_list: &mut Vec<usize>) {
         match self.pend_blocks.page_requests.get_mut(&pid) {
             Some(page_request) => page_request.prio += 1,
             None => {
@@ -268,7 +267,7 @@ impl StorageManager {
     }
     pub fn write_chunk<IO: IOFace>(
         &mut self,
-        pid: crate::PageId,
+        pid: format::PageId,
         chunk: &[u8],
         io: &mut IO,
         base: bool,
@@ -305,7 +304,7 @@ impl FlushBuf {
     pub fn cap(&self) -> u64 {
         self.buf.len() as u64
     }
-    pub fn write_chunk(&mut self, pid: crate::PageId, chunk: &[u8]) -> Result<u64, ()> {
+    pub fn write_chunk(&mut self, pid: format::PageId, chunk: &[u8]) -> Result<u64, ()> {
         if self.buf.len() - self.off < PID_SIZE + CHUNK_LEN_SIZE + chunk.len() {
             return Err(());
         }
@@ -337,8 +336,8 @@ impl Deref for FlushBuf {
     }
 }
 pub struct PendingBlocks {
-    pub page_requests: collections::BTreeMap<crate::PageId, PageRequest>,
-    pub block_requests: collections::BTreeMap<BlockId, Vec<crate::PageId>>,
+    pub page_requests: collections::BTreeMap<format::PageId, PageRequest>,
+    pub block_requests: collections::BTreeMap<BlockId, Vec<format::PageId>>,
 
     pub pend_block: Option<BlockId>,
 
@@ -420,7 +419,7 @@ impl PendingBlocks {
 
     pub fn write_chunk<IO: IOFace>(
         &mut self,
-        pid: crate::PageId,
+        pid: format::PageId,
         chunk: &[u8],
         flush_buf: &mut FlushBuf,
         block_bufs: &mut Vec<Vec<u8>>,
