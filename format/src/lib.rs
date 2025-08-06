@@ -108,7 +108,7 @@ impl Format<'_> for PageId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnTxnId(pub u64);
 impl ConnTxnId {
     pub const SIZE: usize = mem::size_of::<u64>();

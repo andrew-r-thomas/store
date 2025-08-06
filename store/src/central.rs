@@ -22,6 +22,9 @@ use crate::{io, mesh};
 ///     }
 /// }
 /// ```
+///
+/// ## TODO
+/// - checkpointing
 pub struct Central<IO: io::IOFace> {
     pub committed_ts: sync::Arc<atomic::AtomicU64>,
     pub oldest_active_ts: sync::Arc<atomic::AtomicU64>,
@@ -52,7 +55,9 @@ impl<IO: io::IOFace> Central<IO> {
             recent_commits: collections::BTreeMap::new(),
         }
     }
+    #[tracing::instrument(skip(self))]
     pub fn tick(&mut self) {
+        tracing::event!(tracing::Level::INFO, "central ticked");
         // TODO: should probably move the initial accept logic to a setup function or something
         self.io.register_sub(io::Sub::Accept {});
 

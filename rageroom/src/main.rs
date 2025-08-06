@@ -21,6 +21,7 @@ struct Args {
 }
 
 fn main() {
+    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new()).unwrap();
     let args = Args::parse();
     let sim_config = SimConfig::load(&args.sim_config);
     let db_config = store::config::Config::load(&args.db_config).unwrap();

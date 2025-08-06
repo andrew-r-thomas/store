@@ -87,7 +87,10 @@ impl<I: io::IOFace> Shard<I> {
     ///         - gc
     ///         - maybe compaction
     ///
+    #[tracing::instrument(skip(self))]
     pub fn tick(&mut self) {
+        tracing::event!(tracing::Level::INFO, "shard ticked");
+
         // read inputs
         //
         // from other threads
@@ -302,7 +305,6 @@ impl<I: io::IOFace> Shard<I> {
         }
 
         // process reads
-        let read_len = reads.len();
         for (_, group) in reads {
             let mut page = self.page_cache[group.page_idx].read();
 
@@ -328,7 +330,6 @@ impl<I: io::IOFace> Shard<I> {
         //
         // for now, we'll keep this super simple and not optimized, but there will be lots of
         // refining to do later
-        let mut commit_len = 0;
         if let Some((ts, commits)) = self.pending_commits.pop_first() {
             if {
                 // check if we have all the pages in memory to do these writes
@@ -345,8 +346,6 @@ impl<I: io::IOFace> Shard<I> {
                 }
                 out
             } {
-                commit_len = commits.len();
-
                 // process commits
                 for commit in commits {
                     for write_op in format::FormatIter::<op::WriteOp>::from(&commit.writes[..]) {
@@ -378,39 +377,6 @@ impl<I: io::IOFace> Shard<I> {
 
         // submit io
         self.io.submit();
-
-        self.runs += 1;
-
-        println!(
-            "completed pipeline {}, {read_len} reads, {commit_len} commits, {} queued pages",
-            self.runs,
-            self.page_store.pend_blocks.page_requests.len(),
-        );
-        // let mut total_live_txns = 0;
-        // let mut total_live_from = 0;
-        // let mut total_live_to = 0;
-        // let mut total_dead_txns = 0;
-        // let mut total_dead_from = 0;
-        // let mut total_dead_to = 0;
-        // for (_, conn) in &self.conns {
-        //     for (_, queue) in &conn.txns {
-        //         match queue.sealed {
-        //             true => {
-        //                 total_dead_txns += 1;
-        //                 total_dead_from += queue.from.len();
-        //                 total_dead_to += queue.to.len();
-        //             }
-        //             false => {
-        //                 total_live_txns += 1;
-        //                 total_live_from += queue.from.len();
-        //                 total_live_to += queue.to.len();
-        //             }
-        //         }
-        //     }
-        // }
-        // println!(
-        //     "total live: {total_live_txns} ({total_live_from} from, {total_live_to} to), total dead: {total_dead_txns} ({total_dead_from} from, {total_dead_to} to)"
-        // );
     }
 }
 
