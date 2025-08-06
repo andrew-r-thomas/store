@@ -3,10 +3,9 @@ use std::{
     sync::{self, atomic},
 };
 
-use crate::{
-    format::{self, Format},
-    io, mesh,
-};
+use format::{Format, op};
+
+use crate::{io, mesh};
 
 /// this is the central coordinator for the entire system, it runs on the main thread, literally
 /// like this:
@@ -23,11 +22,14 @@ use crate::{
 ///     }
 /// }
 /// ```
+///
+/// ## TODO
+/// - checkpointing
 pub struct Central<IO: io::IOFace> {
     pub committed_ts: sync::Arc<atomic::AtomicU64>,
     pub oldest_active_ts: sync::Arc<atomic::AtomicU64>,
-    pub active_timestamps: collections::BTreeMap<crate::Timestamp, u64>,
-    pub recent_commits: collections::BTreeMap<crate::Timestamp, collections::BTreeSet<Vec<u8>>>,
+    pub active_timestamps: collections::BTreeMap<format::Timestamp, u64>,
+    pub recent_commits: collections::BTreeMap<format::Timestamp, collections::BTreeSet<Vec<u8>>>,
     pub txn_processor: TxnProcessor,
     /// ok so we need some incremental state for successful txns because they will involve waiting
     /// for io potentially, and waiting on responses from shards
@@ -53,7 +55,9 @@ impl<IO: io::IOFace> Central<IO> {
             recent_commits: collections::BTreeMap::new(),
         }
     }
+    #[tracing::instrument(skip(self))]
     pub fn tick(&mut self) {
+        tracing::event!(tracing::Level::INFO, "central ticked");
         // TODO: should probably move the initial accept logic to a setup function or something
         self.io.register_sub(io::Sub::Accept {});
 
@@ -71,7 +75,7 @@ impl<IO: io::IOFace> Central<IO> {
         }
 
         let commit_timestamp =
-            crate::Timestamp(self.committed_ts.fetch_add(1, atomic::Ordering::Release));
+            format::Timestamp(self.committed_ts.fetch_add(1, atomic::Ordering::Release));
 
         // read messages from shards
         let mut commits = Vec::new();
@@ -84,8 +88,7 @@ impl<IO: io::IOFace> Central<IO> {
                         start_ts,
                         writes,
                     } => {
-                        let mut keys_iter =
-                            format::FormatIter::<format::WriteOp>::from(&writes[..]);
+                        let mut keys_iter = format::FormatIter::<op::WriteOp>::from(&writes[..]);
                         if writes.len() == 0 {
                             self.mesh.push(
                                 mesh::Msg::CommitResponse {
@@ -100,7 +103,7 @@ impl<IO: io::IOFace> Central<IO> {
                             // if anything has been committed for any of the keys in this txn since
                             // it started, fail the commit (write-write conflict)
                             self.recent_commits
-                                .range(crate::Timestamp(start_ts.0 + 1)..)
+                                .range(format::Timestamp(start_ts.0 + 1)..)
                                 .any(|(_, keys)| keys.contains(w.key()))
                         }) {
                             self.mesh.push(
@@ -170,7 +173,7 @@ impl<IO: io::IOFace> Central<IO> {
 #[derive(Debug)]
 pub struct Commit {
     pub txn_id: crate::GlobalTxnId,
-    pub commit_ts: crate::Timestamp,
+    pub commit_ts: format::Timestamp,
     pub writes: Vec<u8>,
 }
 
@@ -195,7 +198,7 @@ impl TxnProcessor {
             // message, and queue up waiting for the response
             let mut waiting_on = collections::BTreeSet::new();
             let mut shard_writes = collections::BTreeMap::<usize, Vec<u8>>::new();
-            for write in format::FormatIter::<format::WriteOp>::from(&commit.writes[..]) {
+            for write in format::FormatIter::<op::WriteOp>::from(&commit.writes[..]) {
                 let shard = crate::find_shard(write.key(), num_shards);
                 waiting_on.insert(shard);
 

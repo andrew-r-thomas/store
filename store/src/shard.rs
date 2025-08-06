@@ -3,11 +3,9 @@ use std::{
     sync::{self, atomic},
 };
 
-use crate::{
-    PageId, central, config,
-    format::{self, Format},
-    io, mesh, page,
-};
+use format::{Format, net, op};
+
+use crate::{central, config, io, mesh, page, page_cache};
 
 const CENTRAL_ID: usize = 0;
 
@@ -17,16 +15,13 @@ const CENTRAL_ID: usize = 0;
 ///
 /// need to make sure we're keeping the ordering of txn ops, wrt to responses too
 pub struct Shard<I: io::IOFace> {
-    // page cache
-    pub page_dir: PageDir,
-    pub buf_pool: Vec<page::PageBuffer>,
-    pub free_list: Vec<usize>,
-
     pub config: config::Config,
+
+    pub page_cache: page_cache::PageCache,
 
     // io
     pub io: I,
-    pub storage_manager: io::StorageManager,
+    pub page_store: io::PageStore,
     pub conns: collections::BTreeMap<crate::ConnId, io::Conn>,
     pub txns: collections::BTreeMap<crate::ShardTxnId, Txn>,
     pub net_bufs: Vec<Vec<u8>>,
@@ -36,7 +31,7 @@ pub struct Shard<I: io::IOFace> {
     pub runs: usize,
     pub committed_ts: sync::Arc<atomic::AtomicU64>,
     pub oldest_active_ts: sync::Arc<atomic::AtomicU64>,
-    pub pending_commits: collections::BTreeMap<crate::Timestamp, Vec<central::Commit>>,
+    pub pending_commits: collections::BTreeMap<format::Timestamp, Vec<central::Commit>>,
 }
 impl<I: io::IOFace> Shard<I> {
     pub fn new(
@@ -46,24 +41,21 @@ impl<I: io::IOFace> Shard<I> {
         committed_ts: sync::Arc<atomic::AtomicU64>,
         oldest_active_ts: sync::Arc<atomic::AtomicU64>,
     ) -> Self {
-        let mut page_dir = PageDir::new(config.buf_pool_size, crate::PageId(1), crate::PageId(2));
-        let mut buf_pool: Vec<page::PageBuffer> = (0..config.buf_pool_size)
-            .map(|_| page::PageBuffer::new(config.page_size))
-            .collect();
-        let mut free_list = Vec::from_iter(0..config.buf_pool_size);
+        let mut page_cache = page_cache::PageCache::new(
+            config.page_size,
+            config.buf_pool_size,
+            config.free_cap_target,
+        );
 
         // make root
-        let root_idx = free_list.pop().unwrap();
-        page::PageMut::new(config.page_size, crate::PageId(1)).pack(&mut buf_pool[root_idx]);
-        page_dir.insert(page_dir.root, root_idx);
+        let root_idx = page_cache.pop_free();
+        page::PageMut::new(config.page_size, format::PageId(1)).pack(&mut page_cache[root_idx]);
+        page_cache.insert(format::PageId(1), root_idx);
 
         Self {
-            page_dir,
-            buf_pool,
-            free_list,
-
+            page_cache,
             io,
-            storage_manager: io::StorageManager::new(
+            page_store: io::PageStore::new(
                 config.block_size,
                 config.num_block_bufs,
                 config.block_cap,
@@ -93,8 +85,12 @@ impl<I: io::IOFace> Shard<I> {
     ///     - maybe cache, for evictions
     ///     - future:
     ///         - gc
+    ///         - maybe compaction
     ///
+    #[tracing::instrument(skip(self))]
     pub fn tick(&mut self) {
+        tracing::event!(tracing::Level::INFO, "shard ticked");
+
         // read inputs
         //
         // from other threads
@@ -113,7 +109,7 @@ impl<I: io::IOFace> Shard<I> {
                         let txn_queue = conn.txns.get_mut(&txn_id.conn_txn_id).unwrap();
                         match res {
                             Ok(()) => {
-                                txn_queue.push_to(Ok(format::Resp::Success));
+                                txn_queue.push_to(Ok(net::Resp::Success));
                             }
                             Err(()) => {
                                 txn_queue.push_to(Err(format::Error::Conflict));
@@ -177,18 +173,14 @@ impl<I: io::IOFace> Shard<I> {
                     self.net_bufs.push(buf);
                 }
                 io::Comp::FileRead { mut buf, offset } => {
-                    self.storage_manager.read_block(
-                        &buf,
-                        offset,
-                        &mut self.buf_pool,
-                        &mut self.page_dir,
-                    );
+                    self.page_store
+                        .read_block(&buf, offset, &mut self.page_cache);
                     buf.fill(0);
-                    self.storage_manager.block_bufs.push(buf);
+                    self.page_store.block_bufs.push(buf);
                 }
                 io::Comp::FileWrite { mut buf } => {
                     buf.fill(0);
-                    self.storage_manager.block_bufs.push(buf);
+                    self.page_store.block_bufs.push(buf);
                 }
                 _ => {}
             }
@@ -199,11 +191,12 @@ impl<I: io::IOFace> Shard<I> {
             conn.tick(&mut self.io, &mut self.net_bufs);
         }
 
-        let tick_committed_ts = crate::Timestamp(self.committed_ts.load(atomic::Ordering::Acquire));
+        let tick_committed_ts =
+            format::Timestamp(self.committed_ts.load(atomic::Ordering::Acquire));
         let tick_oldest_active_ts =
-            crate::Timestamp(self.oldest_active_ts.load(atomic::Ordering::Acquire));
+            format::Timestamp(self.oldest_active_ts.load(atomic::Ordering::Acquire));
         // find ops that can be completed in this pipeline
-        let mut reads = collections::BTreeMap::<crate::PageId, ReadGroup>::new();
+        let mut reads = collections::BTreeMap::<format::PageId, ReadGroup>::new();
         {
             for (conn_id, conn) in self.conns.iter_mut() {
                 for (txn_id, txn_queue) in &mut conn.txns {
@@ -231,21 +224,20 @@ impl<I: io::IOFace> Shard<I> {
                     };
                     if let Some(op) = txn_queue.iter_from().next() {
                         match op {
-                            format::RequestOp::Read(read) => {
+                            net::RequestOp::Read(read) => {
                                 // first check if we can fulfill the read from the local txn writes
-                                let mut locals = format::FormatIter::<'_, format::WriteOp>::from(
-                                    &txn.writes[..],
-                                )
-                                .collect::<Vec<_>>();
+                                let mut locals =
+                                    format::FormatIter::<'_, op::WriteOp>::from(&txn.writes[..])
+                                        .collect::<Vec<_>>();
                                 let mut resp = None;
                                 while let Some(local_write) = locals.pop() {
                                     if local_write.key() == read.key() {
                                         match local_write {
-                                            format::WriteOp::Set(set) => {
-                                                resp = Some(Ok(format::Resp::Get(Some(set.val))));
+                                            op::WriteOp::Set(set) => {
+                                                resp = Some(Ok(net::Resp::Get(Some(set.val))));
                                             }
-                                            format::WriteOp::Del(_) => {
-                                                resp = Some(Ok(format::Resp::Get(None)));
+                                            op::WriteOp::Del(_) => {
+                                                resp = Some(Ok(net::Resp::Get(None)));
                                             }
                                         }
                                         break;
@@ -258,8 +250,11 @@ impl<I: io::IOFace> Shard<I> {
                                 }
 
                                 // if we can't, queue it up for searching the actual index
-                                match find_leaf(read.key(), &mut self.page_dir, &mut self.buf_pool)
-                                {
+                                match find_leaf(
+                                    read.key(),
+                                    &mut self.page_cache,
+                                    self.page_store.root,
+                                ) {
                                     Ok((pid, idx)) => match reads.get_mut(&pid) {
                                         Some(read_group) => {
                                             read_group.reads.push((
@@ -282,19 +277,17 @@ impl<I: io::IOFace> Shard<I> {
                                             );
                                         }
                                     },
-                                    Err(pid) => {
-                                        self.storage_manager.inc_prio(pid, &mut self.free_list)
-                                    }
+                                    Err(pid) => self.page_store.inc_prio(pid, &mut self.page_cache),
                                 }
                             }
-                            format::RequestOp::Write(write) => {
+                            net::RequestOp::Write(write) => {
                                 let old_len = txn.writes.len();
                                 txn.writes.resize(old_len + write.len(), 0);
                                 write.write_to_buf(&mut txn.writes[old_len..]);
-                                txn_queue.push_to(Ok(format::Resp::Success));
+                                txn_queue.push_to(Ok(net::Resp::Success));
                                 txn_queue.pop_from();
                             }
-                            format::RequestOp::Commit => {
+                            net::RequestOp::Commit => {
                                 txn_queue.sealed = true;
                                 self.mesh.push(
                                     mesh::Msg::CommitRequest {
@@ -312,9 +305,8 @@ impl<I: io::IOFace> Shard<I> {
         }
 
         // process reads
-        let read_len = reads.len();
         for (_, group) in reads {
-            let mut page = self.buf_pool[group.page_idx].read();
+            let mut page = self.page_cache[group.page_idx].read();
 
             for (txn_id, start_ts, read) in group.reads {
                 let queue = self
@@ -324,10 +316,9 @@ impl<I: io::IOFace> Shard<I> {
                     .txns
                     .get_mut(&txn_id.conn_txn_id)
                     .unwrap();
-                queue.push_to(Ok(format::Resp::Get(page.search_leaf(
-                    format::ReadOp::from_bytes(&read).unwrap().key(),
-                    start_ts,
-                ))));
+                queue.push_to(Ok(net::Resp::Get(
+                    page.search_leaf(op::ReadOp::from_bytes(&read).unwrap().key(), start_ts),
+                )));
                 queue.pop_from();
             }
         }
@@ -339,36 +330,32 @@ impl<I: io::IOFace> Shard<I> {
         //
         // for now, we'll keep this super simple and not optimized, but there will be lots of
         // refining to do later
-        let mut commit_len = 0;
         if let Some((ts, commits)) = self.pending_commits.pop_first() {
             if {
                 // check if we have all the pages in memory to do these writes
                 let mut out = true;
                 for commit in &commits {
-                    for write in format::FormatIter::<format::WriteOp>::from(&commit.writes[..]) {
-                        if let Err(pid) = find_leaf(write.key(), &mut self.page_dir, &self.buf_pool)
+                    for write in format::FormatIter::<op::WriteOp>::from(&commit.writes[..]) {
+                        if let Err(pid) =
+                            find_leaf(write.key(), &mut self.page_cache, self.page_store.root)
                         {
                             out = false;
-                            self.storage_manager.inc_prio(pid, &mut self.free_list);
+                            self.page_store.inc_prio(pid, &mut self.page_cache);
                         }
                     }
                 }
                 out
             } {
-                commit_len = commits.len();
-
                 // process commits
                 for commit in commits {
-                    for write_op in format::FormatIter::<format::WriteOp>::from(&commit.writes[..])
-                    {
-                        let write = format::PageWrite {
+                    for write_op in format::FormatIter::<op::WriteOp>::from(&commit.writes[..]) {
+                        let write = format::page::PageWrite {
                             ts: commit.commit_ts,
                             write: write_op,
                         };
                         apply_write(
-                            &mut self.page_dir,
-                            &mut self.buf_pool,
-                            &mut self.free_list,
+                            &mut self.page_cache,
+                            &mut self.page_store,
                             write,
                             tick_oldest_active_ts,
                             self.config.page_size,
@@ -382,159 +369,46 @@ impl<I: io::IOFace> Shard<I> {
             }
         }
 
-        // evict enough to have a nice full free list
-        let mut evicts = Vec::new();
-        {
-            let mut evict_cands = self.page_dir.evict_cands();
-            while self.free_list.len() < self.config.free_cap_target {
-                let (pid, idx) = evict_cands.next().unwrap();
-                // for now we'll just evict the best candidates, but we may have some constraints
-                // later from things like txns that prevent us from evicting certain pages
-                let page = &mut self.buf_pool[idx];
-                let total = page.cap - page.top;
-                let chunk = page.flush();
-                let base = chunk.len() == total;
-
-                self.storage_manager
-                    .write_chunk(pid, chunk, &mut self.io, base);
-
-                // cleanup
-                page.clear();
-                self.free_list.push(idx);
-                evicts.push(pid);
-            }
-        }
-        for pid in evicts.drain(..) {
-            self.page_dir.remove(pid);
-        }
+        // do any evictions if we need to
+        self.page_cache.tick(&mut self.page_store, &mut self.io);
 
         // queue up any reads that we may want to do
-        self.storage_manager
-            .tick(&mut self.io, &mut self.buf_pool, &mut self.page_dir);
+        self.page_store.tick(&mut self.io, &mut self.page_cache);
 
         // submit io
         self.io.submit();
-
-        self.runs += 1;
-
-        println!(
-            "completed pipeline {}, {read_len} reads, {commit_len} commits, {} queued pages",
-            self.runs,
-            self.storage_manager.pend_blocks.page_requests.len(),
-        );
-        // let mut total_live_txns = 0;
-        // let mut total_live_from = 0;
-        // let mut total_live_to = 0;
-        // let mut total_dead_txns = 0;
-        // let mut total_dead_from = 0;
-        // let mut total_dead_to = 0;
-        // for (_, conn) in &self.conns {
-        //     for (_, queue) in &conn.txns {
-        //         match queue.sealed {
-        //             true => {
-        //                 total_dead_txns += 1;
-        //                 total_dead_from += queue.from.len();
-        //                 total_dead_to += queue.to.len();
-        //             }
-        //             false => {
-        //                 total_live_txns += 1;
-        //                 total_live_from += queue.from.len();
-        //                 total_live_to += queue.to.len();
-        //             }
-        //         }
-        //     }
-        // }
-        // println!(
-        //     "total live: {total_live_txns} ({total_live_from} from, {total_live_to} to), total dead: {total_dead_txns} ({total_dead_from} from, {total_dead_to} to)"
-        // );
     }
 }
 
 pub struct Txn {
-    start_ts: crate::Timestamp,
+    start_ts: format::Timestamp,
     /// these are in chronological (not reverse chron) order
     /// the oldest write is first
     writes: Vec<u8>,
 }
 
-pub struct PageDir {
-    pub id_map: std::collections::BTreeMap<crate::PageId, usize>,
-    pub hits: Vec<[u64; 2]>,
-    pub root: crate::PageId,
-    pub next_pid: crate::PageId,
-    pub hit: u64,
-}
-impl PageDir {
-    pub fn new(buf_pool_size: usize, root: crate::PageId, next_pid: crate::PageId) -> Self {
-        Self {
-            id_map: std::collections::BTreeMap::new(),
-            hits: vec![[u64::MAX, 0]; buf_pool_size],
-            root,
-            next_pid,
-            hit: 0,
-        }
-    }
-    pub fn new_page_id(&mut self) -> crate::PageId {
-        let pid = self.next_pid;
-        self.next_pid.0 += 1;
-        pid
-    }
-    pub fn get(&mut self, page_id: crate::PageId) -> Option<usize> {
-        match self.id_map.get(&page_id) {
-            Some(idx) => {
-                self.hits[*idx][1] = self.hits[*idx][0];
-                self.hits[*idx][0] = self.hit;
-                self.hit += 1;
-                Some(*idx)
-            }
-            None => None,
-        }
-    }
-    pub fn insert(&mut self, page_id: crate::PageId, idx: usize) {
-        if let Some(_) = self.id_map.insert(page_id, idx) {
-            panic!()
-        }
-        self.hits[idx][0] = self.hit;
-        self.hits[idx][1] = 0;
-        self.hit += 1;
-    }
-    pub fn remove(&mut self, page_id: crate::PageId) {
-        self.id_map.remove(&page_id).unwrap();
-    }
-    pub fn evict_cands(&self) -> impl Iterator<Item = (crate::PageId, usize)> {
-        itertools::Itertools::sorted_by(
-            self.id_map
-                .iter()
-                .map(|(pid, idx)| (self.hits[*idx][0] - self.hits[*idx][1], (*pid, *idx))),
-            |a, b| a.0.cmp(&b.0),
-        )
-        .rev()
-        .map(|(_, out)| out)
-    }
-}
-
-/// a bunch of [`format::ReadOp`]s for keys in the same page
+/// a bunch of [`op::ReadOp`]s for keys in the same page
 pub struct ReadGroup {
     page_idx: usize,
-    reads: Vec<(crate::ShardTxnId, crate::Timestamp, Vec<u8>)>,
+    reads: Vec<(crate::ShardTxnId, format::Timestamp, Vec<u8>)>,
 }
 
 fn find_leaf(
     target: &[u8],
-    page_dir: &mut PageDir,
-    buf_pool: &Vec<page::PageBuffer>,
-) -> Result<(PageId, usize), PageId> {
-    let (mut current, mut current_id, mut current_idx) = match page_dir.get(page_dir.root) {
-        Some(idx) => (buf_pool[idx].read(), page_dir.root, idx),
-        None => return Err(page_dir.root),
+    page_cache: &mut page_cache::PageCache,
+    root: format::PageId,
+) -> Result<(format::PageId, usize), format::PageId> {
+    let (mut current, mut current_id, mut current_idx) = match page_cache.get(root) {
+        Some(idx) => (page_cache[idx].read(), root, idx),
+        None => return Err(root),
     };
 
     while current.is_inner() {
         current_id = current.search_inner(target);
-        current = match page_dir.get(current_id) {
+        current = match page_cache.get(current_id) {
             Some(idx) => {
                 current_idx = idx;
-                buf_pool[idx].read()
+                page_cache[idx].read()
             }
             None => return Err(current_id),
         };
@@ -544,26 +418,25 @@ fn find_leaf(
 }
 
 pub fn apply_write(
-    page_dir: &mut PageDir,
-    buf_pool: &mut Vec<page::PageBuffer>,
-    free_list: &mut Vec<usize>,
-    write: format::PageWrite,
-    oldest_active_ts: crate::Timestamp,
+    page_cache: &mut page_cache::PageCache,
+    page_store: &mut io::PageStore,
+    write: format::page::PageWrite,
+    oldest_active_ts: format::Timestamp,
     page_size: usize,
 ) {
     let mut path = Vec::new();
-    let mut page_mut = page::PageMut::new(page_size, crate::PageId(0));
+    let mut page_mut = page::PageMut::new(page_size, format::PageId(0));
 
-    let op = format::PageOp::Write(write);
+    let op = format::page::PageOp::Write(write);
     let key = write.key();
 
-    path.push((page_dir.root, page_dir.get(page_dir.root).unwrap()));
+    path.push((page_store.root, page_cache.get(page_store.root).unwrap()));
     loop {
         let (_, current_idx) = path.last().unwrap();
-        let mut current = buf_pool[*current_idx].read();
+        let mut current = page_cache[*current_idx].read();
         if current.is_inner() {
             let id = current.search_inner(key);
-            path.push((id, page_dir.get(id).unwrap()));
+            path.push((id, page_cache.get(id).unwrap()));
         } else {
             break;
         }
@@ -571,16 +444,16 @@ pub fn apply_write(
 
     let (leaf_id, leaf_idx) = path.pop().unwrap();
 
-    if !buf_pool[leaf_idx].write(&op) {
+    if !page_cache[leaf_idx].write(&op) {
         let new_page = &mut page_mut;
         new_page.clear();
         new_page.pid = leaf_id;
-        new_page.compact(buf_pool[leaf_idx].read(), oldest_active_ts);
+        new_page.compact(page_cache[leaf_idx].read(), oldest_active_ts);
 
         if let Err(()) = new_page.write_op(op) {
             let mut middle_key = Vec::new();
 
-            let to_page_id = page_dir.new_page_id();
+            let to_page_id = page_store.new_page_id();
             let mut to_page = new_page.split_leaf(&mut middle_key, to_page_id);
 
             if key <= &middle_key[..] {
@@ -589,13 +462,13 @@ pub fn apply_write(
                 new_page.write_op(op).unwrap();
             }
 
-            let to_page_idx = free_list.pop().unwrap();
-            to_page.pack(&mut buf_pool[to_page_idx]);
-            page_dir.insert(to_page_id, to_page_idx);
+            let to_page_idx = page_cache.pop_free();
+            to_page.pack(&mut page_cache[to_page_idx]);
+            page_cache.insert(to_page_id, to_page_idx);
 
-            new_page.pack(&mut buf_pool[leaf_idx]);
+            new_page.pack(&mut page_cache[leaf_idx]);
 
-            let mut parent_op = format::SplitOp {
+            let mut parent_op = format::page::SplitOp {
                 middle_key: &middle_key,
                 left_pid: to_page_id,
             };
@@ -604,45 +477,45 @@ pub fn apply_write(
             'split: loop {
                 match path.pop() {
                     Some((parent_id, parent_idx)) => {
-                        if !buf_pool[parent_idx]
-                            .write(&format::PageOp::SMO(format::SMOp::Split(parent_op)))
-                        {
+                        if !page_cache[parent_idx].write(&format::page::PageOp::SMO(
+                            format::page::SMOp::Split(parent_op),
+                        )) {
                             let new_parent = &mut page_mut;
                             new_parent.clear();
                             new_parent.pid = parent_id;
-                            new_parent.compact(buf_pool[parent_idx].read(), oldest_active_ts);
+                            new_parent.compact(page_cache[parent_idx].read(), oldest_active_ts);
 
-                            if let Err(()) = new_parent
-                                .write_op(format::PageOp::SMO(format::SMOp::Split(parent_op)))
-                            {
-                                let to_parent_id = page_dir.new_page_id();
+                            if let Err(()) = new_parent.write_op(format::page::PageOp::SMO(
+                                format::page::SMOp::Split(parent_op),
+                            )) {
+                                let to_parent_id = page_store.new_page_id();
                                 let mut temp_key = Vec::new();
                                 let mut to_parent =
                                     new_parent.split_inner(&mut temp_key, to_parent_id);
 
                                 if &middle_key <= &temp_key {
                                     to_parent
-                                        .write_op(format::PageOp::SMO(format::SMOp::Split(
-                                            parent_op,
-                                        )))
+                                        .write_op(format::page::PageOp::SMO(
+                                            format::page::SMOp::Split(parent_op),
+                                        ))
                                         .unwrap();
                                 } else {
                                     new_parent
-                                        .write_op(format::PageOp::SMO(format::SMOp::Split(
-                                            parent_op,
-                                        )))
+                                        .write_op(format::page::PageOp::SMO(
+                                            format::page::SMOp::Split(parent_op),
+                                        ))
                                         .unwrap();
                                 }
 
-                                let to_parent_idx = free_list.pop().unwrap();
-                                to_parent.pack(&mut buf_pool[to_parent_idx]);
-                                page_dir.insert(to_parent_id, to_parent_idx);
+                                let to_parent_idx = page_cache.pop_free();
+                                to_parent.pack(&mut page_cache[to_parent_idx]);
+                                page_cache.insert(to_parent_id, to_parent_idx);
 
-                                new_parent.pack(&mut buf_pool[parent_idx]);
+                                new_parent.pack(&mut page_cache[parent_idx]);
 
                                 middle_key.clear();
                                 middle_key.extend(temp_key);
-                                parent_op = format::SplitOp {
+                                parent_op = format::page::SplitOp {
                                     middle_key: &middle_key,
                                     left_pid: to_parent_id,
                                 };
@@ -650,7 +523,7 @@ pub fn apply_write(
 
                                 continue 'split;
                             } else {
-                                new_parent.pack(&mut buf_pool[parent_idx]);
+                                new_parent.pack(&mut page_cache[parent_idx]);
                                 break 'split;
                             }
                         } else {
@@ -660,26 +533,28 @@ pub fn apply_write(
                     None => {
                         let new_root = &mut page_mut;
                         new_root.clear();
-                        let new_root_id = page_dir.new_page_id();
+                        let new_root_id = page_store.new_page_id();
                         new_root.pid = new_root_id;
                         new_root.set_right_pid(right);
-                        new_root.set_left_pid(crate::PageId(u64::MAX));
+                        new_root.set_left_pid(format::PageId(u64::MAX));
                         new_root
-                            .write_op(format::PageOp::SMO(format::SMOp::Split(parent_op)))
+                            .write_op(format::page::PageOp::SMO(format::page::SMOp::Split(
+                                parent_op,
+                            )))
                             .unwrap();
 
-                        let new_root_idx = free_list.pop().unwrap();
-                        page_dir.root = new_root_id;
+                        let new_root_idx = page_cache.pop_free();
+                        page_store.root = new_root_id;
 
-                        new_root.pack(&mut buf_pool[new_root_idx]);
-                        page_dir.insert(new_root_id, new_root_idx);
+                        new_root.pack(&mut page_cache[new_root_idx]);
+                        page_cache.insert(new_root_id, new_root_idx);
 
                         break 'split;
                     }
                 }
             }
         } else {
-            new_page.pack(&mut buf_pool[leaf_idx]);
+            new_page.pack(&mut page_cache[leaf_idx]);
         }
     }
 }

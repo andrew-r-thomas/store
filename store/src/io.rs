@@ -1,9 +1,8 @@
 use std::{collections, mem, ops::Deref};
 
-use crate::{
-    format::{self, Format},
-    page, shard,
-};
+use format::{self, Format, net};
+
+use crate::{page, page_cache, shard};
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -64,7 +63,7 @@ pub struct Conn {
     /// need to answer the question of when txns get removed from this map, this is a little tricky
     /// because it seems like two places need to think about when a txn is finished within a shard
     /// both the connection itself, and the shard which owns it
-    pub txns: collections::BTreeMap<crate::ConnTxnId, TxnQueue>,
+    pub txns: collections::BTreeMap<format::ConnTxnId, TxnQueue>,
 }
 impl Conn {
     pub fn new(id: crate::ConnId) -> Self {
@@ -81,7 +80,7 @@ impl Conn {
             // TODO: error handling
             // (eof means we just stop reading,
             // but we also need to handle thing like malformed requests, etc)
-            while let Ok(request) = format::Request::from_bytes(&self.in_buf[cursor..]) {
+            while let Ok(request) = net::Request::from_bytes(&self.in_buf[cursor..]) {
                 cursor += request.len();
                 match self.txns.get_mut(&request.txn_id) {
                     Some(txn_buf) => {
@@ -115,7 +114,7 @@ impl Conn {
         // just round robin for fairness between txns for now
         for (txn_id, txn_queue) in &mut self.txns {
             if let Some(op) = txn_queue.iter_to().next() {
-                let resp = format::Response {
+                let resp = net::Response {
                     txn_id: *txn_id,
                     op,
                 };
@@ -144,11 +143,11 @@ pub struct TxnQueue {
     pub sealed: bool,
 }
 impl TxnQueue {
-    pub fn iter_from(&self) -> format::FormatIter<'_, format::RequestOp<'_>> {
-        format::FormatIter::<format::RequestOp>::from(&self.from[..])
+    pub fn iter_from(&self) -> format::FormatIter<'_, net::RequestOp<'_>> {
+        format::FormatIter::<net::RequestOp>::from(&self.from[..])
     }
-    pub fn iter_to(&self) -> format::FormatIter<'_, Result<format::Resp<'_>, format::Error>> {
-        format::FormatIter::<Result<format::Resp, format::Error>>::from(&self.to[..])
+    pub fn iter_to(&self) -> format::FormatIter<'_, Result<net::Resp<'_>, format::Error>> {
+        format::FormatIter::<Result<net::Resp, format::Error>>::from(&self.to[..])
     }
     pub fn pop_from(&mut self) {
         let mut from_iter = self.iter_from();
@@ -156,7 +155,7 @@ impl TxnQueue {
             self.from.drain(..op.len());
         }
     }
-    pub fn push_to(&mut self, response: Result<format::Resp, format::Error>) {
+    pub fn push_to(&mut self, response: Result<net::Resp, format::Error>) {
         let to_len = self.to.len();
         self.to.resize(to_len + response.len(), 0);
         response.write_to_buf(&mut self.to[to_len..]);
@@ -168,13 +167,19 @@ pub type BlockId = u64;
 pub const CHUNK_LEN_SIZE: usize = mem::size_of::<u64>();
 pub const PID_SIZE: usize = mem::size_of::<u64>();
 
-pub struct StorageManager {
+pub struct PageStore {
     pub flush_buf: FlushBuf,
     pub block_bufs: Vec<Vec<u8>>,
-    pub offset_table: collections::BTreeMap<crate::PageId, Vec<u64>>,
+    pub offset_table: collections::BTreeMap<format::PageId, Vec<u64>>,
     pub pend_blocks: PendingBlocks,
+
+    /// ## TODO
+    /// will eventually have a bunch of other metadata about the index file
+    pub root: format::PageId,
+
+    pub next_pid: format::PageId,
 }
-impl StorageManager {
+impl PageStore {
     pub fn new(block_size: usize, num_block_bufs: usize, cap: u64) -> Self {
         Self {
             flush_buf: FlushBuf {
@@ -191,18 +196,17 @@ impl StorageManager {
                 cap,
                 pend_block: None,
             },
+
+            // TODO: update when we do persistence
+            root: format::PageId(1),
+            next_pid: format::PageId(2),
         }
     }
     /// so we want to find out if we need to read anything,
     /// writing happens in line with write_chunk,
     /// triggering gc happens in write_chunk,
     /// and read_block makes progress on anything we can with the new block of data
-    pub fn tick<IO: IOFace>(
-        &mut self,
-        io: &mut IO,
-        buf_pool: &mut Vec<page::PageBuffer>,
-        page_dir: &mut shard::PageDir,
-    ) {
+    pub fn tick<IO: IOFace>(&mut self, io: &mut IO, page_cache: &mut page_cache::PageCache) {
         // check the flush buffer first,
         if self
             .pend_blocks
@@ -210,7 +214,7 @@ impl StorageManager {
             .contains_key(&self.pend_blocks.head)
         {
             self.pend_blocks
-                .read_block(self.pend_blocks.head, &self.flush_buf, buf_pool, page_dir);
+                .read_block(self.pend_blocks.head, &self.flush_buf, page_cache);
         }
 
         // check if we need to issue any reads
@@ -239,7 +243,7 @@ impl StorageManager {
             self.pend_blocks.pend_block = Some(*block_id);
         }
     }
-    pub fn inc_prio(&mut self, pid: crate::PageId, free_list: &mut Vec<usize>) {
+    pub fn inc_prio(&mut self, pid: format::PageId, page_cache: &mut page_cache::PageCache) {
         match self.pend_blocks.page_requests.get_mut(&pid) {
             Some(page_request) => page_request.prio += 1,
             None => {
@@ -258,7 +262,7 @@ impl StorageManager {
                     pid,
                     PageRequest {
                         prio: 1,
-                        idx: free_list.pop().unwrap(),
+                        idx: page_cache.pop_free(),
                         len: 0,
                         offs: offs,
                     },
@@ -268,7 +272,7 @@ impl StorageManager {
     }
     pub fn write_chunk<IO: IOFace>(
         &mut self,
-        pid: crate::PageId,
+        pid: format::PageId,
         chunk: &[u8],
         io: &mut IO,
         base: bool,
@@ -290,11 +294,15 @@ impl StorageManager {
         &mut self,
         block: &[u8],
         block_id: BlockId,
-        buf_pool: &mut Vec<page::PageBuffer>,
-        page_dir: &mut shard::PageDir,
+        page_cache: &mut page_cache::PageCache,
     ) {
-        self.pend_blocks
-            .read_block(block_id, block, buf_pool, page_dir);
+        self.pend_blocks.read_block(block_id, block, page_cache);
+    }
+
+    pub fn new_page_id(&mut self) -> format::PageId {
+        let old = self.next_pid.0;
+        self.next_pid.0 += 1;
+        format::PageId(old)
     }
 }
 pub struct FlushBuf {
@@ -305,7 +313,7 @@ impl FlushBuf {
     pub fn cap(&self) -> u64 {
         self.buf.len() as u64
     }
-    pub fn write_chunk(&mut self, pid: crate::PageId, chunk: &[u8]) -> Result<u64, ()> {
+    pub fn write_chunk(&mut self, pid: format::PageId, chunk: &[u8]) -> Result<u64, ()> {
         if self.buf.len() - self.off < PID_SIZE + CHUNK_LEN_SIZE + chunk.len() {
             return Err(());
         }
@@ -337,8 +345,8 @@ impl Deref for FlushBuf {
     }
 }
 pub struct PendingBlocks {
-    pub page_requests: collections::BTreeMap<crate::PageId, PageRequest>,
-    pub block_requests: collections::BTreeMap<BlockId, Vec<crate::PageId>>,
+    pub page_requests: collections::BTreeMap<format::PageId, PageRequest>,
+    pub block_requests: collections::BTreeMap<BlockId, Vec<format::PageId>>,
 
     pub pend_block: Option<BlockId>,
 
@@ -355,13 +363,12 @@ impl PendingBlocks {
         &mut self,
         block_id: BlockId,
         block: &[u8],
-        buf_pool: &mut Vec<page::PageBuffer>,
-        page_dir: &mut shard::PageDir,
+        page_cache: &mut page_cache::PageCache,
     ) {
         if let Some(block_request) = self.block_requests.remove(&block_id) {
             for pid in block_request {
                 let page_request = self.page_requests.get_mut(&pid).unwrap();
-                let page = &mut buf_pool[page_request.idx];
+                let page = &mut page_cache[page_request.idx];
                 let buf = page.raw_buffer_mut();
                 loop {
                     let offset = page_request.offs.pop().unwrap();
@@ -402,7 +409,7 @@ impl PendingBlocks {
                             buf.copy_within(0..page_request.len, buf.len() - page_request.len);
                             page.top = buf.len() - page_request.len;
                             page.flush = page.top;
-                            page_dir.insert(pid, page_request.idx);
+                            page_cache.insert(pid, page_request.idx);
                             self.page_requests.remove(&pid);
                             break;
                         }
@@ -420,7 +427,7 @@ impl PendingBlocks {
 
     pub fn write_chunk<IO: IOFace>(
         &mut self,
-        pid: crate::PageId,
+        pid: format::PageId,
         chunk: &[u8],
         flush_buf: &mut FlushBuf,
         block_bufs: &mut Vec<Vec<u8>>,

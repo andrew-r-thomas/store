@@ -1,69 +1,8 @@
-use std::{alloc, collections, slice};
+use std::collections;
 
-use crate::{
-    PageId,
-    format::{self, Format},
-};
+use format::{self, Format, op, page};
 
-pub struct PageBuffer {
-    ptr: *mut u8,
-    pub top: usize,
-    pub cap: usize,
-    pub flush: usize,
-}
-impl PageBuffer {
-    pub fn new(cap: usize) -> Self {
-        let layout = std::alloc::Layout::array::<u8>(cap).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout)
-        }
-        Self {
-            ptr,
-            cap,
-            top: cap,
-            flush: cap,
-        }
-    }
-
-    pub fn read(&self) -> format::Page<'_> {
-        format::Page::from(unsafe {
-            slice::from_raw_parts(self.ptr.add(self.top), self.cap - self.top)
-        })
-    }
-    pub fn write(&mut self, op: &format::PageOp) -> bool {
-        let len = op.len();
-
-        if len > self.top {
-            return false;
-        }
-
-        op.write_to_buf(unsafe { slice::from_raw_parts_mut(self.ptr.add(self.top - len), len) });
-        self.top -= len;
-
-        true
-    }
-
-    #[inline]
-    pub fn raw_buffer_mut(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.ptr, self.cap) }
-    }
-    pub fn clear(&mut self) {
-        self.raw_buffer_mut().fill(0);
-        self.top = self.cap;
-        self.flush = self.cap;
-    }
-    pub fn flush(&mut self) -> &[u8] {
-        let out = &(unsafe { slice::from_raw_parts(self.ptr, self.cap) })[self.top..self.flush];
-        self.flush = self.top;
-        out
-    }
-}
-impl Drop for PageBuffer {
-    fn drop(&mut self) {
-        unsafe { alloc::dealloc(self.ptr, alloc::Layout::array::<u8>(self.cap).unwrap()) }
-    }
-}
+use crate::page_cache;
 
 // TODO: this is gonna need another pass after messing with format
 // PERF: im just gonna be sloppy and allocate/free all over the place here, for some reason this
@@ -73,28 +12,28 @@ impl Drop for PageBuffer {
 // make this better once i get a better sense of how it'll be used, and it definietly doesn't need
 // to be treated as a "page"
 pub struct PageMut {
-    pub pid: crate::PageId,
+    pub pid: format::PageId,
     pub ops: Vec<u8>,
     pub entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
-    pub left_pid: PageId,
-    pub right_pid: PageId,
+    pub left_pid: format::PageId,
+    pub right_pid: format::PageId,
 
     pub total_compacted_size: usize,
     pub page_size: usize,
 }
 impl PageMut {
-    pub fn new(page_size: usize, pid: crate::PageId) -> Self {
+    pub fn new(page_size: usize, pid: format::PageId) -> Self {
         Self {
             pid,
             ops: Vec::new(),
             entries: std::collections::BTreeMap::new(),
-            left_pid: PageId(0),
-            right_pid: PageId(0),
-            total_compacted_size: format::Page::ENTRIES_LEN_SIZE + (format::PID_SIZE * 2),
+            left_pid: format::PageId(0),
+            right_pid: format::PageId(0),
+            total_compacted_size: page::Page::ENTRIES_LEN_SIZE + (format::PageId::SIZE * 2),
             page_size,
         }
     }
-    pub fn compact(&mut self, mut page: format::Page, oldest_active_ts: crate::Timestamp) {
+    pub fn compact(&mut self, mut page: page::Page, oldest_active_ts: format::Timestamp) {
         assert!(self.ops.len() == 0);
         assert!(self.entries.len() == 0);
         // build up the base page
@@ -127,7 +66,7 @@ impl PageMut {
                 let mut last = None;
                 while let Some(op) = page.ops.next() {
                     match op {
-                        format::PageOp::Write(page_write) => {
+                        page::PageOp::Write(page_write) => {
                             if page_write.ts < oldest_active_ts {
                                 last = Some(op);
                                 break;
@@ -151,27 +90,27 @@ impl PageMut {
             }
         }
     }
-    pub fn write_op(&mut self, op: format::PageOp) -> Result<(), ()> {
+    pub fn write_op(&mut self, op: page::PageOp) -> Result<(), ()> {
         if op.len() + self.total_compacted_size + self.ops.len() > self.page_size {
             return Err(());
         }
 
         match op {
-            format::PageOp::Write(page_write) => {
+            page::PageOp::Write(page_write) => {
                 let old_len = self.ops.len();
                 self.ops.resize(old_len + page_write.len(), 0);
                 self.ops.copy_within(0..old_len, page_write.len());
                 page_write.write_to_buf(&mut self.ops[0..page_write.len()]);
             }
-            format::PageOp::SMO(_) => self.apply_op(op),
+            page::PageOp::SMO(_) => self.apply_op(op),
         }
 
         Ok(())
     }
-    fn apply_op(&mut self, op: format::PageOp) {
+    fn apply_op(&mut self, op: page::PageOp) {
         match op {
-            format::PageOp::Write(write) => match write.write {
-                format::WriteOp::Set(set) => {
+            page::PageOp::Write(write) => match write.write {
+                op::WriteOp::Set(set) => {
                     assert_ne!(self.left_pid.0, u64::MAX);
                     match self.entries.insert(Vec::from(set.key), Vec::from(set.val)) {
                         Some(old_val) => {
@@ -179,7 +118,7 @@ impl PageMut {
                             self.total_compacted_size += set.val.len();
                         }
                         None => {
-                            let entry = format::LeafEntry {
+                            let entry = page::LeafEntry {
                                 key: set.key,
                                 val: set.val,
                             };
@@ -187,11 +126,11 @@ impl PageMut {
                         }
                     }
                 }
-                format::WriteOp::Del(del) => {
+                op::WriteOp::Del(del) => {
                     assert_ne!(self.left_pid.0, u64::MAX);
                     match self.entries.remove(del.key) {
                         Some(old) => {
-                            let entry = format::LeafEntry {
+                            let entry = page::LeafEntry {
                                 key: del.key,
                                 val: &old,
                             };
@@ -204,11 +143,11 @@ impl PageMut {
                     }
                 }
             },
-            format::PageOp::SMO(smop) => match smop {
-                format::SMOp::Split(split) => {
+            page::PageOp::SMO(smop) => match smop {
+                page::SMOp::Split(split) => {
                     assert_eq!(self.left_pid.0, u64::MAX);
                     // splits are always inserts, not updates
-                    let entry = format::InnerEntry {
+                    let entry = page::InnerEntry {
                         left_pid: split.left_pid,
                         middle_key: split.middle_key,
                     };
@@ -221,7 +160,7 @@ impl PageMut {
             },
         }
     }
-    pub fn split_inner(&mut self, middle_key_buf: &mut Vec<u8>, to_pid: crate::PageId) -> Self {
+    pub fn split_inner(&mut self, middle_key_buf: &mut Vec<u8>, to_pid: format::PageId) -> Self {
         assert_eq!(self.left_pid.0, u64::MAX);
         assert_eq!(self.ops.len(), 0);
 
@@ -233,8 +172,8 @@ impl PageMut {
         let mut i = 0;
         while i < middle_entry_i {
             let (k, v) = self.entries.pop_first().unwrap();
-            let entry = format::InnerEntry {
-                left_pid: crate::PageId(u64::from_be_bytes(v[..].try_into().unwrap())),
+            let entry = page::InnerEntry {
+                left_pid: format::PageId(u64::from_be_bytes(v[..].try_into().unwrap())),
                 middle_key: &k,
             };
             self.total_compacted_size -= entry.len();
@@ -243,8 +182,8 @@ impl PageMut {
             i += 1;
         }
         let (k, v) = self.entries.pop_first().unwrap();
-        let middle_entry = format::InnerEntry {
-            left_pid: crate::PageId(u64::from_be_bytes(v[..].try_into().unwrap())),
+        let middle_entry = page::InnerEntry {
+            left_pid: format::PageId(u64::from_be_bytes(v[..].try_into().unwrap())),
             middle_key: &k,
         };
         self.total_compacted_size -= middle_entry.len();
@@ -253,7 +192,7 @@ impl PageMut {
 
         other
     }
-    pub fn split_leaf(&mut self, middle_key_buf: &mut Vec<u8>, to_pid: crate::PageId) -> Self {
+    pub fn split_leaf(&mut self, middle_key_buf: &mut Vec<u8>, to_pid: format::PageId) -> Self {
         assert_ne!(self.left_pid.0, u64::MAX);
 
         let mut other = Self::new(self.page_size, to_pid);
@@ -261,7 +200,7 @@ impl PageMut {
 
         // first we find the middle key
         let mut keys = collections::BTreeSet::new();
-        let op_iter = format::FormatIter::<format::PageWrite>::from(&self.ops[..]);
+        let op_iter = format::FormatIter::<page::PageWrite>::from(&self.ops[..]);
         for op in op_iter {
             keys.insert(op.key().to_vec());
         }
@@ -281,14 +220,14 @@ impl PageMut {
                 self.entries.insert(k, v);
                 break;
             }
-            let entry = format::LeafEntry { key: &k, val: &v };
+            let entry = page::LeafEntry { key: &k, val: &v };
             self.total_compacted_size -= entry.len();
             other.total_compacted_size += entry.len();
             other.entries.insert(k, v);
         }
 
         let mut new_self_ops = Vec::new();
-        for op in format::FormatIter::<'_, format::PageWrite<'_>>::from(&self.ops[..]) {
+        for op in format::FormatIter::<'_, page::PageWrite<'_>>::from(&self.ops[..]) {
             if op.key() <= &middle_key[..] {
                 let old_len = other.ops.len();
                 other.ops.resize(old_len + op.len(), 0);
@@ -305,11 +244,11 @@ impl PageMut {
         other
     }
     #[inline]
-    pub fn set_right_pid(&mut self, page_id: PageId) {
+    pub fn set_right_pid(&mut self, page_id: format::PageId) {
         self.right_pid = page_id;
     }
     #[inline]
-    pub fn set_left_pid(&mut self, page_id: PageId) {
+    pub fn set_left_pid(&mut self, page_id: format::PageId) {
         self.left_pid = page_id;
     }
     pub fn clear(&mut self) {
@@ -317,9 +256,9 @@ impl PageMut {
         self.ops.clear();
         self.left_pid.0 = 0;
         self.right_pid.0 = 0;
-        self.total_compacted_size = format::Page::ENTRIES_LEN_SIZE + (format::PID_SIZE * 2);
+        self.total_compacted_size = page::Page::ENTRIES_LEN_SIZE + (format::PageId::SIZE * 2);
     }
-    pub fn pack(&mut self, page_buf: &mut PageBuffer) {
+    pub fn pack(&mut self, page_buf: &mut page_cache::PageBuffer) {
         assert_eq!(page_buf.cap, self.page_size);
 
         page_buf.clear();
@@ -334,27 +273,29 @@ impl PageMut {
         let entries_start = cursor;
         for (k, v) in self.entries.iter() {
             if self.left_pid.0 == u64::MAX {
-                let entry = format::InnerEntry {
-                    left_pid: crate::PageId::from_bytes(&v).unwrap(),
+                let entry = page::InnerEntry {
+                    left_pid: format::PageId::from_bytes(&v).unwrap(),
                     middle_key: &k,
                 };
                 entry.write_to_buf(&mut buf[cursor..cursor + entry.len()]);
                 cursor += entry.len();
             } else {
-                let entry = format::LeafEntry { key: &k, val: &v };
+                let entry = page::LeafEntry { key: &k, val: &v };
                 entry.write_to_buf(&mut buf[cursor..cursor + entry.len()]);
                 cursor += entry.len();
             }
         }
 
-        buf[cursor..cursor + format::Page::ENTRIES_LEN_SIZE]
+        buf[cursor..cursor + page::Page::ENTRIES_LEN_SIZE]
             .copy_from_slice(&((cursor - entries_start) as u64).to_be_bytes());
-        cursor += format::Page::ENTRIES_LEN_SIZE;
-        buf[cursor..cursor + format::PID_SIZE].copy_from_slice(&self.left_pid.0.to_be_bytes());
-        cursor += format::PID_SIZE;
-        buf[cursor..cursor + format::PID_SIZE].copy_from_slice(&self.right_pid.0.to_be_bytes());
+        cursor += page::Page::ENTRIES_LEN_SIZE;
+        self.left_pid
+            .write_to_buf(&mut buf[cursor..cursor + self.left_pid.len()]);
+        cursor += self.left_pid.len();
+        self.right_pid
+            .write_to_buf(&mut buf[cursor..cursor + self.right_pid.len()]);
+        cursor += self.right_pid.len();
 
-        cursor += format::PID_SIZE;
         assert_eq!(cursor, buf.len());
     }
 }

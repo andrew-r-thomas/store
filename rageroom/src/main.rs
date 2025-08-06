@@ -6,16 +6,13 @@ use std::{
 };
 
 use clap::Parser;
+use format::{Format, net, op};
 use rand::{
     Rng, SeedableRng,
     seq::{IndexedMutRandom, IndexedRandom},
 };
 use serde::Deserialize;
-use store::{
-    central,
-    format::{self, Format},
-    io, mesh, shard,
-};
+use store::{central, io, mesh, shard};
 
 #[derive(Parser)]
 struct Args {
@@ -24,6 +21,7 @@ struct Args {
 }
 
 fn main() {
+    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new()).unwrap();
     let args = Args::parse();
     let sim_config = SimConfig::load(&args.sim_config);
     let db_config = store::config::Config::load(&args.db_config).unwrap();
@@ -213,9 +211,9 @@ impl Tick for TestConn {
                 self.rng.fill(&mut key[..]);
                 self.rng.fill(&mut val[..]);
 
-                let req = format::Request {
-                    txn_id: store::ConnTxnId(1),
-                    op: format::RequestOp::Write(format::WriteOp::Set(format::SetOp {
+                let req = net::Request {
+                    txn_id: format::ConnTxnId(1),
+                    op: net::RequestOp::Write(op::WriteOp::Set(op::SetOp {
                         key: &key,
                         val: &val,
                     })),
@@ -224,25 +222,25 @@ impl Tick for TestConn {
                 req.write_to_buf(&mut reqbuf);
                 conn_bufs.from_conn.extend(reqbuf);
 
-                let expected_resp = format::Response {
-                    txn_id: store::ConnTxnId(1),
-                    op: Ok(format::Resp::Success),
+                let expected_resp = net::Response {
+                    txn_id: format::ConnTxnId(1),
+                    op: Ok(net::Resp::Success),
                 };
 
                 self.entries.push((key, val));
                 self.expected.push_back(expected_resp.to_vec());
 
-                let commit = format::Request {
-                    txn_id: store::ConnTxnId(1),
-                    op: format::RequestOp::Commit,
+                let commit = net::Request {
+                    txn_id: format::ConnTxnId(1),
+                    op: net::RequestOp::Commit,
                 };
                 let mut commit_buf = vec![0; commit.len()];
                 commit.write_to_buf(&mut commit_buf);
                 conn_bufs.from_conn.extend(commit_buf);
 
-                let e_r = format::Response {
-                    txn_id: store::ConnTxnId(1),
-                    op: Ok(format::Resp::Success),
+                let e_r = net::Response {
+                    txn_id: format::ConnTxnId(1),
+                    op: Ok(net::Resp::Success),
                 };
                 self.expected.push_back(e_r.to_vec());
             } else if self.ticks < self.num_ingest + self.num_ops {
@@ -258,9 +256,9 @@ impl Tick for TestConn {
                         self.rng.fill(&mut key[..]);
                         self.rng.fill(&mut val[..]);
 
-                        let req = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Write(format::WriteOp::Set(format::SetOp {
+                        let req = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Write(op::WriteOp::Set(op::SetOp {
                                 key: &key,
                                 val: &val,
                             })),
@@ -269,24 +267,24 @@ impl Tick for TestConn {
                         req.write_to_buf(&mut reqbuf);
                         conn_bufs.from_conn.extend(reqbuf);
 
-                        let expected_resp = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let expected_resp = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
 
                         self.entries.push((key, val));
                         self.expected.push_back(expected_resp.to_vec());
-                        let commit = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Commit,
+                        let commit = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Commit,
                         };
                         let mut commit_buf = vec![0; commit.len()];
                         commit.write_to_buf(&mut commit_buf);
                         conn_bufs.from_conn.extend(commit_buf);
 
-                        let e_r = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let e_r = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
                         self.expected.push_back(e_r.to_vec());
                     }
@@ -297,9 +295,9 @@ impl Tick for TestConn {
                         self.rng.fill(&mut new_val[..]);
                         *val = new_val;
 
-                        let req = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Write(format::WriteOp::Set(format::SetOp {
+                        let req = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Write(op::WriteOp::Set(op::SetOp {
                                 key: &key,
                                 val: &val,
                             })),
@@ -308,56 +306,54 @@ impl Tick for TestConn {
                         req.write_to_buf(&mut reqbuf);
                         conn_bufs.from_conn.extend(reqbuf);
 
-                        let expected_resp = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let expected_resp = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
 
                         self.expected.push_back(expected_resp.to_vec());
-                        let commit = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Commit,
+                        let commit = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Commit,
                         };
                         let mut commit_buf = vec![0; commit.len()];
                         commit.write_to_buf(&mut commit_buf);
                         conn_bufs.from_conn.extend(commit_buf);
 
-                        let e_r = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let e_r = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
                         self.expected.push_back(e_r.to_vec());
                     }
                     "get" => {
                         let (key, val) = self.entries.choose(&mut self.rng).unwrap();
 
-                        let req = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Read(format::ReadOp::Get(format::GetOp {
-                                key: &key,
-                            })),
+                        let req = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Read(op::ReadOp::Get(op::GetOp { key: &key })),
                         };
                         let mut reqbuf = vec![0; req.len()];
                         req.write_to_buf(&mut reqbuf);
                         conn_bufs.from_conn.extend(reqbuf);
 
-                        let expected_resp = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Get(Some(&val))),
+                        let expected_resp = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Get(Some(&val))),
                         };
 
                         self.expected.push_back(expected_resp.to_vec());
-                        let commit = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Commit,
+                        let commit = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Commit,
                         };
                         let mut commit_buf = vec![0; commit.len()];
                         commit.write_to_buf(&mut commit_buf);
                         conn_bufs.from_conn.extend(commit_buf);
 
-                        let e_r = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let e_r = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
                         self.expected.push_back(e_r.to_vec());
                     }
@@ -365,33 +361,31 @@ impl Tick for TestConn {
                         let idx = self.rng.random_range(0..self.entries.len());
                         let (key, _) = self.entries.remove(idx);
 
-                        let req = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Write(format::WriteOp::Del(format::DelOp {
-                                key: &key,
-                            })),
+                        let req = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Write(op::WriteOp::Del(op::DelOp { key: &key })),
                         };
                         let mut reqbuf = vec![0; req.len()];
                         req.write_to_buf(&mut reqbuf);
                         conn_bufs.from_conn.extend(reqbuf);
 
-                        let expected_resp = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let expected_resp = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
 
                         self.expected.push_back(expected_resp.to_vec());
-                        let commit = format::Request {
-                            txn_id: store::ConnTxnId(1),
-                            op: format::RequestOp::Commit,
+                        let commit = net::Request {
+                            txn_id: format::ConnTxnId(1),
+                            op: net::RequestOp::Commit,
                         };
                         let mut commit_buf = vec![0; commit.len()];
                         commit.write_to_buf(&mut commit_buf);
                         conn_bufs.from_conn.extend(commit_buf);
 
-                        let e_r = format::Response {
-                            txn_id: store::ConnTxnId(1),
-                            op: Ok(format::Resp::Success),
+                        let e_r = net::Response {
+                            txn_id: format::ConnTxnId(1),
+                            op: Ok(net::Resp::Success),
                         };
                         self.expected.push_back(e_r.to_vec());
                     }

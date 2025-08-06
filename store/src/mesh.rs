@@ -7,10 +7,10 @@ use crate::central;
 pub enum Msg {
     NewConnection(crate::ConnId),
 
-    TxnStart(crate::Timestamp),
+    TxnStart(format::Timestamp),
     CommitRequest {
         txn_id: crate::ShardTxnId,
-        start_ts: crate::Timestamp,
+        start_ts: format::Timestamp,
         writes: Vec<u8>,
     },
     CommitResponse {
