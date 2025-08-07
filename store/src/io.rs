@@ -1,8 +1,9 @@
 use std::{collections, mem, ops::Deref};
 
 use format::{self, Format, net};
+use io_uring::{opcode, types};
 
-use crate::{page, page_cache, shard};
+use crate::page_cache;
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
@@ -463,4 +464,73 @@ pub struct PageRequest {
     idx: usize,
     len: usize,
     offs: Vec<u64>,
+}
+
+#[cfg(target_os = "linux")]
+mod uring {
+    use std::{
+        fs,
+        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    };
+
+    use super::*;
+
+    pub struct ShardIO {
+        index_fd: types::Fd,
+        uring: io_uring::IoUring,
+    }
+    impl ShardIO {
+        pub fn new() -> Self {
+            let index_fd = types::Fd(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open("store")
+                    .unwrap()
+                    .as_raw_fd(),
+            );
+            let uring = io_uring::IoUring::new(1024).unwrap();
+
+            Self { index_fd, uring }
+        }
+    }
+    impl IOFace for ShardIO {
+        fn register_sub(&mut self, sub: Sub) {
+            let entry = match sub {
+                Sub::FileRead { mut buf, offset } => {
+                    opcode::Read::new(self.index_fd, buf.as_mut_ptr(), buf.len() as _)
+                        .offset(offset)
+                        .build()
+                }
+                Sub::FileWrite { mut buf, offset } => {
+                    opcode::Write::new(self.index_fd, buf.as_mut_ptr(), buf.len() as _)
+                        .offset(offset)
+                        .build()
+                }
+                Sub::TcpRead { mut buf, conn_id } => {
+                    opcode::Recv::new(types::Fd(conn_id.0), buf.as_mut_ptr(), buf.len() as _)
+                        .build()
+                }
+                Sub::TcpWrite { mut buf, conn_id } => {
+                    opcode::Send::new(types::Fd(conn_id.0), buf.as_mut_ptr(), buf.len() as _)
+                        .build()
+                }
+                _ => panic!(),
+            };
+
+            unsafe {
+                self.uring.submission().push(&entry).unwrap();
+            }
+        }
+        fn submit(&mut self) {
+            self.uring.submitter().submit().unwrap();
+        }
+        // just get the current interface supported in a simple way for now, we'll probably want to
+        // change up the interface quite a bit as we go though
+        fn poll(&mut self) -> Vec<Comp> {
+            todo!()
+        }
+    }
 }

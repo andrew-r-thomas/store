@@ -9,7 +9,7 @@ pub mod page_cache;
 pub mod shard;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ConnId(pub u32);
+pub struct ConnId(pub i32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShardTxnId {
