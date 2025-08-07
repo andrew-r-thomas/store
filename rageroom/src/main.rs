@@ -101,7 +101,7 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
     };
 
     let mut query_node = Node {
-        workers: Vec::from_iter((0_u32..sim_config.num_clients as u32).map(|i| {
+        workers: Vec::from_iter((0..sim_config.num_clients as i32).map(|i| {
             TestConn::new(
                 sim_config.num_ingest,
                 sim_config.num_batches,
