@@ -1,18 +1,18 @@
-use std::{collections, mem, ops::Deref};
+use std::{collections, fmt::Debug, mem, ops::Deref};
 
 use format::{self, Format, net};
-use io_uring::{opcode, types};
 
 use crate::page_cache;
 
 /// this is basically just a trait that captures the io_uring interface, at a slightly higher level
 /// of abstraction, contextual to our use case. the main purpose of the trait is to allow our test
 /// harness to hook into our main system without too much trouble
-pub trait IOFace {
+pub trait IOFace: Debug {
     fn register_sub(&mut self, sub: Sub);
     fn submit(&mut self);
     fn poll(&mut self) -> Vec<Comp>;
 }
+#[derive(Debug)]
 pub enum Sub {
     Accept {},
     TcpRead {
@@ -32,7 +32,7 @@ pub enum Sub {
         offset: u64,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Comp {
     Accept {
         conn_id: crate::ConnId,
@@ -57,6 +57,7 @@ pub enum Comp {
     },
 }
 
+#[derive(Debug)]
 pub struct Conn {
     pub id: crate::ConnId,
     pub in_buf: Vec<u8>,
@@ -108,6 +109,7 @@ impl Conn {
             self.in_buf.drain(..cursor);
         }
     }
+    #[tracing::instrument(skip(self, io, net_bufs))]
     pub fn tick<IO: IOFace>(&mut self, io: &mut IO, net_bufs: &mut Vec<Vec<u8>>) {
         // write anything we can/have
         let mut net_buf = net_bufs.pop().unwrap();
@@ -138,6 +140,7 @@ impl Conn {
     }
 }
 
+#[derive(Debug)]
 pub struct TxnQueue {
     pub from: Vec<u8>,
     pub to: Vec<u8>,
@@ -464,73 +467,4 @@ pub struct PageRequest {
     idx: usize,
     len: usize,
     offs: Vec<u64>,
-}
-
-#[cfg(target_os = "linux")]
-mod uring {
-    use std::{
-        fs,
-        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    };
-
-    use super::*;
-
-    pub struct ShardIO {
-        index_fd: types::Fd,
-        uring: io_uring::IoUring,
-    }
-    impl ShardIO {
-        pub fn new() -> Self {
-            let index_fd = types::Fd(
-                fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .custom_flags(libc::O_DIRECT)
-                    .open("store")
-                    .unwrap()
-                    .as_raw_fd(),
-            );
-            let uring = io_uring::IoUring::new(1024).unwrap();
-
-            Self { index_fd, uring }
-        }
-    }
-    impl IOFace for ShardIO {
-        fn register_sub(&mut self, sub: Sub) {
-            let entry = match sub {
-                Sub::FileRead { mut buf, offset } => {
-                    opcode::Read::new(self.index_fd, buf.as_mut_ptr(), buf.len() as _)
-                        .offset(offset)
-                        .build()
-                }
-                Sub::FileWrite { mut buf, offset } => {
-                    opcode::Write::new(self.index_fd, buf.as_mut_ptr(), buf.len() as _)
-                        .offset(offset)
-                        .build()
-                }
-                Sub::TcpRead { mut buf, conn_id } => {
-                    opcode::Recv::new(types::Fd(conn_id.0), buf.as_mut_ptr(), buf.len() as _)
-                        .build()
-                }
-                Sub::TcpWrite { mut buf, conn_id } => {
-                    opcode::Send::new(types::Fd(conn_id.0), buf.as_mut_ptr(), buf.len() as _)
-                        .build()
-                }
-                _ => panic!(),
-            };
-
-            unsafe {
-                self.uring.submission().push(&entry).unwrap();
-            }
-        }
-        fn submit(&mut self) {
-            self.uring.submitter().submit().unwrap();
-        }
-        // just get the current interface supported in a simple way for now, we'll probably want to
-        // change up the interface quite a bit as we go though
-        fn poll(&mut self) -> Vec<Comp> {
-            todo!()
-        }
-    }
 }

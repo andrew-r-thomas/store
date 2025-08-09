@@ -1,16 +1,13 @@
 use std::{
     cell, collections, fs,
     io::{Read, Seek, Write},
-    path, rc,
+    mem, path, rc,
     sync::{self, atomic},
 };
 
 use clap::Parser;
-use format::{Format, net, op};
-use rand::{
-    Rng, SeedableRng,
-    seq::{IndexedMutRandom, IndexedRandom},
-};
+use format::Format;
+use rand::{Rng, SeedableRng, distr::Distribution, seq::IteratorRandom};
 use serde::Deserialize;
 use store::{central, io, mesh, shard};
 
@@ -33,9 +30,8 @@ pub struct SimConfig {
     pub seed: u64,
     pub key_len_range: std::ops::Range<usize>,
     pub val_len_range: std::ops::Range<usize>,
-    pub num_clients: usize,
-    pub num_ingest: usize,
-    pub num_batches: usize,
+    pub num_conns: usize,
+    pub num_txns: usize,
 }
 impl SimConfig {
     pub fn load(path: &path::Path) -> Self {
@@ -100,16 +96,17 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
         ],
     };
 
+    let data_oracle = rc::Rc::new(cell::RefCell::new(collections::BTreeMap::new()));
     let mut query_node = Node {
-        workers: Vec::from_iter((0..sim_config.num_clients as i32).map(|i| {
+        workers: Vec::from_iter((0..sim_config.num_conns as i32).map(|i| {
             TestConn::new(
-                sim_config.num_ingest,
-                sim_config.num_batches,
+                sim_config.num_txns,
                 rng.random(),
                 sim_config.key_len_range.clone(),
                 sim_config.val_len_range.clone(),
                 store::ConnId(i),
                 network_manager.clone(),
+                data_oracle.clone(),
             )
         })),
     };
@@ -124,7 +121,6 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
             let worker = &mut query_node.workers[worker_i];
             worker.tick();
             if worker.is_done() {
-                println!("worker {} done!", worker.id.0);
                 let mut network_manager = network_manager.borrow_mut();
                 network_manager.conn_bufs.remove(&worker.id);
                 query_node.workers.remove(worker_i);
@@ -137,17 +133,6 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
                 StoreNodeWorker::Shard(shard) => shard.io.process_subs(),
             }
         }
-
-        // let nm = network_manager.borrow();
-        // let mut total_from_conns = 0;
-        // let mut total_to_conns = 0;
-        // for (_, cb) in &nm.conn_bufs {
-        //     total_from_conns += cb.from_conn.len();
-        //     total_to_conns += cb.to_conn.len();
-        // }
-        // if total_from_conns > 0 || total_to_conns > 0 {
-        //     println!("total from: {total_from_conns}, total to: {total_to_conns}");
-        // }
     }
 
     println!("test completed successfully!");
@@ -156,99 +141,118 @@ pub fn run_sim(sim_config: SimConfig, db_config: store::config::Config) {
 struct TestConn {
     id: store::ConnId,
     network_manager: rc::Rc<cell::RefCell<TestNetworkManager>>,
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-    expected: std::collections::VecDeque<Vec<u8>>,
-    ticks: usize,
-    num_ingest: usize,
-    num_ops: usize,
+    data_oracle: rc::Rc<cell::RefCell<collections::BTreeMap<Vec<u8>, Vec<u8>>>>,
+
+    num_txns: usize,
+    completed_txns: usize,
+    active_txns: collections::BTreeMap<format::ConnTxnId, ActiveTxn>,
+    next_txn_id: u64,
+
     key_len_range: std::ops::Range<usize>,
     val_len_range: std::ops::Range<usize>,
     rng: rand_chacha::ChaCha8Rng,
 }
 impl TestConn {
     fn new(
-        num_ingest: usize,
-        num_ops: usize,
+        num_txns: usize,
         seed: u64,
         key_len_range: std::ops::Range<usize>,
         val_len_range: std::ops::Range<usize>,
         id: store::ConnId,
         network_manager: rc::Rc<cell::RefCell<TestNetworkManager>>,
+        data_oracle: rc::Rc<cell::RefCell<collections::BTreeMap<Vec<u8>, Vec<u8>>>>,
     ) -> Self {
         let rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+
         {
             let mut nm = network_manager.borrow_mut();
             nm.pending_conns.push(id);
         }
+
         Self {
             id,
             network_manager,
-            entries: Vec::new(),
-            expected: std::collections::VecDeque::new(),
-            ticks: 0,
-            num_ingest,
-            num_ops,
+            data_oracle,
+
+            num_txns,
+            completed_txns: 0,
+            next_txn_id: 1,
+            active_txns: collections::BTreeMap::new(),
+
             key_len_range,
             val_len_range,
             rng,
         }
     }
     fn is_done(&self) -> bool {
-        (self.ticks >= self.num_ingest + self.num_ops) && self.expected.is_empty()
+        self.completed_txns >= self.num_txns
     }
 }
-
 impl Tick for TestConn {
     fn tick(&mut self) {
-        let mut network_manager = self.network_manager.borrow_mut();
-        if let Some(conn_bufs) = network_manager.conn_bufs.get_mut(&self.id) {
-            if self.ticks < self.num_ingest {
-                // do an ingest
-                let key_len = self.rng.random_range(self.key_len_range.clone());
-                let val_len = self.rng.random_range(self.val_len_range.clone());
-                let mut key = vec![0; key_len];
-                let mut val = vec![0; val_len];
-                self.rng.fill(&mut key[..]);
-                self.rng.fill(&mut val[..]);
+        let mut nm = self.network_manager.borrow_mut();
 
-                let req = net::Request {
-                    txn_id: format::ConnTxnId(1),
-                    op: net::RequestOp::Write(op::WriteOp::Set(op::SetOp {
-                        key: &key,
-                        val: &val,
-                    })),
-                };
-                let mut reqbuf = vec![0; req.len()];
-                req.write_to_buf(&mut reqbuf);
-                conn_bufs.from_conn.extend(reqbuf);
+        let mut data = self.data_oracle.borrow_mut();
 
-                let expected_resp = net::Response {
-                    txn_id: format::ConnTxnId(1),
-                    op: Ok(net::Resp::Success),
-                };
+        if let Some(buf) = nm.conn_bufs.get_mut(&self.id) {
+            if let Some(txn) = {
+                if self.rng.random() && !self.active_txns.is_empty() {
+                    // make progress on an existing txn
+                    let (_, txn) = self.active_txns.iter_mut().choose(&mut self.rng).unwrap();
+                    if txn.committed { None } else { Some(txn) }
+                } else if self.completed_txns + self.active_txns.len() < self.num_txns {
+                    // start a new txn
+                    let id = format::ConnTxnId(self.next_txn_id);
+                    let txn = ActiveTxn {
+                        id,
+                        local_writes: Vec::new(),
+                        num_sent: 0,
+                        num_recv: 0,
+                        committed: false,
+                    };
+                    self.active_txns.insert(txn.id, txn);
+                    self.next_txn_id += 1;
 
-                self.entries.push((key, val));
-                self.expected.push_back(expected_resp.to_vec());
-
-                let commit = net::Request {
-                    txn_id: format::ConnTxnId(1),
-                    op: net::RequestOp::Commit,
-                };
-                let mut commit_buf = vec![0; commit.len()];
-                commit.write_to_buf(&mut commit_buf);
-                conn_bufs.from_conn.extend(commit_buf);
-
-                let e_r = net::Response {
-                    txn_id: format::ConnTxnId(1),
-                    op: Ok(net::Resp::Success),
-                };
-                self.expected.push_back(e_r.to_vec());
-            } else if self.ticks < self.num_ingest + self.num_ops {
-                // do an op
-                let ops = ["insert", "update", "get", "del"];
-                let chosen_op = ops.choose(&mut self.rng).unwrap();
-                match *chosen_op {
-                    "insert" => {
+                    Some(self.active_txns.get_mut(&id).unwrap())
+                } else {
+                    // done producing work
+                    None
+                }
+            } {
+                if let Some(request) = match self.rng.random::<ConnOp>() {
+                    ConnOp::Get => {
+                        if self.rng.random() && !txn.local_writes.is_empty() {
+                            // read from local data
+                            let write = format::FormatIter::<format::op::WriteOp>::from(
+                                &txn.local_writes[..],
+                            )
+                            .choose(&mut self.rng)
+                            .unwrap();
+                            Some(
+                                format::net::Request {
+                                    txn_id: txn.id,
+                                    op: format::net::RequestOp::Read(format::op::ReadOp::Get(
+                                        format::op::GetOp { key: write.key() },
+                                    )),
+                                }
+                                .to_vec(),
+                            )
+                        } else if let Some((key, _)) = data.iter().choose(&mut self.rng) {
+                            // read from oracle (note that sometimes this will be for local keys)
+                            Some(
+                                format::net::Request {
+                                    txn_id: txn.id,
+                                    op: format::net::RequestOp::Read(format::op::ReadOp::Get(
+                                        format::op::GetOp { key },
+                                    )),
+                                }
+                                .to_vec(),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    ConnOp::Insert => {
                         let key_len = self.rng.random_range(self.key_len_range.clone());
                         let val_len = self.rng.random_range(self.val_len_range.clone());
                         let mut key = vec![0; key_len];
@@ -256,159 +260,184 @@ impl Tick for TestConn {
                         self.rng.fill(&mut key[..]);
                         self.rng.fill(&mut val[..]);
 
-                        let req = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Write(op::WriteOp::Set(op::SetOp {
-                                key: &key,
+                        let op = format::op::WriteOp::Set(format::op::SetOp {
+                            key: &key[..],
+                            val: &val[..],
+                        });
+
+                        txn.local_writes.extend_from_slice(&op.to_vec());
+
+                        Some(
+                            format::net::Request {
+                                txn_id: txn.id,
+                                op: format::net::RequestOp::Write(op),
+                            }
+                            .to_vec(),
+                        )
+                    }
+                    ConnOp::Update => {
+                        if self.rng.random() && !txn.local_writes.is_empty() {
+                            let write = format::FormatIter::<format::op::WriteOp>::from(
+                                &txn.local_writes[..],
+                            )
+                            .choose(&mut self.rng)
+                            .unwrap();
+
+                            let val_len = self.rng.random_range(self.val_len_range.clone());
+                            let mut val = vec![0; val_len];
+                            self.rng.fill(&mut val[..]);
+
+                            let op = format::op::WriteOp::Set(format::op::SetOp {
+                                key: write.key(),
                                 val: &val,
-                            })),
-                        };
-                        let mut reqbuf = vec![0; req.len()];
-                        req.write_to_buf(&mut reqbuf);
-                        conn_bufs.from_conn.extend(reqbuf);
+                            });
 
-                        let expected_resp = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
+                            let out = format::net::Request {
+                                txn_id: txn.id,
+                                op: format::net::RequestOp::Write(op),
+                            }
+                            .to_vec();
+                            txn.local_writes.extend_from_slice(&op.to_vec());
 
-                        self.entries.push((key, val));
-                        self.expected.push_back(expected_resp.to_vec());
-                        let commit = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Commit,
-                        };
-                        let mut commit_buf = vec![0; commit.len()];
-                        commit.write_to_buf(&mut commit_buf);
-                        conn_bufs.from_conn.extend(commit_buf);
+                            Some(out)
+                        } else if let Some((key, _)) = data.iter().choose(&mut self.rng) {
+                            let val_len = self.rng.random_range(self.val_len_range.clone());
+                            let mut val = vec![0; val_len];
+                            self.rng.fill(&mut val[..]);
 
-                        let e_r = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
-                        self.expected.push_back(e_r.to_vec());
+                            let op = format::op::WriteOp::Set(format::op::SetOp { key, val: &val });
+
+                            let out = format::net::Request {
+                                txn_id: txn.id,
+                                op: format::net::RequestOp::Write(op),
+                            }
+                            .to_vec();
+                            txn.local_writes.extend_from_slice(&op.to_vec());
+
+                            Some(out)
+                        } else {
+                            None
+                        }
                     }
-                    "update" => {
-                        let (key, val) = self.entries.choose_mut(&mut self.rng).unwrap();
-                        let new_val_len = self.rng.random_range(self.val_len_range.clone());
-                        let mut new_val = vec![0; new_val_len];
-                        self.rng.fill(&mut new_val[..]);
-                        *val = new_val;
+                    ConnOp::Delete => {
+                        if self.rng.random() && !txn.local_writes.is_empty() {
+                            let write = format::FormatIter::<format::op::WriteOp>::from(
+                                &txn.local_writes[..],
+                            )
+                            .choose(&mut self.rng)
+                            .unwrap();
 
-                        let req = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Write(op::WriteOp::Set(op::SetOp {
-                                key: &key,
-                                val: &val,
-                            })),
-                        };
-                        let mut reqbuf = vec![0; req.len()];
-                        req.write_to_buf(&mut reqbuf);
-                        conn_bufs.from_conn.extend(reqbuf);
+                            let op =
+                                format::op::WriteOp::Del(format::op::DelOp { key: write.key() });
 
-                        let expected_resp = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
+                            let out = format::net::Request {
+                                txn_id: txn.id,
+                                op: format::net::RequestOp::Write(op),
+                            }
+                            .to_vec();
+                            txn.local_writes.extend_from_slice(&op.to_vec());
 
-                        self.expected.push_back(expected_resp.to_vec());
-                        let commit = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Commit,
-                        };
-                        let mut commit_buf = vec![0; commit.len()];
-                        commit.write_to_buf(&mut commit_buf);
-                        conn_bufs.from_conn.extend(commit_buf);
+                            Some(out)
+                        } else if let Some((key, _)) = data.iter().choose(&mut self.rng) {
+                            let op = format::op::WriteOp::Del(format::op::DelOp { key });
 
-                        let e_r = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
-                        self.expected.push_back(e_r.to_vec());
+                            let out = format::net::Request {
+                                txn_id: txn.id,
+                                op: format::net::RequestOp::Write(op),
+                            }
+                            .to_vec();
+                            txn.local_writes.extend_from_slice(&op.to_vec());
+
+                            Some(out)
+                        } else {
+                            None
+                        }
                     }
-                    "get" => {
-                        let (key, val) = self.entries.choose(&mut self.rng).unwrap();
-
-                        let req = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Read(op::ReadOp::Get(op::GetOp { key: &key })),
-                        };
-                        let mut reqbuf = vec![0; req.len()];
-                        req.write_to_buf(&mut reqbuf);
-                        conn_bufs.from_conn.extend(reqbuf);
-
-                        let expected_resp = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Get(Some(&val))),
-                        };
-
-                        self.expected.push_back(expected_resp.to_vec());
-                        let commit = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Commit,
-                        };
-                        let mut commit_buf = vec![0; commit.len()];
-                        commit.write_to_buf(&mut commit_buf);
-                        conn_bufs.from_conn.extend(commit_buf);
-
-                        let e_r = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
-                        self.expected.push_back(e_r.to_vec());
+                    ConnOp::Commit => {
+                        txn.committed = true;
+                        Some(
+                            format::net::Request {
+                                txn_id: txn.id,
+                                op: format::net::RequestOp::Commit,
+                            }
+                            .to_vec(),
+                        )
                     }
-                    "del" => {
-                        let idx = self.rng.random_range(0..self.entries.len());
-                        let (key, _) = self.entries.remove(idx);
-
-                        let req = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Write(op::WriteOp::Del(op::DelOp { key: &key })),
-                        };
-                        let mut reqbuf = vec![0; req.len()];
-                        req.write_to_buf(&mut reqbuf);
-                        conn_bufs.from_conn.extend(reqbuf);
-
-                        let expected_resp = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
-
-                        self.expected.push_back(expected_resp.to_vec());
-                        let commit = net::Request {
-                            txn_id: format::ConnTxnId(1),
-                            op: net::RequestOp::Commit,
-                        };
-                        let mut commit_buf = vec![0; commit.len()];
-                        commit.write_to_buf(&mut commit_buf);
-                        conn_bufs.from_conn.extend(commit_buf);
-
-                        let e_r = net::Response {
-                            txn_id: format::ConnTxnId(1),
-                            op: Ok(net::Resp::Success),
-                        };
-                        self.expected.push_back(e_r.to_vec());
-                    }
-                    _ => panic!(),
+                } {
+                    tracing::info!(
+                        conn_id = self.id.0,
+                        txn_id = txn.id.0,
+                        committed = txn.committed,
+                        "issued request",
+                        // request = ?format::net::Request::from_bytes(&request).unwrap(),
+                    );
+                    buf.from_conn.extend(request);
+                    txn.num_sent += 1;
                 }
             }
 
-            // try to clear expecteds
-            while let Some(e) = self.expected.pop_front() {
-                if conn_bufs.to_conn.len() >= e.len() {
-                    let mut got = vec![0; e.len()];
-                    conn_bufs.to_conn.read_exact(&mut got).unwrap();
-                    assert_eq!(got, e);
-                } else {
-                    self.expected.push_front(e);
-                    break;
+            let raw_buffer = buf.to_conn.drain(..).collect::<Vec<_>>();
+            // deal with any responses we may have
+            for response in format::FormatIter::<format::net::Response>::from(&raw_buffer[..]) {
+                let txn = self.active_txns.get_mut(&response.txn_id).unwrap();
+                txn.num_recv += 1;
+                tracing::info!(
+                    conn_id = self.id.0,
+                    ?response,
+                    num_recv = txn.num_recv,
+                    num_sent = txn.num_sent
+                );
+                if txn.committed && txn.num_recv == txn.num_sent {
+                    for write in
+                        format::FormatIter::<format::op::WriteOp>::from(&txn.local_writes[..])
+                    {
+                        match write {
+                            format::op::WriteOp::Set(set) => {
+                                data.insert(Vec::from(set.key), Vec::from(set.val));
+                            }
+                            format::op::WriteOp::Del(del) => {
+                                data.remove(del.key);
+                            }
+                        }
+                    }
+                    self.active_txns.remove(&response.txn_id);
+                    self.completed_txns += 1;
                 }
             }
-            self.ticks += 1;
         }
     }
 }
 
+struct ActiveTxn {
+    id: format::ConnTxnId,
+    local_writes: Vec<u8>,
+    num_sent: usize,
+    num_recv: usize,
+    committed: bool,
+}
+
+enum ConnOp {
+    Get,
+    Insert,
+    Update,
+    Delete,
+    Commit,
+}
+impl Distribution<ConnOp> for rand::distr::StandardUniform {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> ConnOp {
+        let i = rng.random_range(0..5);
+        match i {
+            0 => ConnOp::Get,
+            1 => ConnOp::Insert,
+            2 => ConnOp::Update,
+            3 => ConnOp::Delete,
+            4 => ConnOp::Commit,
+            _ => panic!(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct TestIO {
     id: usize,
     storage_manager: rc::Rc<cell::RefCell<TestStorageManager>>,
@@ -419,11 +448,11 @@ struct TestIO {
     comps: Vec<io::Comp>,
 }
 impl TestIO {
+    #[tracing::instrument(skip(self))]
     fn process_subs(&mut self) {
         for sub in self.subs.drain(..) {
             match sub {
                 io::Sub::FileRead { mut buf, offset } => {
-                    println!("reading from file!");
                     let mut storage_manager = self.storage_manager.borrow_mut();
                     let file = storage_manager.shard_files.get_mut(&self.id).unwrap();
                     file.seek(std::io::SeekFrom::Start(offset)).unwrap();
@@ -431,7 +460,6 @@ impl TestIO {
                     self.comps.push(io::Comp::FileRead { buf, offset });
                 }
                 io::Sub::FileWrite { buf, offset } => {
-                    println!("writing to file!");
                     let mut storage_manager = self.storage_manager.borrow_mut();
                     let file = storage_manager.shard_files.get_mut(&self.id).unwrap();
                     file.seek(std::io::SeekFrom::Start(offset)).unwrap();
@@ -501,9 +529,7 @@ impl TestIO {
 }
 impl io::IOFace for TestIO {
     fn poll(&mut self) -> Vec<io::Comp> {
-        let out = self.comps.clone();
-        self.comps.clear();
-        out
+        mem::take(&mut self.comps)
     }
     fn register_sub(&mut self, sub: io::Sub) {
         self.pending_subs.push(sub);
@@ -513,14 +539,17 @@ impl io::IOFace for TestIO {
     }
 }
 
+#[derive(Debug)]
 pub struct ConnBufs {
     from_conn: collections::VecDeque<u8>,
     to_conn: collections::VecDeque<u8>,
 }
 
+#[derive(Debug)]
 pub struct TestStorageManager {
     shard_files: collections::BTreeMap<usize, std::io::Cursor<Vec<u8>>>,
 }
+#[derive(Debug)]
 pub struct TestNetworkManager {
     pending_conns: Vec<store::ConnId>,
     conn_bufs: collections::BTreeMap<store::ConnId, ConnBufs>,

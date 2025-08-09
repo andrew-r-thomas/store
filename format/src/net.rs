@@ -150,48 +150,60 @@ pub enum Resp<'r> {
     Get(Option<&'r [u8]>),
     Success,
 }
+impl Resp<'_> {
+    const GET_CODE: u8 = 1;
+    const SUCCESS_CODE: u8 = 2;
+}
 impl<'r> crate::Format<'r> for Resp<'r> {
     fn len(&self) -> usize {
-        match self {
-            Self::Get(maybe_val) => {
-                crate::CODE_SIZE
-                    + match maybe_val {
-                        Some(val) => crate::KVLen::SIZE + val.len(),
-                        None => 0,
-                    }
+        crate::CODE_SIZE
+            + match self {
+                Self::Get(maybe_val) => {
+                    crate::CODE_SIZE
+                        + match maybe_val {
+                            Some(val) => crate::KVLen::SIZE + val.len(),
+                            None => 0,
+                        }
+                }
+                Self::Success => 0,
             }
-            Self::Success => 0,
-        }
     }
+    #[tracing::instrument]
     fn from_bytes(buf: &'r [u8]) -> Result<Self, crate::Error> {
-        if buf.len() == 0 {
-            return Ok(Self::Success);
-        }
-
         let mut cursor = 0;
-        match buf[cursor] {
-            1 => {
+        match *buf.get(cursor).ok_or(crate::Error::EOF)? {
+            Self::GET_CODE => {
                 cursor += crate::CODE_SIZE;
-                let val_len = u32::from_be_bytes(
-                    buf.get(cursor..cursor + crate::KVLen::SIZE)
-                        .ok_or(crate::Error::EOF)?
-                        .try_into()
-                        .map_err(|_| crate::Error::CorruptData)?,
-                ) as usize;
-                cursor += crate::KVLen::SIZE;
-                let val = buf.get(cursor..cursor + val_len).ok_or(crate::Error::EOF)?;
-                Ok(Self::Get(Some(val)))
+                match *buf.get(cursor).ok_or(crate::Error::EOF)? {
+                    1 => {
+                        cursor += crate::CODE_SIZE;
+                        let val_len = u32::from_be_bytes(
+                            buf.get(cursor..cursor + crate::KVLen::SIZE)
+                                .ok_or(crate::Error::EOF)?
+                                .try_into()
+                                .map_err(|_| crate::Error::CorruptData)?,
+                        ) as usize;
+                        cursor += crate::KVLen::SIZE;
+                        let val = buf.get(cursor..cursor + val_len).ok_or(crate::Error::EOF)?;
+                        Ok(Self::Get(Some(val)))
+                    }
+                    0 => Ok(Self::Get(None)),
+                    _ => Err(crate::Error::InvalidCode),
+                }
             }
-            0 => Ok(Self::Get(None)),
+            Self::SUCCESS_CODE => Ok(Self::Success),
             _ => Err(crate::Error::InvalidCode),
         }
     }
     fn write_to_buf(&self, buf: &mut [u8]) {
         assert_eq!(buf.len(), self.len());
 
+        let mut cursor = 0;
+
         match self {
             Self::Get(maybe_val) => {
-                let mut cursor = 0;
+                buf[cursor] = Self::GET_CODE;
+                cursor += crate::CODE_SIZE;
                 match maybe_val {
                     Some(val) => {
                         buf[cursor] = 1;
@@ -206,7 +218,9 @@ impl<'r> crate::Format<'r> for Resp<'r> {
                     }
                 }
             }
-            Self::Success => {}
+            Self::Success => {
+                buf[cursor] = Self::SUCCESS_CODE;
+            }
         }
     }
 }
