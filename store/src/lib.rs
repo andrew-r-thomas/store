@@ -17,12 +17,6 @@ pub struct ShardTxnId {
     pub conn_id: ConnId,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct GlobalTxnId {
-    pub shard_txn_id: ShardTxnId,
-    pub shard_id: usize,
-}
-
 /// ## NOTE
 /// this function adds 1 to the final output,
 /// since the 0 index is used for [`central::Central`]

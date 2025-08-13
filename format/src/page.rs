@@ -1,6 +1,6 @@
 use std::mem;
 
-use crate::{Format, op};
+use crate::Format;
 
 /// a split operation
 ///

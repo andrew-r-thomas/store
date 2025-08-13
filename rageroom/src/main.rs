@@ -7,9 +7,15 @@ use std::{
 
 use clap::Parser;
 use format::Format;
-use rand::{Rng, SeedableRng, distr::Distribution, seq::IteratorRandom};
+use rand::{
+    Rng, SeedableRng,
+    distr::{Distribution, weighted::WeightedIndex},
+    seq::IteratorRandom,
+};
 use serde::Deserialize;
 use store::{central, io, mesh, shard};
+use tracing::{Subscriber, field::Visit};
+use tracing_subscriber::layer::SubscriberExt;
 
 #[derive(Parser)]
 struct Args {
@@ -18,11 +24,53 @@ struct Args {
 }
 
 fn main() {
-    tracing::subscriber::set_global_default(tracing_subscriber::FmtSubscriber::new()).unwrap();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(DuckDbLayer::new()),
+        // .with(tracing_subscriber::fmt::layer()),
+    )
+    .unwrap();
+
     let args = Args::parse();
     let sim_config = SimConfig::load(&args.sim_config);
     let db_config = store::config::Config::load(&args.db_config).unwrap();
+
     run_sim(sim_config, db_config);
+}
+
+pub struct DuckDbLayer {}
+impl DuckDbLayer {
+    pub fn new() -> Self {
+        todo!()
+    }
+}
+impl<S> tracing_subscriber::Layer<S> for DuckDbLayer
+where
+    S: Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        event.record(&mut EventVisitor::new());
+        todo!()
+    }
+}
+
+pub enum EventVisitor {
+    Fresh,
+    Request {},
+    Response {},
+}
+impl EventVisitor {
+    pub fn new() -> Self {
+        Self::Fresh
+    }
+}
+impl Visit for EventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        todo!()
+    }
 }
 
 #[derive(Deserialize)]
@@ -219,7 +267,7 @@ impl Tick for TestConn {
                     None
                 }
             } {
-                if let Some(request) = match self.rng.random::<ConnOp>() {
+                if let Some(request) = match ConnOpDist::default().sample(&mut self.rng) {
                     ConnOp::Get => {
                         if self.rng.random() && !txn.local_writes.is_empty() {
                             // read from local data
@@ -365,11 +413,12 @@ impl Tick for TestConn {
                     }
                 } {
                     tracing::info!(
-                        conn_id = self.id.0,
-                        txn_id = txn.id.0,
-                        committed = txn.committed,
-                        "issued request",
-                        // request = ?format::net::Request::from_bytes(&request).unwrap(),
+                        txn_id = ?store::ShardTxnId {
+                            conn_id: self.id,
+                            conn_txn_id: txn.id,
+                        },
+                        request = ?format::net::Request::from_bytes(&request).unwrap(),
+                        "request",
                     );
                     buf.from_conn.extend(request);
                     txn.num_sent += 1;
@@ -382,10 +431,12 @@ impl Tick for TestConn {
                 let txn = self.active_txns.get_mut(&response.txn_id).unwrap();
                 txn.num_recv += 1;
                 tracing::info!(
-                    conn_id = self.id.0,
+                    txn_id = ?store::ShardTxnId {
+                        conn_id: self.id,
+                        conn_txn_id: txn.id,
+                    },
                     ?response,
-                    num_recv = txn.num_recv,
-                    num_sent = txn.num_sent
+                    "response",
                 );
                 if txn.committed && txn.num_recv == txn.num_sent {
                     for write in
@@ -423,10 +474,19 @@ enum ConnOp {
     Delete,
     Commit,
 }
-impl Distribution<ConnOp> for rand::distr::StandardUniform {
+struct ConnOpDist {
+    weights: WeightedIndex<usize>,
+}
+impl Default for ConnOpDist {
+    fn default() -> Self {
+        Self {
+            weights: WeightedIndex::new([25, 20, 15, 10, 30]).unwrap(),
+        }
+    }
+}
+impl Distribution<ConnOp> for ConnOpDist {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> ConnOp {
-        let i = rng.random_range(0..5);
-        match i {
+        match self.weights.sample(rng) {
             0 => ConnOp::Get,
             1 => ConnOp::Insert,
             2 => ConnOp::Update,
@@ -576,4 +636,10 @@ impl<IO: io::IOFace> Tick for StoreNodeWorker<IO> {
             Self::Shard(shard) => shard.tick(),
         }
     }
+}
+
+pub fn validate_invariants(db: &mut duckdb::Connection) {
+    // snapshot consistency
+
+    // write-write conflicts
 }

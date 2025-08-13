@@ -1,5 +1,3 @@
-use crate::op;
-
 /// a network request
 ///
 /// transactions are began implicitly, on the first op sent for a given txn_id.
@@ -42,9 +40,9 @@ impl<'r> crate::Format<'r> for Request<'r> {
 }
 #[derive(Copy, Clone, Debug)]
 pub enum RequestOp<'r> {
-    Read(op::ReadOp<'r>),
-    Write(op::WriteOp<'r>),
-    Commit,
+    Read(crate::Read<'r>),
+    Write(crate::Write<'r>),
+    TxnCtrl(crate::TxnCtrl),
 }
 impl RequestOp<'_> {
     pub const COMMIT_CODE: u8 = 9;
@@ -80,11 +78,11 @@ impl<'r> crate::Format<'r> for RequestOp<'r> {
 #[derive(Clone, Copy, Debug)]
 pub struct Response<'r> {
     pub txn_id: crate::ConnTxnId,
-    pub op: Result<Resp<'r>, crate::Error>,
+    pub res: Result<Resp<'r>, crate::Error>,
 }
 impl<'r> crate::Format<'r> for Response<'r> {
     fn len(&self) -> usize {
-        self.txn_id.len() + self.op.len()
+        self.txn_id.len() + self.res.len()
     }
     fn from_bytes(buf: &'r [u8]) -> Result<Self, crate::Error> {
         let mut cursor = 0;
@@ -94,7 +92,7 @@ impl<'r> crate::Format<'r> for Response<'r> {
 
         Ok(Self {
             txn_id,
-            op: Result::<Resp, crate::Error>::from_bytes(
+            res: Result::<Resp, crate::Error>::from_bytes(
                 buf.get(cursor..).ok_or(crate::Error::EOF)?,
             )?,
         })
@@ -108,7 +106,7 @@ impl<'r> crate::Format<'r> for Response<'r> {
             .write_to_buf(&mut buf[cursor..cursor + self.txn_id.len()]);
         cursor += self.txn_id.len();
 
-        self.op.write_to_buf(&mut buf[cursor..]);
+        self.res.write_to_buf(&mut buf[cursor..]);
     }
 }
 

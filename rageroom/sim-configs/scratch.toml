@@ -3,4 +3,4 @@ key_len_range = { start = 32, end = 128 }
 val_len_range = { start = 256, end = 512 }
 
 num_conns = 8
-num_txns = 32
+num_txns = 1024

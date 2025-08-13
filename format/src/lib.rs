@@ -1,5 +1,4 @@
 pub mod net;
-pub mod op;
 pub mod page;
 pub mod storage;
 
@@ -59,29 +58,6 @@ impl<'f, F: Format<'f>> From<&'f [u8]> for FormatIter<'f, F> {
             cursor: 0,
             _ph: marker::PhantomData,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct KVLen(u32);
-impl KVLen {
-    pub const SIZE: usize = mem::size_of::<u32>();
-}
-impl Format<'_> for KVLen {
-    fn len(&self) -> usize {
-        Self::SIZE
-    }
-    fn from_bytes(buf: &[u8]) -> Result<Self, Error> {
-        Ok(Self(u32::from_be_bytes(
-            buf.get(0..Self::SIZE)
-                .ok_or(Error::EOF)?
-                .try_into()
-                .map_err(|_| Error::CorruptData)?,
-        )))
-    }
-    fn write_to_buf(&self, buf: &mut [u8]) {
-        assert_eq!(self.len(), buf.len());
-        buf.copy_from_slice(&self.0.to_be_bytes());
     }
 }
 
@@ -188,6 +164,256 @@ impl<'e> Format<'e> for Error {
             Self::InvalidCode => buf[0] = Self::INVALID_CODE_CODE,
             Self::CorruptData => buf[0] = Self::CORRUPT_DATA_CODE,
             Self::Conflict => buf[0] = Self::CONFLICT_CODE,
+        }
+    }
+}
+
+pub const FLAGS_SIZE: usize = mem::size_of::<u8>();
+
+pub const TYPE_MASK: u8 = 0b_11_000000;
+pub const RES_MASK: u8 = 0b_0000000_1;
+
+pub const FLAG_SUCCESS: u8 = 0b_0000000_0;
+pub const FLAG_ERROR: u8 = 0b_0000000_1;
+
+/// for now, basically just a "get"
+#[derive(Clone, Copy, Debug)]
+pub struct Read<'r> {
+    key: Key<'r>,
+}
+impl Read<'_> {
+    pub const FLAG_TYPE: u8 = 0b_00_00000;
+
+    pub fn flags(&self) -> u8 {
+        Self::FLAG_TYPE
+    }
+}
+impl<'r> Format<'r> for Read<'r> {
+    fn len(&self) -> usize {
+        FLAGS_SIZE + self.key.len()
+    }
+    fn from_bytes(buf: &'r [u8]) -> Result<Self, Error> {
+        let mut cursor = 0;
+
+        let flags = *buf.get(cursor).ok_or(Error::EOF)?;
+        assert_eq!(flags & TYPE_MASK, Self::FLAG_TYPE);
+        // don't care about the other flags for now
+        cursor += FLAGS_SIZE;
+
+        Ok(Self {
+            key: Key::from_bytes(buf.get(cursor..).ok_or(Error::EOF)?)?,
+        })
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        assert_eq!(self.len(), buf.len());
+        let mut cursor = 0;
+        buf[cursor] = self.flags();
+        cursor += FLAGS_SIZE;
+        self.key.write_to_buf(&mut buf[cursor..]);
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ReadResp<'r>(Result<Val<'r>, Error>);
+impl ReadResp<'_> {
+    pub fn flags(&self) -> u8 {
+        Read::FLAG_TYPE
+            | match self.0 {
+                Ok(_) => FLAG_SUCCESS,
+                Err(_) => FLAG_ERROR,
+            }
+    }
+}
+impl<'r> Format<'r> for ReadResp<'r> {
+    fn len(&self) -> usize {
+        FLAGS_SIZE
+            + match self.0 {
+                Ok(val) => val.len(),
+                Err(e) => e.len(),
+            }
+    }
+    fn from_bytes(buf: &'r [u8]) -> Result<Self, Error> {
+        let mut cursor = 0;
+        let flags = *buf.get(cursor).ok_or(Error::EOF)?;
+        cursor += FLAGS_SIZE;
+
+        assert_eq!(flags & TYPE_MASK, Read::FLAG_TYPE);
+
+        if flags & RES_MASK == FLAG_SUCCESS {
+            // val
+            Ok(Self(Result::Ok(Val::from_bytes(
+                buf.get(cursor..).ok_or(Error::EOF)?,
+            )?)))
+        } else {
+            // err
+            Ok(Self(Result::Err(Error::from_bytes(
+                buf.get(cursor..).ok_or(Error::EOF)?,
+            )?)))
+        }
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        assert_eq!(self.len(), buf.len());
+        let mut cursor = 0;
+        buf[cursor] = self.flags();
+        cursor += FLAGS_SIZE;
+        match self.0 {
+            Ok(val) => val.write_to_buf(&mut buf[cursor..]),
+            Err(e) => e.write_to_buf(&mut buf[cursor..]),
+        }
+    }
+}
+
+/// ## NOTE
+/// `val.0 == None` semantically means "delete `key`"
+#[derive(Clone, Copy, Debug)]
+pub struct Write<'w> {
+    key: Key<'w>,
+    val: Val<'w>,
+}
+impl<'w> Format<'w> for Write<'w> {
+    fn len(&self) -> usize {
+        todo!()
+    }
+    fn from_bytes(buf: &'w [u8]) -> Result<Self, Error> {
+        todo!()
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        todo!()
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct WriteResp(Result<(), Error>);
+impl<'f> Format<'f> for WriteResp {
+    fn len(&self) -> usize {
+        todo!()
+    }
+    fn from_bytes(buf: &'f [u8]) -> Result<Self, Error> {
+        todo!()
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        todo!()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TxnCtrl {
+    Commit,
+    Abort,
+}
+impl<'f> Format<'f> for TxnCtrl {
+    fn len(&self) -> usize {
+        todo!()
+    }
+    fn from_bytes(buf: &'f [u8]) -> Result<Self, Error> {
+        todo!()
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        todo!()
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct TxnCtrlResp(Result<(), Error>);
+impl<'f> Format<'f> for TxnCtrlResp {
+    fn len(&self) -> usize {
+        todo!()
+    }
+    fn from_bytes(buf: &'f [u8]) -> Result<Self, Error> {
+        todo!()
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        todo!()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Key<'k>(&'k [u8]);
+impl Key<'_> {
+    pub const LEN_SIZE: usize = mem::size_of::<u16>();
+}
+impl<'k> Format<'k> for Key<'k> {
+    fn len(&self) -> usize {
+        Self::LEN_SIZE + self.0.len()
+    }
+    fn from_bytes(buf: &'k [u8]) -> Result<Self, Error> {
+        let mut cursor = 0;
+
+        let key_len = u16::from_be_bytes(
+            buf.get(cursor..cursor + Self::LEN_SIZE)
+                .ok_or(Error::EOF)?
+                .try_into()
+                .map_err(|_| Error::CorruptData)?,
+        ) as usize;
+        cursor += Self::LEN_SIZE;
+
+        let key = buf.get(cursor..cursor + key_len).ok_or(Error::EOF)?;
+
+        Ok(Self(key))
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        assert_eq!(self.len(), buf.len());
+
+        let mut cursor = 0;
+
+        buf[cursor..cursor + Self::LEN_SIZE].copy_from_slice(&(self.0.len() as u16).to_be_bytes());
+        cursor += Self::LEN_SIZE;
+
+        buf[cursor..cursor + self.0.len()].copy_from_slice(self.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Val<'v>(Option<&'v [u8]>);
+impl Val<'_> {
+    pub const KIND_SIZE: usize = mem::size_of::<u8>();
+    pub const LEN_SIZE: usize = mem::size_of::<u32>();
+
+    pub const SOME_KIND: u8 = 1;
+    pub const NONE_KIND: u8 = 0;
+}
+impl<'v> Format<'v> for Val<'v> {
+    fn len(&self) -> usize {
+        Self::KIND_SIZE
+            + match self.0 {
+                Some(v) => Self::LEN_SIZE + v.len(),
+                None => 0,
+            }
+    }
+    fn from_bytes(buf: &'v [u8]) -> Result<Self, Error> {
+        let mut cursor = 0;
+        match *buf.get(cursor).ok_or(Error::EOF)? {
+            Self::SOME_KIND => {
+                cursor += Self::KIND_SIZE;
+
+                let val_len = u32::from_be_bytes(
+                    buf.get(cursor..cursor + Self::LEN_SIZE)
+                        .ok_or(Error::EOF)?
+                        .try_into()
+                        .map_err(|_| Error::CorruptData)?,
+                ) as usize;
+                cursor += Self::LEN_SIZE;
+
+                let val = buf.get(cursor..cursor + val_len).ok_or(Error::EOF)?;
+                Ok(Self(Some(val)))
+            }
+            Self::NONE_KIND => Ok(Self(None)),
+            _ => Err(Error::InvalidCode),
+        }
+    }
+    fn write_to_buf(&self, buf: &mut [u8]) {
+        assert_eq!(self.len(), buf.len());
+
+        let mut cursor = 0;
+        match self.0 {
+            Some(v) => {
+                buf[cursor] = Self::SOME_KIND;
+                cursor += Self::KIND_SIZE;
+
+                buf[cursor..cursor + Self::LEN_SIZE]
+                    .copy_from_slice(&(v.len() as u32).to_be_bytes());
+                cursor += Self::LEN_SIZE;
+
+                buf[cursor..cursor + v.len()].copy_from_slice(v);
+            }
+            None => buf[cursor] = Self::NONE_KIND,
         }
     }
 }

@@ -122,10 +122,8 @@ impl<IO: io::IOFace> Central<IO> {
                                 commit_ts_writes.insert(key.to_vec());
                             }
                             commits.push(Commit {
-                                txn_id: crate::GlobalTxnId {
-                                    shard_txn_id: txn_id,
-                                    shard_id: from,
-                                },
+                                txn_id,
+                                shard_id: from,
                                 commit_ts: commit_timestamp,
                                 writes,
                             });
@@ -172,13 +170,14 @@ impl<IO: io::IOFace> Central<IO> {
 
 #[derive(Debug)]
 pub struct Commit {
-    pub txn_id: crate::GlobalTxnId,
+    pub txn_id: crate::ShardTxnId,
+    pub shard_id: usize,
     pub commit_ts: format::Timestamp,
     pub writes: Vec<u8>,
 }
 
 pub struct TxnProcessor {
-    queued_successful: collections::BTreeMap<crate::GlobalTxnId, collections::BTreeSet<usize>>,
+    queued_successful: collections::BTreeMap<crate::ShardTxnId, collections::BTreeSet<usize>>,
 }
 impl TxnProcessor {
     pub fn process_commits(
@@ -219,6 +218,7 @@ impl TxnProcessor {
                         txn_id: commit.txn_id,
                         commit_ts: commit.commit_ts,
                         writes,
+                        shard_id: commit.shard_id,
                     }),
                     shard,
                 );
@@ -243,10 +243,10 @@ impl TxnProcessor {
                 // TODO: we also will need to wait on WAL fsync
                 mesh.push(
                     mesh::Msg::CommitResponse {
-                        txn_id: commit.txn_id.shard_txn_id,
+                        txn_id: commit.txn_id,
                         res: Ok(()),
                     },
-                    commit.txn_id.shard_id,
+                    commit.shard_id,
                 );
             }
         }

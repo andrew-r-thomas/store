@@ -70,8 +70,8 @@ impl Conn {
                 let n = reader.read(&mut buf).await.unwrap();
                 for response in format::FormatIter::<format::net::Response>::from(&buf[..n]) {
                     let mut txn_req = txns.remove(&response.txn_id).unwrap();
-                    txn_req.buf.resize(response.op.len(), 0);
-                    response.op.write_to_buf(&mut txn_req.buf);
+                    txn_req.buf.resize(response.res.len(), 0);
+                    response.res.write_to_buf(&mut txn_req.buf);
                     txn_req.send.send(txn_req.buf).unwrap();
                 }
             }

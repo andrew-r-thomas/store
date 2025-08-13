@@ -119,7 +119,7 @@ impl Conn {
             if let Some(op) = txn_queue.iter_to().next() {
                 let resp = net::Response {
                     txn_id: *txn_id,
-                    op,
+                    res,
                 };
                 if cursor + resp.len() > net_buf.len() {
                     // TODO: figure out best thing to do here
