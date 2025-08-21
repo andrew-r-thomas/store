@@ -1,3 +1,0 @@
-[workspace]
-members = ["format", "rageroom", "store"]
-resolver = "3"
