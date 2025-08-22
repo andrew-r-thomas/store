@@ -1,5 +1,4 @@
 const std = @import("std");
-const PageCache = @import("PageCache.zig");
 
 const mem = std.mem;
 const heap = std.heap;
@@ -167,10 +166,8 @@ pub const PageId = struct {
         mem.writeInt(Self, buf[0..SIZE], self, .big);
     }
 
-    pub inline fn parse(buf: []const u8) Error.Set!Self {
-        if (buf.len < SIZE) {
-            return Error.Set.EOF;
-        }
+    pub inline fn fromBytes(buf: []const u8) Self {
+        assert(SIZE == buf.len);
         return mem.readInt(Self, buf[0..SIZE], .big);
     }
 };
@@ -1266,4 +1263,97 @@ test Page {
             try testing.expectEqual(null, left.searchLeaf(key, j_b));
         }
     }
+}
+
+/// format:
+/// ```
+/// [ chunk_len (u64)     ]
+/// [ next_off (u64)      ]
+/// [ (maybe) ops ...     ]
+/// [ (maybe) entries ... ]
+/// [ (maybe) footer      ]
+///           v
+///  [ entries len (u64) ]
+///  [ left_pid (u64)    ]
+///  [ right_pid (u64)   ]
+/// ```
+pub fn PageChunk(comptime is_leaf: bool) type {
+    const Op = if (is_leaf) Commit else Write;
+
+    const LEN_SIZE: usize = @sizeOf(u64);
+    const OFF_SIZE: usize = @sizeOf(u64);
+
+    return struct {
+        ops: Iter(Op, false),
+        entries: Iter(Entry, false),
+        next: ?u64,
+        left_pid: ?u64,
+        right_pid: ?u64,
+
+        pub fn fromBytes(buf: []const u8) @This() {
+            var cursor: usize = 0;
+
+            const chunk_len = mem.readInt(
+                u64,
+                buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
+                .big,
+            );
+            cursor += LEN_SIZE;
+
+            const next_off = mem.readInt(
+                u64,
+                buf[cursor .. cursor + OFF_SIZE][0..OFF_SIZE],
+                .big,
+            );
+            cursor += OFF_SIZE;
+
+            if (next_off == 0) {
+                var footer_cursor: usize = cursor + chunk_len;
+
+                const right_pid = PageId.fromBytes(
+                    buf[footer_cursor - PageId.SIZE .. footer_cursor],
+                );
+                footer_cursor -= PageId.SIZE;
+                const left_pid = PageId.fromBytes(
+                    buf[footer_cursor - PageId.SIZE .. footer_cursor],
+                );
+                footer_cursor -= PageId.SIZE;
+
+                const entries_len = mem.readInt(
+                    u64,
+                    buf[footer_cursor - LEN_SIZE .. footer_cursor][0..LEN_SIZE],
+                    .big,
+                );
+                footer_cursor -= LEN_SIZE;
+
+                const entries = Iter(Entry, false).fromBytes(
+                    buf[footer_cursor - entries_len .. footer_cursor],
+                );
+                footer_cursor -= entries_len;
+
+                const ops = Iter(Op, false).fromBytes(
+                    buf[cursor..footer_cursor],
+                );
+
+                return @This(){
+                    .ops = ops,
+                    .entries = entries,
+                    .next = null,
+                    .left_pid = left_pid,
+                    .right_pid = right_pid,
+                };
+            } else {
+                const ops = Iter(Op, false).fromBytes(
+                    buf[cursor .. cursor + chunk_len],
+                );
+                return @This(){
+                    .ops = ops,
+                    .entries = Iter(Entry, false).fromBytes(&.{}),
+                    .next = next_off,
+                    .left_pid = null,
+                    .right_pid = null,
+                };
+            }
+        }
+    };
 }
