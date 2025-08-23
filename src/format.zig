@@ -1119,151 +1119,36 @@ pub const PageBuilder = struct {
     }
 };
 
-test Page {
-    const buf = try testing.allocator.alloc(u8, 1024);
-    var page_buf = PageCache.Buffer.init(buf);
-    defer testing.allocator.free(buf);
+pub const PageChunkHeader = struct {
+    pub const LEN_SIZE: usize = @sizeOf(u64);
+    pub const OFF_SIZE: usize = @sizeOf(u64);
+    pub const SIZE: usize = LEN_SIZE + OFF_SIZE;
 
-    var builder = PageBuilder.init(testing.allocator);
-    defer builder.deinit();
+    len: u64,
+    next: ?u64,
 
-    try testing.expectEqual(0, builder.entries.items.len);
-    try testing.expectEqual(0, builder.commits.items.len);
-    try testing.expectEqual(0, builder.left_pid);
-    try testing.expectEqual(0, builder.right_pid);
-    try testing.expectEqual(Page.FOOTER_SIZE, builder.size());
-    try page_buf.write(PageBuilder, &builder);
-
-    {
-        const page = page_buf.read();
-        try testing.expectEqual(0, page.entries.len);
-        try testing.expectEqual(0, page.writes.len);
-        try testing.expectEqual(0, page.left_pid);
-        try testing.expectEqual(0, page.right_pid);
-    }
-
-    var i: u8 = 1;
-    while (true) {
-        const commit = Commit{
-            .timestamp = i,
-            .write = Write{
-                .key = &.{ i, i, i, i },
-                .val = &.{ i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i },
-            },
-        };
-        page_buf.write(Commit, &commit) catch break;
-        i += 1;
-    }
-
-    const page = page_buf.read();
-    for (1..i) |j| {
-        const j_b: u8 = @intCast(j);
-        const key = &.{ j_b, j_b, j_b, j_b };
-        const expected = &.{
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-        };
-        try testing.expectEqualDeep(expected, page.searchLeaf(key, j_b));
-    }
-
-    builder.compact(page, 0);
-    const other_buf = try testing.allocator.alloc(u8, 1024);
-    var other_page_buf = PageCache.Buffer.init(other_buf);
-    defer testing.allocator.free(other_buf);
-    try other_page_buf.write(PageBuilder, &builder);
-
-    const other_page = other_page_buf.read();
-    for (1..i) |j| {
-        const j_b: u8 = @intCast(j);
-        const key = &.{ j_b, j_b, j_b, j_b };
-        const expected = &.{
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-        };
-        try testing.expectEqualDeep(
-            expected,
-            other_page.searchLeaf(key, j_b),
+    pub fn fromBytes(buf: []const u8) @This() {
+        var cursor: usize = 0;
+        const len = mem.readInt(
+            u64,
+            buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
+            .big,
         );
-    }
+        cursor += LEN_SIZE;
 
-    var left_builder = builder.splitLeaf(testing.allocator);
-    defer left_builder.deinit();
-    const left_buf = try testing.allocator.alloc(u8, 1024);
-    var left_page_buf = PageCache.Buffer.init(left_buf);
-    defer testing.allocator.free(left_buf);
-    try left_page_buf.write(PageBuilder, &left_builder);
+        const next_off = mem.readInt(
+            u64,
+            buf[cursor .. cursor + OFF_SIZE][0..OFF_SIZE],
+            .big,
+        );
+        cursor += OFF_SIZE;
 
-    other_page_buf.reset();
-    try other_page_buf.write(PageBuilder, &builder);
-
-    const middle_i = i / 2;
-    const right = other_page_buf.read();
-    const left = left_page_buf.read();
-    for (1..i) |j| {
-        const j_b: u8 = @intCast(j);
-        const key = &.{ j_b, j_b, j_b, j_b };
-        const expected = &.{
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
-            j_b,
+        return @This(){
+            .len = len,
+            .next = if (next_off == 0) null else next_off,
         };
-
-        if (j <= middle_i) {
-            try testing.expectEqualDeep(
-                expected,
-                left.searchLeaf(key, j),
-            );
-            try testing.expectEqual(null, right.searchLeaf(key, j_b));
-        } else {
-            try testing.expectEqualDeep(
-                expected,
-                right.searchLeaf(key, j),
-            );
-            try testing.expectEqual(null, left.searchLeaf(key, j_b));
-        }
     }
-}
+};
 
 /// format:
 /// ```
@@ -1279,9 +1164,7 @@ test Page {
 /// ```
 pub fn PageChunk(comptime is_leaf: bool) type {
     const Op = if (is_leaf) Commit else Write;
-
     const LEN_SIZE: usize = @sizeOf(u64);
-    const OFF_SIZE: usize = @sizeOf(u64);
 
     return struct {
         ops: Iter(Op, false),
@@ -1292,23 +1175,16 @@ pub fn PageChunk(comptime is_leaf: bool) type {
 
         pub fn fromBytes(buf: []const u8) @This() {
             var cursor: usize = 0;
-
-            const chunk_len = mem.readInt(
-                u64,
-                buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
-                .big,
+            const header = PageChunkHeader.fromBytes(
+                buf[cursor .. cursor + PageChunkHeader.SIZE],
             );
-            cursor += LEN_SIZE;
+            cursor += PageChunkHeader.SIZE;
+            return fromParts(header, buf[cursor..]);
+        }
 
-            const next_off = mem.readInt(
-                u64,
-                buf[cursor .. cursor + OFF_SIZE][0..OFF_SIZE],
-                .big,
-            );
-            cursor += OFF_SIZE;
-
-            if (next_off == 0) {
-                var footer_cursor: usize = cursor + chunk_len;
+        pub fn fromParts(header: PageChunkHeader, buf: []const u8) @This() {
+            if (header.next) |_| {
+                var footer_cursor: usize = header.len;
 
                 const right_pid = PageId.fromBytes(
                     buf[footer_cursor - PageId.SIZE .. footer_cursor],
@@ -1332,7 +1208,7 @@ pub fn PageChunk(comptime is_leaf: bool) type {
                 footer_cursor -= entries_len;
 
                 const ops = Iter(Op, false).fromBytes(
-                    buf[cursor..footer_cursor],
+                    buf[0..footer_cursor],
                 );
 
                 return @This(){
@@ -1344,12 +1220,12 @@ pub fn PageChunk(comptime is_leaf: bool) type {
                 };
             } else {
                 const ops = Iter(Op, false).fromBytes(
-                    buf[cursor .. cursor + chunk_len],
+                    buf[0..header.len],
                 );
                 return @This(){
                     .ops = ops,
                     .entries = Iter(Entry, false).fromBytes(&.{}),
-                    .next = next_off,
+                    .next = header.next,
                     .left_pid = null,
                     .right_pid = null,
                 };
