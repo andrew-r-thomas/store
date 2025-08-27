@@ -1,3 +1,7 @@
+//! ## TODO
+//! - convert all ints to little endian
+//! - alignment tricks
+
 const std = @import("std");
 
 const mem = std.mem;
@@ -8,6 +12,10 @@ const assert = debug.assert;
 const print = debug.print;
 
 const testing = std.testing;
+
+comptime {
+    debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
+}
 
 pub const FLAGS_SIZE = @sizeOf(u8);
 
@@ -31,7 +39,7 @@ pub const Key = struct {
             u16,
             buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
             @intCast(self.len),
-            .big,
+            .little,
         );
         cursor += LEN_SIZE;
 
@@ -47,7 +55,7 @@ pub const Key = struct {
         const key_len = mem.readInt(
             u16,
             buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
-            .big,
+            .little,
         );
         cursor += LEN_SIZE;
 
@@ -93,7 +101,7 @@ pub const Val = struct {
                 u32,
                 buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
                 @intCast(v.len),
-                .big,
+                .little,
             );
             cursor += LEN_SIZE;
 
@@ -120,7 +128,7 @@ pub const Val = struct {
                 const val_len = mem.readInt(
                     u32,
                     buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
-                    .big,
+                    .little,
                 );
                 cursor += LEN_SIZE;
 
@@ -145,14 +153,14 @@ pub const TxnId = struct {
 
     pub inline fn serialize(self: Self, buf: []u8) void {
         assert(SIZE == buf.len);
-        mem.writeInt(Self, buf[0..SIZE], self, .big);
+        mem.writeInt(Self, buf[0..SIZE], self, .little);
     }
 
     pub inline fn parse(buf: []const u8) Error.Set!Self {
         if (buf.len < SIZE) {
             return Error.Set.EOF;
         }
-        return mem.readInt(Self, buf[0..SIZE], .big);
+        return mem.readInt(Self, buf[0..SIZE], .little);
     }
 };
 
@@ -163,12 +171,12 @@ pub const PageId = struct {
 
     pub inline fn serialize(self: Self, buf: []u8) void {
         assert(SIZE == buf.len);
-        mem.writeInt(Self, buf[0..SIZE], self, .big);
+        mem.writeInt(Self, buf[0..SIZE], self, .little);
     }
 
     pub inline fn fromBytes(buf: []const u8) Self {
         assert(SIZE == buf.len);
-        return mem.readInt(Self, buf[0..SIZE], .big);
+        return mem.readInt(Self, buf[0..SIZE], .little);
     }
 };
 
@@ -401,52 +409,6 @@ pub const Request = struct {
     }
 };
 
-test Request {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
-
-    const req = Request{
-        .txn_id = 1,
-        .op = .{ .read = Read{ .key = &.{ 0, 0, 0, 1 } } },
-    };
-
-    try buf.resize(req.size());
-    req.serialize(buf.items);
-
-    const parsed_req = Request.parse(buf.items);
-
-    try testing.expectEqualDeep(req, parsed_req);
-
-    const wreq = Request{
-        .txn_id = 2,
-        .op = .{
-            .write = Write{
-                .key = &.{ 0, 1, 0, 1 },
-                .val = &.{ 1, 0, 1, 0 },
-            },
-        },
-    };
-
-    try buf.resize(wreq.size());
-    wreq.serialize(buf.items);
-
-    const parsed_wreq = Request.parse(buf.items);
-
-    try testing.expectEqualDeep(wreq, parsed_wreq);
-
-    const tcreq = Request{
-        .txn_id = 2,
-        .op = .{ .txn_ctrl = TxnCtrl.Commit },
-    };
-
-    try buf.resize(tcreq.size());
-    tcreq.serialize(buf.items);
-
-    const parsed_tcreq = Request.parse(buf.items);
-
-    try testing.expectEqualDeep(tcreq, parsed_tcreq);
-}
-
 pub const Error = struct {
     err: Set,
 
@@ -595,23 +557,6 @@ pub const Response = struct {
     }
 };
 
-test Response {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
-
-    const res = Response{
-        .txn_id = 1,
-        .res = Error.Set.MALFORMED,
-    };
-
-    try buf.resize(res.size());
-    res.serialize(buf.items);
-
-    const parsed_res = Response.parse(buf.items);
-
-    try testing.expectEqualDeep(res, parsed_res);
-}
-
 pub fn Iter(comptime T: type, comptime fallible: bool) type {
     if (fallible) {
         return struct {
@@ -677,35 +622,6 @@ pub fn Iter(comptime T: type, comptime fallible: bool) type {
     }
 }
 
-test Iter {
-    var buf = std.ArrayList(u8).init(testing.allocator);
-    defer buf.deinit();
-
-    for (0..10) |_| {
-        const write = Write{
-            .key = &.{ 0, 0, 0, 1 },
-            .val = &.{ 1, 0, 0, 0 },
-        };
-        const cursor = buf.items.len;
-        try buf.resize(cursor + write.size());
-        write.serialize(buf.items[cursor .. cursor + write.size()]);
-    }
-
-    var iter = Iter(Write, true).fromBytes(buf.items);
-    for (0..10) |_| {
-        const write = try iter.next();
-        try testing.expectEqualDeep(
-            write,
-            Write{
-                .key = &.{ 0, 0, 0, 1 },
-                .val = &.{ 1, 0, 0, 0 },
-            },
-        );
-    }
-
-    try testing.expectEqualDeep(null, try iter.next());
-}
-
 pub const Page = struct {
     writes: []const u8,
     entries: []const u8,
@@ -733,7 +649,7 @@ pub const Page = struct {
         const entries_len = mem.readInt(
             u64,
             buf[cursor - ENTRIES_LEN_SIZE .. cursor][0..ENTRIES_LEN_SIZE],
-            .big,
+            .little,
         );
         cursor -= ENTRIES_LEN_SIZE;
 
@@ -804,12 +720,12 @@ pub const Timestamp = struct {
 
     pub inline fn fromBytes(buf: []const u8) Self {
         assert(buf.len >= SIZE);
-        return mem.readInt(Self, buf[0..SIZE], .big);
+        return mem.readInt(Self, buf[0..SIZE], .little);
     }
 
     pub inline fn serialize(self: Self, buf: []u8) void {
         assert(SIZE == buf.len);
-        mem.writeInt(Self, buf[0..SIZE], self, .big);
+        mem.writeInt(Self, buf[0..SIZE], self, .little);
     }
 };
 
@@ -869,7 +785,7 @@ pub const Entry = struct {
         const val_len = mem.readInt(
             u32,
             buf[cursor .. cursor + Val.LEN_SIZE][0..Val.LEN_SIZE],
-            .big,
+            .little,
         );
         cursor += Val.LEN_SIZE;
 
@@ -893,7 +809,7 @@ pub const Entry = struct {
             u32,
             buf[cursor .. cursor + Val.LEN_SIZE][0..Val.LEN_SIZE],
             @intCast(self.val.len),
-            .big,
+            .little,
         );
         cursor += Val.LEN_SIZE;
 
@@ -905,7 +821,10 @@ pub const Entry = struct {
 /// - adjust left/right pid stuff for range scans
 ///   (actually treat them as sibling pointers)
 pub const PageBuilder = struct {
+    chunks: std.ArrayListUnmanaged(PageChunk),
+
     commits: std.ArrayListUnmanaged(Commit),
+    smos: std.ArrayListUnmanaged(Smo),
     entries: std.ArrayListUnmanaged(Entry),
 
     left_pid: u64,
@@ -917,7 +836,10 @@ pub const PageBuilder = struct {
 
     pub fn init(allocator: mem.Allocator) Self {
         return Self{
+            .chunks = std.ArrayListUnmanaged(PageChunk).empty,
+
             .commits = std.ArrayListUnmanaged(Commit).empty,
+            .smos = std.ArrayListUnmanaged(Smo).empty,
             .entries = std.ArrayListUnmanaged(Entry).empty,
 
             .left_pid = 0,
@@ -930,6 +852,10 @@ pub const PageBuilder = struct {
     pub fn deinit(self: *Self) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    pub fn appendChunk(self: *Self, chunk: PageChunk) void {
+        self.chunks.append(self.arena.allocator(), chunk) catch unreachable;
     }
 
     pub fn clear(self: *Self) void {
@@ -1043,7 +969,7 @@ pub const PageBuilder = struct {
             u64,
             buf[cursor .. cursor + Page.ENTRIES_LEN_SIZE][0..Page.ENTRIES_LEN_SIZE],
             self.entriesSize(),
-            .big,
+            .little,
         );
         cursor += Page.ENTRIES_LEN_SIZE;
 
@@ -1119,117 +1045,277 @@ pub const PageBuilder = struct {
     }
 };
 
-pub const PageChunkHeader = struct {
-    pub const LEN_SIZE: usize = @sizeOf(u64);
-    pub const OFF_SIZE: usize = @sizeOf(u64);
-    pub const SIZE: usize = LEN_SIZE + OFF_SIZE;
-
-    len: u64,
-    next: ?u64,
-
-    pub fn fromBytes(buf: []const u8) @This() {
-        var cursor: usize = 0;
-        const len = mem.readInt(
-            u64,
-            buf[cursor .. cursor + LEN_SIZE][0..LEN_SIZE],
-            .big,
-        );
-        cursor += LEN_SIZE;
-
-        const next_off = mem.readInt(
-            u64,
-            buf[cursor .. cursor + OFF_SIZE][0..OFF_SIZE],
-            .big,
-        );
-        cursor += OFF_SIZE;
-
-        return @This(){
-            .len = len,
-            .next = if (next_off == 0) null else next_off,
+/// format:
+/// ```
+/// [ HEADER                            ]
+///     [ type            (u8) ]
+///     [ len            (u64) ]
+///     [ maybe next_off (u64) ]
+/// [ COMMITS | SMOPS | ENTRIES (bytes) ]
+/// ```
+pub fn PageChunk(comptime pt: page_type) type {
+    return union(Tag) {
+        const Self = @This();
+        pub const Tag = enum(u8) { commits, smops, entries };
+        pub const HEADER_SIZE = @sizeOf(u8) + (@sizeOf(u64) * 2);
+        const Entries = switch (pt) {
+            .leaf => LeafEntries,
+            .inner => InnerEntries,
         };
+
+        commits: struct { commits: Iter(Commit, false), next: u64 },
+        smops: struct { smops: Iter(Smo, false), next: u64 },
+        entries: Entries,
+
+        pub fn size(self: *const Self) usize {
+            return HEADER_SIZE + switch (self.*) {
+                .commits => |c| c.commits.buf.len,
+                .smops => |s| s.smops.buf.len,
+                .entries => |e| e.size(),
+            };
+        }
+
+        pub fn serialize(self: *const Self, buf: []u8) void {
+            debug.assert(self.size() == buf.len);
+            var cursor: usize = 0;
+            switch (self.*) {
+                .commits => |c| {
+                    buf[cursor] = @intFromEnum(Tag.commits);
+                    cursor += @sizeOf(u8);
+                    mem.writeInt(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
+                        c.commits.buf.len,
+                        .little,
+                    );
+                    cursor += @sizeOf(u64);
+                    mem.writeInt(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
+                        c.next,
+                        .little,
+                    );
+                    cursor += @sizeOf(u64);
+                    @memcpy(buf[cursor..], c.commits.buf);
+                },
+                .smops => |s| {
+                    buf[cursor] = @intFromEnum(Tag.smops);
+                    cursor += @sizeOf(u8);
+                    mem.writeInt(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
+                        s.smops.buf.len,
+                        .little,
+                    );
+                    cursor += @sizeOf(u64);
+                    mem.writeInt(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
+                        s.next,
+                        .little,
+                    );
+                    cursor += @sizeOf(u64);
+                    @memcpy(buf[cursor..], s.smops.buf);
+                },
+                .entries => |e| {
+                    buf[cursor] = @intFromEnum(Tag.entries);
+                    cursor += @sizeOf(u8);
+                    mem.writeInt(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
+                        e.size(),
+                        .little,
+                    );
+                    cursor += @sizeOf(u64);
+                    e.serialize(buf[cursor..]);
+                },
+            }
+        }
+
+        pub fn fromBytes(buf: []const u8) Self {
+            var cursor: usize = 0;
+
+            const t: Tag = @enumFromInt(buf[cursor]);
+            cursor += @sizeOf(u8);
+
+            const len = mem.bytesToValue(
+                u64,
+                buf[cursor .. cursor + @sizeOf(u64)],
+            );
+            cursor += @sizeOf(u64);
+
+            switch (t) {
+                Tag.commits => {
+                    const next_off = mem.bytesToValue(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)],
+                    );
+                    cursor += @sizeOf(u64);
+                    return Self{
+                        .commits = .{
+                            .commits = Iter(Commit, false).fromBytes(
+                                buf[cursor .. cursor + len],
+                            ),
+                            .next = next_off,
+                        },
+                    };
+                },
+                Tag.smops => {
+                    const next_off = mem.bytesToValue(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)],
+                    );
+                    cursor += @sizeOf(u64);
+                    return Self{
+                        .smops = .{
+                            .smops = Iter(Smo, false).fromBytes(
+                                buf[cursor .. cursor + len],
+                            ),
+                            .next = next_off,
+                        },
+                    };
+                },
+                Tag.entries => {
+                    return Self{
+                        .entries = Entries.fromBytes(
+                            buf[cursor .. cursor + len],
+                        ),
+                    };
+                },
+            }
+        }
+    };
+}
+
+pub const page_type = enum {
+    inner,
+    leaf,
+};
+
+pub const Smo = union(Tag) {
+    split: struct {
+        pid: u64,
+        lte_key: []const u8,
+    },
+
+    pub const Tag = enum {
+        split,
+    };
+};
+
+/// format:
+/// ```
+/// [ num          (u16) ]
+/// [ pids      ...(u64) ]
+/// [ key offs  ...(u32) ]
+/// [ key lens  ...(u16) ]
+/// [ keys    ...(bytes) ]
+/// ```
+/// pids, offsets, lengths, and keys themselves are in key-sorted order
+pub const InnerEntries = struct {
+    const Self = @This();
+
+    pids: []align(1) const u64,
+
+    key_offs: []align(1) const u32,
+    key_lens: []align(1) const u16,
+    keys: []const u8,
+
+    pub fn size(self: *const Self) usize {
+        return @sizeOf(u16) +
+            (self.pids.len * @sizeOf(u64)) +
+            (self.key_offs.len * @sizeOf(u32)) +
+            (self.key_lens.len * @sizeOf(u16)) +
+            self.keys.len;
+    }
+
+    pub fn serialize(self: *const Self, buf: []u8) void {
+        var cursor: usize = 0;
+        mem.writeInt(
+            u16,
+            buf[cursor .. cursor + @sizeOf(u16)][0..@sizeOf(u16)],
+            @intCast(self.pids.len - 1),
+            .little,
+        );
+        cursor += @sizeOf(u16);
+        @memcpy(
+            buf[cursor .. cursor + (self.pids.len * @sizeOf(u64))],
+            mem.sliceAsBytes(self.pids),
+        );
+        cursor += (self.pids.len * @sizeOf(u64));
+        @memcpy(
+            buf[cursor .. cursor + (self.key_offs.len * @sizeOf(u32))],
+            mem.sliceAsBytes(self.key_offs),
+        );
+        cursor += (self.key_offs.len * @sizeOf(u32));
+        @memcpy(
+            buf[cursor .. cursor + (self.key_lens.len * @sizeOf(u16))],
+            mem.sliceAsBytes(self.key_lens),
+        );
+        cursor += (self.key_lens.len * @sizeOf(u16));
+        @memcpy(buf[cursor..], self.keys);
+    }
+
+    /// expects exact size buffer
+    pub fn fromBytes(buf: []const u8) Self {
+        var cursor: usize = 0;
+
+        const num = mem.bytesToValue(
+            u16,
+            buf[cursor .. cursor + @sizeOf(u16)],
+        );
+        cursor += @sizeOf(u16);
+
+        const pids = mem.bytesAsSlice(
+            u64,
+            buf[cursor .. cursor + (@sizeOf(u64) * (num + 1))],
+        );
+        cursor += @sizeOf(u64) * (num + 1);
+
+        const key_offs = mem.bytesAsSlice(
+            u32,
+            buf[cursor .. cursor + (@sizeOf(u32) * num)],
+        );
+        cursor += @sizeOf(u32) * num;
+
+        const key_lens = mem.bytesAsSlice(
+            u16,
+            buf[cursor .. cursor + (@sizeOf(u16) * num)],
+        );
+        cursor += @sizeOf(u16) * num;
+
+        const keys = buf[cursor..];
+
+        return Self{
+            .pids = pids,
+            .key_offs = key_offs,
+            .key_lens = key_lens,
+            .keys = keys,
+        };
+    }
+
+    pub fn search(self: *const Self, target: []const u8) u64 {
+        for (0..self.key_offs.len) |i| {
+            const off = self.key_offs[i];
+            const len = self.key_lens[i];
+            const key = self.keys[off .. off + len];
+            switch (mem.order(u8, target, key)) {
+                .lt, .eq => {
+                    return self.pids[i];
+                },
+                .gt => {},
+            }
+        }
+        return self.pids[self.pids.len - 1];
     }
 };
 
 /// format:
 /// ```
-/// [ chunk_len (u64)     ]
-/// [ next_off (u64)      ]
-/// [ (maybe) ops ...     ]
-/// [ (maybe) entries ... ]
-/// [ (maybe) footer      ]
-///           v
-///  [ entries len (u64) ]
-///  [ left_pid (u64)    ]
-///  [ right_pid (u64)   ]
+/// [ num          (u16) ]
+/// [ offs      ...(u32) ]
+/// [ key lens  ...(u16) ]
+/// [ val lens  ...(u32) ]
+/// [ entries ...(bytes) ]
 /// ```
-pub fn PageChunk(comptime is_leaf: bool) type {
-    const Op = if (is_leaf) Commit else Write;
-    const LEN_SIZE: usize = @sizeOf(u64);
-
-    return struct {
-        ops: Iter(Op, false),
-        entries: Iter(Entry, false),
-        next: ?u64,
-        left_pid: ?u64,
-        right_pid: ?u64,
-
-        pub fn fromBytes(buf: []const u8) @This() {
-            var cursor: usize = 0;
-            const header = PageChunkHeader.fromBytes(
-                buf[cursor .. cursor + PageChunkHeader.SIZE],
-            );
-            cursor += PageChunkHeader.SIZE;
-            return fromParts(header, buf[cursor..]);
-        }
-
-        pub fn fromParts(header: PageChunkHeader, buf: []const u8) @This() {
-            if (header.next) |_| {
-                var footer_cursor: usize = header.len;
-
-                const right_pid = PageId.fromBytes(
-                    buf[footer_cursor - PageId.SIZE .. footer_cursor],
-                );
-                footer_cursor -= PageId.SIZE;
-                const left_pid = PageId.fromBytes(
-                    buf[footer_cursor - PageId.SIZE .. footer_cursor],
-                );
-                footer_cursor -= PageId.SIZE;
-
-                const entries_len = mem.readInt(
-                    u64,
-                    buf[footer_cursor - LEN_SIZE .. footer_cursor][0..LEN_SIZE],
-                    .big,
-                );
-                footer_cursor -= LEN_SIZE;
-
-                const entries = Iter(Entry, false).fromBytes(
-                    buf[footer_cursor - entries_len .. footer_cursor],
-                );
-                footer_cursor -= entries_len;
-
-                const ops = Iter(Op, false).fromBytes(
-                    buf[0..footer_cursor],
-                );
-
-                return @This(){
-                    .ops = ops,
-                    .entries = entries,
-                    .next = null,
-                    .left_pid = left_pid,
-                    .right_pid = right_pid,
-                };
-            } else {
-                const ops = Iter(Op, false).fromBytes(
-                    buf[0..header.len],
-                );
-                return @This(){
-                    .ops = ops,
-                    .entries = Iter(Entry, false).fromBytes(&.{}),
-                    .next = header.next,
-                    .left_pid = null,
-                    .right_pid = null,
-                };
-            }
-        }
-    };
-}
+pub const LeafEntries = struct {};

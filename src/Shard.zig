@@ -7,94 +7,65 @@ const debug = std.debug;
 const print = debug.print;
 
 const format = @import("format.zig");
+const zipper = @import("zipper.zig");
 const Mesh = @import("Mesh.zig");
 
-mem_table: MemTable,
+root: Root,
+levels: std.ArrayListUnmanaged(LevelMeta),
 block_server: BlockServer,
-inner_offsets: std.AutoArrayHashMapUnmanaged(u64, u64),
-leaf_offsets: std.AutoArrayHashMapUnmanaged(u64, u64),
-root: u64,
-mesh: *Mesh,
 
 pump_arena: heap.ArenaAllocator,
 
 pub fn init(
     cfg: Config,
-    mesh: *Mesh,
     allocator: mem.Allocator,
 ) !Self {
     const pump_arena = heap.ArenaAllocator.init(allocator);
-    const mem_table = try MemTable.init(
-        cfg.max_page_size,
-        cfg.block_size,
-        allocator,
-    );
+    const root = try Root.init(allocator, cfg.block_size);
     const block_server = try BlockServer.init(
         cfg.block_size,
         cfg.num_blocks,
         allocator,
     );
-    const inner_offsets = std.AutoArrayHashMapUnmanaged(u64, u64).empty;
-    const leaf_offsets = std.AutoArrayHashMapUnmanaged(u64, u64).empty;
     return Self{
-        .mesh = mesh,
         .pump_arena = pump_arena,
-        .mem_table = mem_table,
+        .root = root,
         .block_server = block_server,
-        .inner_offsets = inner_offsets,
-        .leaf_offsets = leaf_offsets,
-        .root = 1,
+        .levels = std.ArrayListUnmanaged(LevelMeta).empty,
     };
 }
 pub fn deinit(self: *Self) void {
     // mesh init/deinit is handled by central
     self.pump_arena.deinit();
-    self.mem_table.deinit();
+    self.root.deinit();
 }
 
 pub fn pump(self: *Self) void {
-    _ = findLeaf(
-        &.{ 0, 0, 0, 1 },
+    _ = self.root.commit(
+        format.Commit{
+            .timestamp = 0,
+            .write = format.Write{ .key = &.{0}, .val = null },
+        },
+    ) catch unreachable;
+    _ = self.root.read(&.{0}, 0);
+    const block = self.pump_arena.allocator().alloc(
+        u8,
+        1024,
+    ) catch unreachable;
+    _ = self.root.flush(block, &self.levels.items[self.levels.items.len - 1]);
+    zipper.zip(
+        self.pump_arena.allocator(),
+        &self.levels.items[2],
+        &self.levels.items[3],
+        123,
         &self.block_server,
-        &self.inner_offsets,
-        self.root,
-    );
-    _ = executeRead(
-        &.{ 0, 0, 0, 1 },
-        12,
-        128,
-        &self.block_server,
-        &self.leaf_offsets,
-    );
-    _ = self.mem_table.read(true, 123);
-    _ = self.mem_table.write(format.Commit, format.Commit{
-        .timestamp = 123,
-        .write = format.Write{ .key = &.{0}, .val = null },
-    }) catch unreachable;
+    ) catch unreachable;
 }
 
 pub const Config = struct {
     block_size: usize,
     num_blocks: usize,
     max_page_size: usize,
-};
-
-pub const PageStore = struct {
-    offset_table: std.HashMapUnmanaged(u64, u64),
-    root: u64,
-    next_pid: u64,
-
-    pub fn init() @This() {
-        return @This(){};
-    }
-    pub fn deinit(_: *@This(), _: mem.Allocator) void {}
-
-    pub fn readBlock(
-        _: *@This(),
-        _: []const u8,
-        _: u64,
-        _: *PageCache,
-    ) void {}
 };
 
 pub const PageCache = struct {
@@ -241,7 +212,7 @@ fn findLeaf(
             const block_start = block_server.offsetToBlockStart(off);
             if (block_server.getBlock(block_start)) |block| {
                 var chunk = chunkFromBlock(false, block, off);
-                while (chunk.ops.next()) |write| {
+                while (chunk.commits.next()) |write| {
                     switch (mem.order(u8, target, write.key)) {
                         .lt, .eq => {
                             if (best_op) |bo| {
@@ -306,7 +277,7 @@ fn executeRead(
         const block_start = block_server.offsetToBlockStart(off);
         if (block_server.getBlock(block_start)) |block| {
             var chunk = chunkFromBlock(true, block, off);
-            while (chunk.ops.next()) |commit| {
+            while (chunk.commits.next()) |commit| {
                 if (commit.timestamp > ts) continue;
                 if (mem.eql(u8, commit.write.key, target)) {
                     return .{ .val = commit.write.val };
@@ -329,79 +300,210 @@ const executeReadTag = enum {
     val,
 };
 
-fn chunkFromBlock(
-    comptime is_leaf: bool,
+pub inline fn chunkFromBlock(
+    comptime pt: format.page_type,
     block: []const u8,
     offset: u64,
-) format.PageChunk(is_leaf) {
+) format.PageChunk(pt) {
     debug.assert((block.len & (block.len - 1)) == 0);
     const inner_offset: u64 = offset & (@as(u64, block.len) - 1);
-    return format.PageChunk(is_leaf).fromBytes(block[inner_offset..]);
+    return format.PageChunk(pt).fromBytes(block[inner_offset..]);
 }
 
-pub const MemTable = struct {
-    page_map: std.AutoArrayHashMapUnmanaged(u64, Buffer),
+/// this is the memtable and the root node of the tree
+/// it only takes user ops/commits
+pub const Root = struct {
+    children: std.MultiArrayList(Child),
+
+    gt_buf: Buffer,
+    gt_pid: u64,
+
     flush_arena: heap.ArenaAllocator,
-    max_page_size: usize,
     total_size: usize,
     block_size: usize,
 
-    pub const Buffer = struct {
-        buf: []u8,
-        top: usize,
-        next: ?u64,
+    pub const Child = struct {
+        key: []const u8,
+        lte_pid: u64,
+        op_buf: Buffer,
     };
 
     pub const Error = error{
         FULL,
     };
 
+    pub const Buffer = struct {
+        buf: []u8,
+        top: usize,
+
+        pub const empty = @This(){
+            .buf = &.{},
+            .top = 0,
+        };
+
+        pub fn write(self: *@This(), comptime W: type, w: W) !void {
+            const size = w.size();
+            if (self.top < size) return Error.FULL;
+
+            w.serialize(self.buf[self.top - size .. self.top]);
+            self.top -= size;
+        }
+    };
+
     pub fn init(
-        max_page_size: usize,
-        block_size: usize,
         allocator: mem.Allocator,
+        block_size: usize,
     ) !@This() {
         return @This(){
+            .children = std.MultiArrayList(Child).empty,
+
+            .gt_buf = Buffer.empty,
+            .gt_pid = 0,
+
             .flush_arena = heap.ArenaAllocator.init(allocator),
-            .page_map = std.AutoArrayHashMapUnmanaged(u64, Buffer).empty,
-            .max_page_size = max_page_size,
             .total_size = 0,
             .block_size = block_size,
         };
     }
-    pub fn deinit(self: *@This()) void {
-        self.flush_arena.deinit();
+    pub fn deinit(self: *@This(), allocator: mem.Allocator) void {
+        self.children.deinit(allocator);
+        self.flush_arena.deinit(allocator);
     }
 
-    pub fn read(
-        self: *@This(),
-        comptime is_leaf: bool,
-        pid: u64,
-    ) ?format.PageChunk(is_leaf) {
-        const buffer = self.page_map.getPtr(pid) orelse return null;
-        const header = format.PageChunkHeader{
-            .len = buffer.buf.len - buffer.top,
-            .next = buffer.next,
-        };
-        return format.PageChunk(is_leaf).fromParts(
-            header,
-            buffer.buf[buffer.top..],
-        );
+    pub fn commit(self: *@This(), c: format.Commit) !void {
+        const size = c.size();
+        if ((size + self.total_size) > self.block_size) return Error.FULL;
+
+        const alloc = self.flush_arena.allocator();
+        const c_buf = try alloc.alloc(u8, size);
+        c.serialize(c_buf);
+
+        const child_idx = self.findChild(c.write.key);
+        if (child_idx) |i| {
+            try self.children.items(.op_buf)[i].write(format.Commit, c);
+        } else {
+            try self.gt_buf.write(format.Commit, c);
+        }
+
+        self.total_size += size;
     }
-    pub fn write(_: *@This(), comptime W: type, _: W) !void {}
-    pub fn replace() void {}
+    pub fn read(
+        self: *const @This(),
+        target: []const u8,
+        ts: u64,
+    ) union(readRes) {
+        pid: u64,
+        val: ?[]const u8,
+    } {
+        const buf, const pid = if (self.findChild(target)) |i|
+            .{
+                &self.children.items(.op_buf)[i],
+                self.children.items(.lte_pid)[i],
+            }
+        else
+            .{ &self.gt_buf, self.gt_pid };
+
+        var ops = format.Iter(format.Commit, false).fromBytes(
+            buf.buf[buf.top..],
+        );
+        while (ops.next()) |c| {
+            if (c.timestamp > ts) continue;
+            if (mem.eql(u8, c.write.key, target)) {
+                return .{ .val = c.write.val };
+            }
+        }
+
+        return .{ .pid = pid };
+    }
+    const readRes = enum {
+        pid,
+        val,
+    };
+
+    pub fn flush(self: *@This(), block: []u8, level_meta: *LevelMeta) void {
+        debug.assert(block.len == self.block_size);
+        debug.assert(self.total_size <= self.block_size);
+
+        var cursor: u64 = 0;
+
+        for (
+            self.children.items(.lte_pid),
+            self.children.items(.op_buf),
+        ) |pid, buf| {
+            const off = level_meta.offset_table.getPtr(pid).?;
+
+            // this will be an inner page most of the time,
+            // but also it doesn't matter since it will be commits only
+            const chunk = format.PageChunk(.inner){
+                .commits = .{
+                    .commits = format.Iter(format.Commit, false).fromBytes(
+                        buf.buf,
+                    ),
+                    .next = off.*,
+                },
+            };
+
+            off.* = level_meta.head + cursor;
+
+            chunk.serialize(block[cursor .. cursor + chunk.size()]);
+            cursor += chunk.size();
+        }
+
+        const off = level_meta.offset_table.getPtr(self.gt_pid).?;
+
+        const chunk = format.PageChunk(.inner){
+            .commits = .{
+                .commits = format.Iter(format.Commit, false).fromBytes(
+                    self.gt_buf.buf,
+                ),
+                .next = off.*,
+            },
+        };
+
+        off.* = level_meta.head + cursor;
+
+        chunk.serialize(block[cursor .. cursor + chunk.size()]);
+
+        debug.assert(self.flush_arena.reset(.retain_capacity));
+    }
+
+    pub fn insert() void {}
+
+    fn findChild(self: *const @This(), target: []const u8) ?usize {
+        for (self.children.items(.key), 0..) |key, i| {
+            switch (mem.order(u8, target, key)) {
+                .lt, .eq => return i,
+                .gt => {},
+            }
+        }
+        return null;
+    }
+};
+
+pub const LevelMeta = struct {
+    level: usize,
+    offset_table: std.AutoArrayHashMap(u64, u64),
+    current_buf: usize,
+    head: u64,
+    tail: u64,
 };
 
 pub const BlockServer = struct {
     blocks_buf: []u8,
     block_size: usize,
 
-    mapping_table: std.AutoArrayHashMapUnmanaged(u64, usize),
+    mapping_table: std.ArrayListUnmanaged(
+        std.AutoArrayHashMapUnmanaged(u64, usize),
+    ),
     free_list: std.ArrayListUnmanaged(usize),
+    pins: std.DynamicBitSetUnmanaged,
 
     const BlockPrio = struct {
         offset: u64,
         prio: u64,
+    };
+    pub const Error = error{
+        needs_io,
     };
 
     pub fn init(
@@ -410,7 +512,9 @@ pub const BlockServer = struct {
         allocator: mem.Allocator,
     ) !@This() {
         const blocks_buf = try allocator.alloc(u8, block_size * num_blocks);
-        var mapping_table = std.AutoArrayHashMapUnmanaged(u64, usize).empty;
+        var mapping_table = std.ArrayListUnmanaged(
+            std.AutoArrayHashMapUnmanaged(u64, usize),
+        ).empty;
         try mapping_table.ensureTotalCapacity(allocator, num_blocks);
         var free_list = std.ArrayListUnmanaged(usize).empty;
         for (0..num_blocks) |i| {
@@ -421,20 +525,39 @@ pub const BlockServer = struct {
             .block_size = block_size,
             .mapping_table = mapping_table,
             .free_list = free_list,
+            .pins = try std.DynamicBitSetUnmanaged.initEmpty(
+                allocator,
+                num_blocks,
+            ),
         };
     }
     pub fn deinit(_: *@This()) void {}
 
-    pub inline fn offsetToBlockStart(self: *const @This(), offset: u64) u64 {
-        return offset >> @intCast(@ctz(self.block_size));
+    /// ## TODO
+    /// - hit tracking
+    pub fn getBlockIdx(
+        self: *@This(),
+        level: usize,
+        offset: u64,
+    ) !usize {
+        const idx = self.mapping_table.items[level].get(
+            offset >> @intCast(@ctz(self.block_size)),
+        ) orelse return Error.needs_io;
+        return idx;
     }
-    pub fn getBlock(self: *@This(), block_start: u64) ?[]const u8 {
-        const idx = self.mapping_table.get(block_start) orelse return null;
+
+    pub inline fn getBlock(self: *const @This(), idx: usize) []const u8 {
         const start = idx * self.block_size;
         const end = start + self.block_size;
         return self.blocks_buf[start..end];
     }
 
+    pub fn flush() void {}
+    pub fn pin() void {}
+    pub fn unpin() void {}
+
+    /// returns a free mutable buffer and it's index.
+    /// for now, panics if there are no free buffers.
     pub fn popFree(self: *@This()) .{ usize, []u8 } {
         if (self.free_list.pop()) |i| {
             const start = i * self.block_size;
