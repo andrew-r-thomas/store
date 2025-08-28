@@ -7,12 +7,13 @@ const debug = std.debug;
 const print = debug.print;
 
 const format = @import("format.zig");
-const zipper = @import("zipper.zig");
+const Zipper = @import("Zipper.zig");
 const Mesh = @import("Mesh.zig");
 
 root: Root,
 levels: std.ArrayListUnmanaged(LevelMeta),
 block_server: BlockServer,
+zipper: Zipper,
 
 pump_arena: heap.ArenaAllocator,
 
@@ -27,11 +28,13 @@ pub fn init(
         cfg.num_blocks,
         allocator,
     );
+    const zipper = Zipper.init(allocator);
     return Self{
         .pump_arena = pump_arena,
         .root = root,
         .block_server = block_server,
         .levels = std.ArrayListUnmanaged(LevelMeta).empty,
+        .zipper = zipper,
     };
 }
 pub fn deinit(self: *Self) void {
@@ -53,13 +56,7 @@ pub fn pump(self: *Self) void {
         1024,
     ) catch unreachable;
     _ = self.root.flush(block, &self.levels.items[self.levels.items.len - 1]);
-    zipper.zip(
-        self.pump_arena.allocator(),
-        &self.levels.items[2],
-        &self.levels.items[3],
-        123,
-        &self.block_server,
-    ) catch unreachable;
+    _ = try self.zipper.pump(&self.block_server, &self.levels, 123);
 }
 
 pub const Config = struct {
@@ -496,7 +493,7 @@ pub const BlockServer = struct {
         std.AutoArrayHashMapUnmanaged(u64, usize),
     ),
     free_list: std.ArrayListUnmanaged(usize),
-    pins: std.DynamicBitSetUnmanaged,
+    pins: []u16,
 
     const BlockPrio = struct {
         offset: u64,
@@ -520,15 +517,14 @@ pub const BlockServer = struct {
         for (0..num_blocks) |i| {
             try free_list.append(allocator, i);
         }
+        const pins = try allocator.alloc(u16, num_blocks);
+        @memset(pins, 0);
         return @This(){
             .blocks_buf = blocks_buf,
             .block_size = block_size,
             .mapping_table = mapping_table,
             .free_list = free_list,
-            .pins = try std.DynamicBitSetUnmanaged.initEmpty(
-                allocator,
-                num_blocks,
-            ),
+            .pins = pins,
         };
     }
     pub fn deinit(_: *@This()) void {}
@@ -539,11 +535,12 @@ pub const BlockServer = struct {
         self: *@This(),
         level: usize,
         offset: u64,
-    ) !usize {
+    ) !.{ usize, u64 } {
+        const block_start = offset >> @intCast(@ctz(self.block_size));
         const idx = self.mapping_table.items[level].get(
-            offset >> @intCast(@ctz(self.block_size)),
+            block_start,
         ) orelse return Error.needs_io;
-        return idx;
+        return .{ idx, block_start };
     }
 
     pub inline fn getBlock(self: *const @This(), idx: usize) []const u8 {
@@ -553,8 +550,12 @@ pub const BlockServer = struct {
     }
 
     pub fn flush() void {}
-    pub fn pin() void {}
-    pub fn unpin() void {}
+    pub inline fn pin(self: *@This(), idx: usize) void {
+        self.pins[idx] += 1;
+    }
+    pub inline fn unpin(self: *@This(), idx: usize) void {
+        self.pins[idx] -= 1;
+    }
 
     /// returns a free mutable buffer and it's index.
     /// for now, panics if there are no free buffers.

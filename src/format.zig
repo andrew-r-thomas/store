@@ -824,7 +824,7 @@ pub const PageBuilder = struct {
     chunks: std.ArrayListUnmanaged(PageChunk),
 
     commits: std.ArrayListUnmanaged(Commit),
-    smos: std.ArrayListUnmanaged(Smo),
+    smos: std.ArrayListUnmanaged(Smop),
     entries: std.ArrayListUnmanaged(Entry),
 
     left_pid: u64,
@@ -839,7 +839,7 @@ pub const PageBuilder = struct {
             .chunks = std.ArrayListUnmanaged(PageChunk).empty,
 
             .commits = std.ArrayListUnmanaged(Commit).empty,
-            .smos = std.ArrayListUnmanaged(Smo).empty,
+            .smos = std.ArrayListUnmanaged(Smop).empty,
             .entries = std.ArrayListUnmanaged(Entry).empty,
 
             .left_pid = 0,
@@ -1064,7 +1064,7 @@ pub fn PageChunk(comptime pt: page_type) type {
         };
 
         commits: struct { commits: Iter(Commit, false), next: u64 },
-        smops: struct { smops: Iter(Smo, false), next: u64 },
+        smops: struct { smops: Iter(Smop, false), next: u64 },
         entries: Entries,
 
         pub fn size(self: *const Self) usize {
@@ -1168,7 +1168,7 @@ pub fn PageChunk(comptime pt: page_type) type {
                     cursor += @sizeOf(u64);
                     return Self{
                         .smops = .{
-                            .smops = Iter(Smo, false).fromBytes(
+                            .smops = Iter(Smop, false).fromBytes(
                                 buf[cursor .. cursor + len],
                             ),
                             .next = next_off,
@@ -1192,15 +1192,11 @@ pub const page_type = enum {
     leaf,
 };
 
-pub const Smo = union(Tag) {
-    split: struct {
-        pid: u64,
-        lte_key: []const u8,
-    },
-
-    pub const Tag = enum {
-        split,
-    };
+/// a [S]tructure [M]odification [OP]eration
+pub const Smop = struct {
+    pid: u64,
+    gt_key: []const u8,
+    lte_key: []const u8,
 };
 
 /// format:
