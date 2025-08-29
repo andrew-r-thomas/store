@@ -28,7 +28,7 @@ pub fn init(
         cfg.num_blocks,
         allocator,
     );
-    const zipper = Zipper.init(allocator);
+    const zipper = Zipper.init(allocator, cfg.zip_cfg);
     return Self{
         .pump_arena = pump_arena,
         .root = root,
@@ -56,13 +56,14 @@ pub fn pump(self: *Self) void {
         1024,
     ) catch unreachable;
     _ = self.root.flush(block, &self.levels.items[self.levels.items.len - 1]);
-    _ = try self.zipper.pump(&self.block_server, &self.levels, 123);
+    self.zipper.pump(&self.block_server, &self.levels, 123) catch unreachable;
 }
 
 pub const Config = struct {
     block_size: usize,
     num_blocks: usize,
     max_page_size: usize,
+    zip_cfg: Zipper.Cfg,
 };
 
 pub const PageCache = struct {
@@ -480,7 +481,7 @@ pub const Root = struct {
 pub const LevelMeta = struct {
     level: usize,
     offset_table: std.AutoArrayHashMap(u64, u64),
-    current_buf: usize,
+    current_buf: BlockServer.Buffer,
     head: u64,
     tail: u64,
 };
@@ -494,6 +495,12 @@ pub const BlockServer = struct {
     ),
     free_list: std.ArrayListUnmanaged(usize),
     pins: []u16,
+
+    const Buffer = struct {
+        buf: []u8,
+        off: usize,
+        idx: usize,
+    };
 
     const BlockPrio = struct {
         offset: u64,
@@ -535,7 +542,7 @@ pub const BlockServer = struct {
         self: *@This(),
         level: usize,
         offset: u64,
-    ) !.{ usize, u64 } {
+    ) !struct { usize, u64 } {
         const block_start = offset >> @intCast(@ctz(self.block_size));
         const idx = self.mapping_table.items[level].get(
             block_start,

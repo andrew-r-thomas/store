@@ -14,6 +14,14 @@ pub fn main() !void {
             .block_size = 1024 * 1024,
             .num_blocks = 64,
             .max_page_size = 1024,
+
+            // NOTE: these are not currently being used internally
+            .zip_cfg = .{
+                .zip_thresh = 1024,
+                .compact_thresh = 1024,
+                .split_thresh = 1024,
+                .merge_thresh = 1024,
+            },
         },
         gpa.allocator(),
     );

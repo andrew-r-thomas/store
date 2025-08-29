@@ -1050,9 +1050,13 @@ pub const PageBuilder = struct {
 /// [ HEADER                            ]
 ///     [ type            (u8) ]
 ///     [ len            (u64) ]
-///     [ maybe next_off (u64) ]
+///     [ next_off (u64) ]
 /// [ COMMITS | SMOPS | ENTRIES (bytes) ]
 /// ```
+///
+/// ## TODO
+/// - figure out what to do with next_off when we already have the type
+///   (for now we're just putting it there every time, 0 for entries chunk)
 pub fn PageChunk(comptime pt: page_type) type {
     return union(Tag) {
         const Self = @This();
@@ -1127,6 +1131,12 @@ pub fn PageChunk(comptime pt: page_type) type {
                         .little,
                     );
                     cursor += @sizeOf(u64);
+                    mem.writeInt(
+                        u64,
+                        buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
+                        0,
+                        .little,
+                    );
                     e.serialize(buf[cursor..]);
                 },
             }
@@ -1144,13 +1154,14 @@ pub fn PageChunk(comptime pt: page_type) type {
             );
             cursor += @sizeOf(u64);
 
+            const next_off = mem.bytesToValue(
+                u64,
+                buf[cursor .. cursor + @sizeOf(u64)],
+            );
+            cursor += @sizeOf(u64);
+
             switch (t) {
                 Tag.commits => {
-                    const next_off = mem.bytesToValue(
-                        u64,
-                        buf[cursor .. cursor + @sizeOf(u64)],
-                    );
-                    cursor += @sizeOf(u64);
                     return Self{
                         .commits = .{
                             .commits = Iter(Commit, false).fromBytes(
@@ -1161,11 +1172,6 @@ pub fn PageChunk(comptime pt: page_type) type {
                     };
                 },
                 Tag.smops => {
-                    const next_off = mem.bytesToValue(
-                        u64,
-                        buf[cursor .. cursor + @sizeOf(u64)],
-                    );
-                    cursor += @sizeOf(u64);
                     return Self{
                         .smops = .{
                             .smops = Iter(Smop, false).fromBytes(
@@ -1194,9 +1200,43 @@ pub const page_type = enum {
 
 /// a [S]tructure [M]odification [OP]eration
 pub const Smop = struct {
+    const Self = @This();
+
     pid: u64,
     gt_key: []const u8,
     lte_key: []const u8,
+
+    pub fn size(self: *const Self) usize {
+        return PageId.SIZE +
+            (Key.LEN_SIZE * 2) +
+            self.gt_key.len +
+            self.lte_key.len;
+    }
+    pub fn fromBytes(buf: []const u8) Self {
+        var cursor: usize = 0;
+        const pid = PageId.fromBytes(buf[cursor .. cursor + PageId.SIZE]);
+        cursor += PageId.SIZE;
+        const gt_key = Key.parse(buf[cursor..]) catch unreachable;
+        cursor += Key.size(gt_key);
+        const lte_key = Key.parse(buf[cursor..]) catch unreachable;
+        return Self{
+            .pid = pid,
+            .gt_key = gt_key,
+            .lte_key = lte_key,
+        };
+    }
+    pub fn serialize(self: *const Self, buf: []u8) void {
+        debug.assert(self.size() == buf.len);
+        var cursor: usize = 0;
+        PageId.serialize(self.pid, buf[cursor .. cursor + PageId.SIZE]);
+        cursor += PageId.SIZE;
+        Key.serialize(
+            self.gt_key,
+            buf[cursor .. cursor + Key.size(self.gt_key)],
+        );
+        cursor += Key.size(self.gt_key);
+        Key.serialize(self.lte_key, buf[cursor..]);
+    }
 };
 
 /// format:
@@ -1314,4 +1354,12 @@ pub const InnerEntries = struct {
 /// [ val lens  ...(u32) ]
 /// [ entries ...(bytes) ]
 /// ```
-pub const LeafEntries = struct {};
+pub const LeafEntries = struct {
+    const Self = @This();
+
+    key_offs: []align(1) const u32,
+    key_lens: []align(1) const u16,
+    keys: []const u8,
+
+    pub fn fromBytes(_: []const u8) Self {}
+};
