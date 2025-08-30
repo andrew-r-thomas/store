@@ -43,7 +43,8 @@ pub fn pump(
     self: *Self,
     block_server: *Shard.BlockServer,
     levels: *std.ArrayListUnmanaged(Shard.LevelMeta),
-    oldest_active_commit: u64,
+    root: *Shard.Root,
+    oldest_active_ts: u64,
 ) !void {
     const alloc = self.zip_arena.allocator();
 
@@ -55,7 +56,7 @@ pub fn pump(
                 .building_parent = .{
                     .req = req,
                     .next = levels.items[req.parent_level].offset_table.get(req.parent_id).?,
-                    .parent = PageBuilder(.inner).empty,
+                    .parent = PageBuilder(.inner).init(req.parent_id),
                 },
             };
             continue :state self.state;
@@ -84,15 +85,16 @@ pub fn pump(
             }
         },
         .zipping => |*data| {
+            var parent_level = &levels.items[data.req.parent_level];
             if (data.child_map.pop()) |child| {
-                const child_level = data.req.parent_level - 1;
+                const child_level = parent_level.level - 1;
                 if (child_level == 0) {
                     self.state = .{
                         .building_leaf_child = .{
                             .zipping = data.*,
                             .new_child_commits = child.value,
                             .next = levels.items[child_level].offset_table.get(child.key).?,
-                            .child = .empty,
+                            .child = PageBuilder(.leaf).init(child.key),
                         },
                     };
                 } else {
@@ -101,26 +103,52 @@ pub fn pump(
                             .zipping = data.*,
                             .new_child_commits = child.value,
                             .next = levels.items[child_level].offset_table.get(child.key).?,
-                            .child = .empty,
+                            .child = PageBuilder(.inner).init(child.key),
                         },
                     };
                 }
                 continue :state self.state;
             } else {
                 if (data.req.parent_level == levels.items.len - 1) {
-                    // TODO: parent is top level, run compaction/split check
+                    if (data.parent.size() > self.cfg.compact_thresh) {
+                        try data.parent.compact(alloc, oldest_active_ts);
+                        if (data.parent.size() > self.cfg.split_thresh) {
+                            const to_pid = parent_level.next_pid;
+                            parent_level.next_pid += 1;
+
+                            var res = try data.parent.split(alloc, to_pid);
+                            root.insert(res.smop);
+
+                            const size = res.to.size();
+                            const buf = parent_level
+                                .current_buf
+                                .buf[parent_level.current_buf.off..];
+                            if (buf.len < size) {
+                                // TODO: get a new buffer, and flush the current one
+                                unreachable;
+                            }
+                            res.to.serialize(buf[0..size]);
+                            try parent_level.offset_table.put(
+                                res.to.pid,
+                                parent_level.current_buf.off,
+                            );
+                            parent_level.current_buf.off += size;
+                        }
+                    }
                 }
 
-                const level_buffer = &levels.items[
-                    data.req.parent_level
-                ].current_buf;
-                const buf = level_buffer.buf[level_buffer.off..];
+                const buf = parent_level.current_buf.buf[parent_level.current_buf.off..];
                 const size = data.parent.size();
                 if (buf.len < size) {
                     // TODO: get a new buffer, and flush the current one
+                    unreachable;
                 }
                 data.parent.serialize(buf[0..data.parent.size()]);
-                level_buffer.off += size;
+                try parent_level.offset_table.put(
+                    data.parent.pid,
+                    parent_level.current_buf.off,
+                );
+                parent_level.current_buf.off += size;
 
                 for (self.pins.items) |idx| {
                     block_server.unpin(idx);
@@ -131,9 +159,9 @@ pub fn pump(
             }
         },
         .building_inner_child => |*data| {
-            const child_level = data.zipping.req.parent_level - 1;
+            var child_level = &levels.items[data.zipping.req.parent_level - 1];
             const block_idx, const block_start = block_server.getBlockIdx(
-                child_level,
+                child_level.level,
                 data.next,
             ) catch return;
             block_server.pin(block_idx);
@@ -148,29 +176,44 @@ pub fn pump(
                 continue :state self.state;
             } else {
                 if (data.child.size() > self.cfg.compact_thresh) {
-                    try data.child.compact(alloc, oldest_active_commit);
+                    try data.child.compact(alloc, oldest_active_ts);
                     if (data.child.size() > self.cfg.split_thresh) {
-                        _ = try data.child.split(alloc);
+                        const to_pid = child_level.next_pid;
+                        child_level.next_pid += 1;
+
+                        var res = try data.child.split(alloc, to_pid);
+                        try data.zipping.parent.smops.insert(alloc, 0, res.smop);
+
+                        const size = res.to.size();
+                        const buf = child_level.current_buf.buf[child_level.current_buf.off..];
+                        if (buf.len < size) {
+                            // TODO: get a new buffer, and flush the current one
+                            unreachable;
+                        }
+                        res.to.serialize(buf[0..size]);
+                        try child_level.offset_table.put(res.to.pid, child_level.current_buf.off);
+                        child_level.current_buf.off += size;
                     }
                 }
 
                 const size = data.child.size();
-                const level_buffer = &levels.items[child_level].current_buf;
-                const buf = level_buffer.buf[level_buffer.off..];
+                const buf = child_level.current_buf.buf[child_level.current_buf.off..];
                 if (buf.len < size) {
                     // TODO: get a new buffer, and flush the current one
+                    unreachable;
                 }
                 data.child.serialize(buf[0..size]);
-                level_buffer.off += size;
+                try child_level.offset_table.put(data.child.pid, child_level.current_buf.off);
+                child_level.current_buf.off += size;
 
                 self.state = .{ .zipping = data.zipping };
                 continue :state self.state;
             }
         },
         .building_leaf_child => |*data| {
-            const child_level = data.zipping.req.parent_level - 1;
+            var child_level = &levels.items[data.zipping.req.parent_level - 1];
             const block_idx, const block_start = block_server.getBlockIdx(
-                child_level,
+                child_level.level,
                 data.next,
             ) catch return;
             block_server.pin(block_idx);
@@ -185,20 +228,35 @@ pub fn pump(
                 continue :state self.state;
             } else {
                 if (data.child.size() > self.cfg.compact_thresh) {
-                    try data.child.compact(alloc, oldest_active_commit);
+                    try data.child.compact(alloc, oldest_active_ts);
                     if (data.child.size() > self.cfg.split_thresh) {
-                        _ = try data.child.split(alloc);
+                        const to_pid = child_level.next_pid;
+                        child_level.next_pid += 1;
+
+                        var res = try data.child.split(alloc, to_pid);
+                        try data.zipping.parent.smops.insert(alloc, 0, res.smop);
+
+                        const size = res.to.size();
+                        const buf = child_level.current_buf.buf[child_level.current_buf.off..];
+                        if (buf.len < size) {
+                            // TODO: get a new buffer, and flush the current one
+                            unreachable;
+                        }
+                        res.to.serialize(buf[0..size]);
+                        try child_level.offset_table.put(res.to.pid, child_level.current_buf.off);
+                        child_level.current_buf.off += size;
                     }
                 }
 
                 const size = data.child.size();
-                const level_buffer = &levels.items[child_level].current_buf;
-                const buf = level_buffer.buf[level_buffer.off..];
+                const buf = child_level.current_buf.buf[child_level.current_buf.off..];
                 if (buf.len < size) {
                     // TODO: get a new buffer, and flush the current one
+                    unreachable;
                 }
                 data.child.serialize(buf[0..size]);
-                level_buffer.off += size;
+                try child_level.offset_table.put(data.child.pid, child_level.current_buf.off);
+                child_level.current_buf.off += size;
 
                 self.state = .{ .zipping = data.zipping };
                 continue :state self.state;
@@ -209,6 +267,7 @@ pub fn pump(
 
 pub fn PageBuilder(comptime pt: format.page_type) type {
     return struct {
+        pid: u64,
         commits: std.ArrayListUnmanaged(format.Commit),
         smops: std.ArrayListUnmanaged(format.Smop),
         entries: union(Tag) {
@@ -240,11 +299,14 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
             .leaf => std.MultiArrayList(struct { key: []const u8, val: []const u8 }),
         };
 
-        pub const empty = @This(){
-            .commits = .empty,
-            .smops = .empty,
-            .entries = .none,
-        };
+        pub fn init(pid: u64) @This() {
+            return @This(){
+                .pid = pid,
+                .commits = .empty,
+                .smops = .empty,
+                .entries = .none,
+            };
+        }
 
         pub fn size(_: *const @This()) usize {
             return 0;
@@ -443,10 +505,10 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
             }
         }
 
-        /// NOTE: returned smop's pid is undefined, and must be set by the user
         pub fn split(
             self: *@This(),
             allocator: mem.Allocator,
+            to_pid: u64,
         ) !struct {
             smop: format.Smop,
             to: PageBuilder(pt),
@@ -457,7 +519,7 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
             });
             debug.assert(self.smops.items.len == 0);
 
-            var to = @This().empty;
+            var to = @This().init(to_pid);
             switch (pt) {
                 .inner => {
                     const slice = self.entries.new.list.slice();
@@ -483,7 +545,7 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
 
                     return .{
                         .smop = format.Smop{
-                            .pid = undefined,
+                            .pid = to_pid,
                             .gt_key = to.entries.new.list.get(0).key,
                             .lte_key = middle.key,
                         },
@@ -513,7 +575,7 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
 
                     return .{
                         .smop = format.Smop{
-                            .pid = undefined,
+                            .pid = to_pid,
                             .gt_key = to.entries.new.get(0).key,
                             .lte_key = middle.key,
                         },

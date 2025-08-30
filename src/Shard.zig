@@ -17,6 +17,9 @@ zipper: Zipper,
 
 pump_arena: heap.ArenaAllocator,
 
+/// ## TODO
+/// - need the minimal structure when building new index
+///   (root, then two inners, then two leaves each)
 pub fn init(
     cfg: Config,
     allocator: mem.Allocator,
@@ -56,7 +59,7 @@ pub fn pump(self: *Self) void {
         1024,
     ) catch unreachable;
     _ = self.root.flush(block, &self.levels.items[self.levels.items.len - 1]);
-    self.zipper.pump(&self.block_server, &self.levels, 123) catch unreachable;
+    self.zipper.pump(&self.block_server, &self.levels, &self.root, 123) catch unreachable;
 }
 
 pub const Config = struct {
@@ -465,7 +468,7 @@ pub const Root = struct {
         debug.assert(self.flush_arena.reset(.retain_capacity));
     }
 
-    pub fn insert() void {}
+    pub fn insert(_: *@This(), _: format.Smop) void {}
 
     fn findChild(self: *const @This(), target: []const u8) ?usize {
         for (self.children.items(.key), 0..) |key, i| {
@@ -482,6 +485,7 @@ pub const LevelMeta = struct {
     level: usize,
     offset_table: std.AutoArrayHashMap(u64, u64),
     current_buf: BlockServer.Buffer,
+    next_pid: u64,
     head: u64,
     tail: u64,
 };
