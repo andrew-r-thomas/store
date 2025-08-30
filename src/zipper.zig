@@ -115,11 +115,12 @@ pub fn pump(
                     data.req.parent_level
                 ].current_buf;
                 const buf = level_buffer.buf[level_buffer.off..];
-                if (buf.len < data.parent.total_size) {
+                const size = data.parent.size();
+                if (buf.len < size) {
                     // TODO: get a new buffer, and flush the current one
                 }
-                data.parent.serialize(buf[0..data.parent.total_size]);
-                level_buffer.off += data.parent.total_size;
+                data.parent.serialize(buf[0..data.parent.size()]);
+                level_buffer.off += size;
 
                 for (self.pins.items) |idx| {
                     block_server.unpin(idx);
@@ -130,8 +131,9 @@ pub fn pump(
             }
         },
         .building_inner_child => |*data| {
+            const child_level = data.zipping.req.parent_level - 1;
             const block_idx, const block_start = block_server.getBlockIdx(
-                data.zipping.req.parent_level - 1,
+                child_level,
                 data.next,
             ) catch return;
             block_server.pin(block_idx);
@@ -145,9 +147,22 @@ pub fn pump(
                 data.next = next;
                 continue :state self.state;
             } else {
-                // TODO:
-                // - decide on compaction
-                // - decide on split
+                if (data.child.size() > self.cfg.compact_thresh) {
+                    try data.child.compact(alloc, oldest_active_commit);
+                    if (data.child.size() > self.cfg.split_thresh) {
+                        _ = try data.child.split(alloc);
+                    }
+                }
+
+                const size = data.child.size();
+                const level_buffer = &levels.items[child_level].current_buf;
+                const buf = level_buffer.buf[level_buffer.off..];
+                if (buf.len < size) {
+                    // TODO: get a new buffer, and flush the current one
+                }
+                data.child.serialize(buf[0..size]);
+                level_buffer.off += size;
+
                 self.state = .{ .zipping = data.zipping };
                 continue :state self.state;
             }
@@ -169,18 +184,21 @@ pub fn pump(
                 data.next = next;
                 continue :state self.state;
             } else {
-                if (data.child.total_size > self.cfg.compact_thresh) {
-                    // TODO: compact, then maybe split
-                    data.child.compact(oldest_active_commit);
+                if (data.child.size() > self.cfg.compact_thresh) {
+                    try data.child.compact(alloc, oldest_active_commit);
+                    if (data.child.size() > self.cfg.split_thresh) {
+                        _ = try data.child.split(alloc);
+                    }
                 }
 
+                const size = data.child.size();
                 const level_buffer = &levels.items[child_level].current_buf;
                 const buf = level_buffer.buf[level_buffer.off..];
-                if (buf.len < data.child.total_size) {
+                if (buf.len < size) {
                     // TODO: get a new buffer, and flush the current one
                 }
-                data.child.serialize(buf[0..data.child.total_size]);
-                level_buffer.off += data.child.total_size;
+                data.child.serialize(buf[0..size]);
+                level_buffer.off += size;
 
                 self.state = .{ .zipping = data.zipping };
                 continue :state self.state;
@@ -190,30 +208,53 @@ pub fn pump(
 }
 
 pub fn PageBuilder(comptime pt: format.page_type) type {
-    const Entries = switch (pt) {
-        .inner => format.InnerEntries,
-        .leaf => format.LeafEntries,
-    };
-
     return struct {
         commits: std.ArrayListUnmanaged(format.Commit),
         smops: std.ArrayListUnmanaged(format.Smop),
-        entries: ?Entries,
-        total_size: usize,
+        entries: union(Tag) {
+            none,
+            chunk: ChunkEntries,
+            new: NewEntries,
 
-        const empty = @This(){
+            pub const Tag = enum {
+                none,
+                chunk,
+                new,
+            };
+        },
+
+        pub const ChunkEntries = switch (pt) {
+            .leaf => format.LeafEntries,
+            .inner => format.InnerEntries,
+        };
+        pub const NewEntries = switch (pt) {
+            .inner => struct {
+                list: std.MultiArrayList(struct { pid: u64, key: []const u8 }),
+                gt_pid: u64,
+
+                pub const empty = @This(){
+                    .list = .empty,
+                    .gt_pid = 0,
+                };
+            },
+            .leaf => std.MultiArrayList(struct { key: []const u8, val: []const u8 }),
+        };
+
+        pub const empty = @This(){
             .commits = .empty,
             .smops = .empty,
-            .entries = null,
-            .total_size = 0,
+            .entries = .none,
         };
+
+        pub fn size(_: *const @This()) usize {
+            return 0;
+        }
 
         pub fn ingestChunk(
             self: *@This(),
             allocator: mem.Allocator,
             chunk: format.PageChunk(pt),
         ) !?u64 {
-            self.total_size += chunk.size();
             switch (chunk) {
                 .commits => |c| {
                     var commits = c.commits;
@@ -230,7 +271,7 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
                     return s.next;
                 },
                 .entries => |e| {
-                    self.entries = e;
+                    self.entries = .{ .chunk = e };
                     return null;
                 },
             }
@@ -263,7 +304,7 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
                 }
                 const res = try child_map.getOrPut(
                     allocator,
-                    self.entries.?.search(commit.write.key),
+                    self.entries.chunk.search(commit.write.key),
                 );
                 if (!res.found_existing) {
                     res.value_ptr.* = .empty;
@@ -274,7 +315,213 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
             return child_map;
         }
 
-        pub fn compact(_: *@This(), _: u64) void {}
+        pub fn compact(self: *@This(), allocator: mem.Allocator, oldest_active_ts: u64) !void {
+            switch (pt) {
+                .inner => {
+                    var new_entries = NewEntries.empty;
+                    const old_entries = self.entries.chunk;
+
+                    for (0..old_entries.key_offs.len) |i| {
+                        const pid = old_entries.pids[i];
+                        const key_off = old_entries.key_offs[i];
+                        const key_len = old_entries.key_lens[i];
+                        try new_entries.list.append(
+                            allocator,
+                            .{ .pid = pid, .key = old_entries.keys[key_off .. key_off + key_len] },
+                        );
+                    }
+                    new_entries.gt_pid = old_entries.pids[old_entries.pids.len - 1];
+
+                    // NOTE: since we're only doing splits right now, all smops are inserts
+                    // TODO: adjust for merges
+                    smops: for (self.smops.items) |smop| {
+                        for (new_entries.list.items(.key), 0..) |key, i| {
+                            if (mem.lessThan(u8, smop.lte_key, key)) {
+                                try new_entries.list.insert(
+                                    allocator,
+                                    i,
+                                    .{ .pid = smop.pid, .key = smop.lte_key },
+                                );
+                                continue :smops;
+                            }
+                        }
+                        try new_entries.list.append(
+                            allocator,
+                            .{ .pid = smop.pid, .key = smop.lte_key },
+                        );
+                    }
+                    self.smops = .empty;
+
+                    var safe_point: ?usize = null;
+                    for (self.commits.items, 0..) |commit, i| {
+                        if (commit.timestamp < oldest_active_ts) {
+                            safe_point = i;
+                            break;
+                        }
+                    }
+                    if (safe_point) |sp| {
+                        var hit_keys = KeySet.empty;
+                        var to_remove = std.ArrayListUnmanaged(usize).empty;
+                        for (self.commits.items[sp..], 0..) |commit, i| {
+                            if (try hit_keys.insert(allocator, commit.write.key)) {
+                                try to_remove.append(allocator, i);
+                            }
+                        }
+                        for (to_remove.items) |i| {
+                            _ = self.commits.orderedRemove(i);
+                        }
+                    }
+
+                    self.entries = .{ .new = new_entries };
+                },
+                .leaf => {
+                    // TODO: this will change when we need to do sib ptr changes for range scans
+                    debug.assert(self.smops.items.len == 0);
+                    var new_entries = NewEntries.empty;
+                    const old_entries = self.entries.chunk;
+
+                    for (0..old_entries.offs.len) |i| {
+                        const off = old_entries.offs[i];
+                        const key_len = old_entries.key_lens[i];
+                        const val_len = old_entries.val_lens[i];
+                        try new_entries.append(
+                            allocator,
+                            .{
+                                .key = old_entries.entries[off .. off + key_len],
+                                .val = old_entries.entries[off + key_len .. off + key_len + val_len],
+                            },
+                        );
+                    }
+
+                    var safe_point: ?usize = null;
+                    for (self.commits.items, 0..) |commit, i| {
+                        if (commit.timestamp < oldest_active_ts) {
+                            safe_point = i;
+                            break;
+                        }
+                    }
+                    if (safe_point) |sp| {
+                        commits: for (self.commits.items[sp..]) |commit| {
+                            for (new_entries.items(.key), 0..) |key, i| {
+                                switch (mem.order(u8, commit.write.key, key)) {
+                                    .lt => {
+                                        if (commit.write.val) |val| {
+                                            try new_entries.insert(
+                                                allocator,
+                                                i,
+                                                .{ .key = commit.write.key, .val = val },
+                                            );
+                                        }
+                                        continue :commits;
+                                    },
+                                    .eq => {
+                                        if (commit.write.val) |val| {
+                                            new_entries.set(
+                                                i,
+                                                .{ .key = commit.write.key, .val = val },
+                                            );
+                                        } else {
+                                            new_entries.orderedRemove(i);
+                                        }
+                                        continue :commits;
+                                    },
+                                    .gt => {},
+                                }
+                            }
+                            if (commit.write.val) |val| {
+                                try new_entries.append(
+                                    allocator,
+                                    .{ .key = commit.write.key, .val = val },
+                                );
+                            }
+                        }
+                        self.commits.items = self.commits.items[0..sp];
+                    }
+
+                    self.entries = .{ .new = new_entries };
+                },
+            }
+        }
+
+        /// NOTE: returned smop's pid is undefined, and must be set by the user
+        pub fn split(
+            self: *@This(),
+            allocator: mem.Allocator,
+        ) !struct {
+            smop: format.Smop,
+            to: PageBuilder(pt),
+        } {
+            debug.assert(switch (self.entries) {
+                .new => true,
+                else => false,
+            });
+            debug.assert(self.smops.items.len == 0);
+
+            var to = @This().empty;
+            switch (pt) {
+                .inner => {
+                    const slice = self.entries.new.list.slice();
+                    const middle = slice.get(slice.len / 2);
+                    to.entries.new.gt_pid = middle.pid;
+                    to.entries.new.list = slice.subslice(0, slice.len / 2).toMultiArrayList();
+                    self.entries.new.list = slice.subslice(
+                        (slice.len / 2) + 1,
+                        slice.len,
+                    ).toMultiArrayList();
+
+                    var remove = std.ArrayListUnmanaged(usize).empty;
+                    for (self.commits.items, 0..) |commit, i| {
+                        switch (mem.order(u8, commit.write.key, middle.key)) {
+                            .lt, .eq => {
+                                try to.commits.append(allocator, commit);
+                                try remove.append(allocator, i);
+                            },
+                            .gt => {},
+                        }
+                    }
+                    self.commits.orderedRemoveMany(remove.items);
+
+                    return .{
+                        .smop = format.Smop{
+                            .pid = undefined,
+                            .gt_key = to.entries.new.list.get(0).key,
+                            .lte_key = middle.key,
+                        },
+                        .to = to,
+                    };
+                },
+                .leaf => {
+                    const slice = self.entries.new.slice();
+                    const middle = slice.get(slice.len / 2);
+                    to.entries.new = slice.subslice(0, (slice.len / 2) + 1).toMultiArrayList();
+                    self.entries.new = slice.subslice(
+                        (slice.len / 2) + 1,
+                        slice.len,
+                    ).toMultiArrayList();
+
+                    var remove = std.ArrayListUnmanaged(usize).empty;
+                    for (self.commits.items, 0..) |commit, i| {
+                        switch (mem.order(u8, commit.write.key, middle.key)) {
+                            .lt, .eq => {
+                                try to.commits.append(allocator, commit);
+                                try remove.append(allocator, i);
+                            },
+                            .gt => {},
+                        }
+                    }
+                    self.commits.orderedRemoveMany(remove.items);
+
+                    return .{
+                        .smop = format.Smop{
+                            .pid = undefined,
+                            .gt_key = to.entries.new.get(0).key,
+                            .lte_key = middle.key,
+                        },
+                        .to = to,
+                    };
+                },
+            }
+        }
 
         pub fn serialize(_: *@This(), _: []u8) void {}
     };
@@ -341,4 +588,32 @@ pub const Cfg = struct {
     /// the minimum number of total bytes a page's entries section can contain
     /// before being merged
     merge_thresh: u64,
+};
+
+pub const KeySet = struct {
+    map: std.ArrayHashMapUnmanaged(
+        []const u8,
+        struct {},
+        struct {
+            pub fn hash(_: *const @This(), key: []const u8) u32 {
+                var hasher = std.hash.Wyhash.init(0);
+                std.hash.autoHashStrat(&hasher, key, .Deep);
+                return @truncate(hasher.final());
+            }
+            pub fn eql(_: *const @This(), a: []const u8, b: []const u8, _: usize) bool {
+                return mem.eql(u8, a, b);
+            }
+        },
+        false,
+    ),
+
+    pub const empty = @This(){
+        .map = .empty,
+    };
+
+    pub fn insert(self: *@This(), allocator: mem.Allocator, key: []const u8) !bool {
+        const res = try self.map.getOrPut(allocator, key);
+        res.value_ptr.* = .{};
+        return res.found_existing;
+    }
 };

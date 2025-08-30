@@ -1296,28 +1296,16 @@ pub const InnerEntries = struct {
     pub fn fromBytes(buf: []const u8) Self {
         var cursor: usize = 0;
 
-        const num = mem.bytesToValue(
-            u16,
-            buf[cursor .. cursor + @sizeOf(u16)],
-        );
+        const num = mem.bytesToValue(u16, buf[cursor .. cursor + @sizeOf(u16)]);
         cursor += @sizeOf(u16);
 
-        const pids = mem.bytesAsSlice(
-            u64,
-            buf[cursor .. cursor + (@sizeOf(u64) * (num + 1))],
-        );
+        const pids = mem.bytesAsSlice(u64, buf[cursor .. cursor + (@sizeOf(u64) * (num + 1))]);
         cursor += @sizeOf(u64) * (num + 1);
 
-        const key_offs = mem.bytesAsSlice(
-            u32,
-            buf[cursor .. cursor + (@sizeOf(u32) * num)],
-        );
+        const key_offs = mem.bytesAsSlice(u32, buf[cursor .. cursor + (@sizeOf(u32) * num)]);
         cursor += @sizeOf(u32) * num;
 
-        const key_lens = mem.bytesAsSlice(
-            u16,
-            buf[cursor .. cursor + (@sizeOf(u16) * num)],
-        );
+        const key_lens = mem.bytesAsSlice(u16, buf[cursor .. cursor + (@sizeOf(u16) * num)]);
         cursor += @sizeOf(u16) * num;
 
         const keys = buf[cursor..];
@@ -1357,9 +1345,42 @@ pub const InnerEntries = struct {
 pub const LeafEntries = struct {
     const Self = @This();
 
-    key_offs: []align(1) const u32,
+    offs: []align(1) const u32,
     key_lens: []align(1) const u16,
-    keys: []const u8,
+    val_lens: []align(1) const u32,
+    entries: []const u8,
 
-    pub fn fromBytes(_: []const u8) Self {}
+    pub fn size(self: *const Self) usize {
+        return @sizeOf(u16) +
+            (self.offs.len * @sizeOf(u32)) +
+            (self.key_lens.len * @sizeOf(u16)) +
+            (self.val_lens.len * @sizeOf(u32)) +
+            self.entries.len;
+    }
+
+    /// expects exact size buffer
+    pub fn fromBytes(buf: []const u8) Self {
+        var cursor: usize = 0;
+
+        const num = mem.bytesToValue(u16, buf[cursor .. cursor + @sizeOf(u16)]);
+        cursor += @sizeOf(u16);
+
+        const offs = mem.bytesAsSlice(u32, buf[cursor .. cursor + (@sizeOf(u32) * num)]);
+        cursor += @sizeOf(u32) * num;
+
+        const key_lens = mem.bytesAsSlice(u16, buf[cursor .. cursor + (@sizeOf(u16) * num)]);
+        cursor += @sizeOf(u16) * num;
+
+        const val_lens = mem.bytesAsSlice(u32, buf[cursor .. cursor + (@sizeOf(u32) * num)]);
+        cursor += @sizeOf(u32) * num;
+
+        const entries = buf[cursor..];
+
+        return Self{
+            .offs = offs,
+            .key_lens = key_lens,
+            .val_lens = val_lens,
+            .entries = entries,
+        };
+    }
 };
