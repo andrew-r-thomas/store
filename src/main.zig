@@ -4,7 +4,7 @@ const print = debug.print;
 const heap = std.heap;
 
 const store = @import("store_lib");
-const Shard = store.Shard;
+const Shard = store.shard.Shard;
 const Mesh = store.Mesh;
 
 pub fn main() !void {

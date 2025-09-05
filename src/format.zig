@@ -1,6 +1,6 @@
 //! ## TODO
-//! - convert all ints to little endian
 //! - alignment tricks
+//! - need a way to parse from slices (might want something more interface esque)
 
 const std = @import("std");
 
@@ -333,26 +333,21 @@ pub const TxnCtrl = enum {
     }
 };
 
-pub const NET_HEADER_SIZE = TxnId.SIZE + FLAGS_SIZE;
+pub const RequestOp = union(Tag) {
+    read: Read,
+    write: Write,
+    txn_ctrl: TxnCtrl,
 
-pub const Request = struct {
-    txn_id: u64,
-    op: union(OpTag) {
-        read: Read,
-        write: Write,
-        txn_ctrl: TxnCtrl,
-    },
+    const Self = @This();
 
-    const OpTag = enum {
+    pub const Tag = enum {
         read,
         write,
         txn_ctrl,
     };
 
-    const Self = @This();
-
     pub fn size(self: *const Self) usize {
-        return TxnId.SIZE + switch (self.op) {
+        return switch (self.*) {
             .read => |read| read.size(),
             .write => |write| write.size(),
             .txn_ctrl => TxnCtrl.SIZE,
@@ -360,52 +355,57 @@ pub const Request = struct {
     }
 
     pub fn parse(buf: []const u8) Error.Set!Self {
-        if (buf.len < NET_HEADER_SIZE) {
-            return Error.Set.EOF;
-        }
-
-        var cursor: usize = 0;
-
-        const txn_id = try TxnId.parse(buf[cursor .. cursor + TxnId.SIZE]);
-        cursor += TxnId.SIZE;
-        const flags = buf[cursor];
-
+        if (buf.len < FLAGS_SIZE) return Error.Set.EOF;
+        const flags = buf[0];
         switch (flags & TYPE_MASK) {
-            Read.FLAG_TYPE => {
-                return Self{
-                    .txn_id = txn_id,
-                    .op = .{ .read = try Read.parse(buf[cursor..]) },
-                };
-            },
-            Write.FLAG_TYPE => {
-                return Self{
-                    .txn_id = txn_id,
-                    .op = .{ .write = try Write.parse(buf[cursor..]) },
-                };
-            },
-            TxnCtrl.FLAG_TYPE => {
-                return Self{
-                    .txn_id = txn_id,
-                    .op = .{ .txn_ctrl = try TxnCtrl.parse(buf[cursor..]) },
-                };
-            },
+            Read.FLAG_TYPE => return Self{ .read = try Read.parse(buf) },
+            Write.FLAG_TYPE => return Self{ .write = try Write.parse(buf) },
+            TxnCtrl.FLAG_TYPE => return Self{ .txn_ctrl = try TxnCtrl.parse(buf) },
             else => return Error.Set.MALFORMED,
         }
     }
 
+    pub fn fromBytes(buf: []const u8) Self {
+        return Self.parse(buf) catch unreachable;
+    }
+
     pub fn serialize(self: *const Self, buf: []u8) void {
         assert(self.size() == buf.len);
+        switch (self) {
+            .read => |read| read.serialize(buf),
+            .write => |write| write.serialize(buf),
+            .txn_ctrl => |txn_ctrl| txn_ctrl.serialize(buf),
+        }
+    }
+};
 
+const NET_HEADER_SIZE = TxnId.SIZE + FLAGS_SIZE;
+
+pub const Request = struct {
+    txn_id: u64,
+    op: RequestOp,
+
+    const Self = @This();
+
+    pub fn size(self: *const Self) usize {
+        return TxnId.SIZE + self.op.size();
+    }
+
+    pub fn parse(buf: []const u8) Error.Set!Self {
+        if (buf.len < TxnId.SIZE) return Error.Set.EOF;
         var cursor: usize = 0;
+        const txn_id = try TxnId.parse(buf[cursor .. cursor + TxnId.SIZE]);
+        cursor += TxnId.SIZE;
+        const op = try RequestOp.parse(buf[cursor..]);
+        return Self{ .txn_id = txn_id, .op = op };
+    }
 
+    pub fn serialize(self: *const Self, buf: []u8) void {
+        assert(self.size() == buf.len);
+        var cursor: usize = 0;
         TxnId.serialize(self.txn_id, buf[cursor .. cursor + TxnId.SIZE]);
         cursor += TxnId.SIZE;
-
-        switch (self.op) {
-            .read => |read| read.serialize(buf[cursor..]),
-            .write => |write| write.serialize(buf[cursor..]),
-            .txn_ctrl => |txn_ctrl| txn_ctrl.serialize(buf[cursor..]),
-        }
+        self.op.serialize(buf[cursor..]);
     }
 };
 
@@ -446,113 +446,75 @@ pub const Error = struct {
 };
 
 pub const Response = struct {
-    txn_id: u64,
-    res: Error.Set!union(ResTag) {
-        read: ?[]const u8,
-        write,
-        txn_ctrl,
-    },
+    const Self = @This();
 
-    const ResTag = enum {
+    txn_id: u64,
+    op: ResponseOp,
+
+    pub const RES_MASK: u8 = 0b0000000_1;
+
+    pub fn size(self: *const Self) usize {
+        return TxnId.SIZE + self.op.size();
+    }
+    pub fn serialize(self: *const Self, buf: []u8) void {
+        assert(self.size() == buf.len);
+        var cursor: usize = 0;
+        TxnId.serialize(self.txn_id, buf[cursor .. cursor + TxnId.SIZE]);
+        cursor += TxnId.SIZE;
+        self.op.serialize(buf[cursor..]);
+    }
+};
+
+pub const ResponseOp = union(Tag) {
+    const Self = @This();
+
+    read: ?[]const u8,
+    write,
+    txn_ctrl,
+    err: Error,
+
+    pub const Tag = enum {
         read,
         write,
         txn_ctrl,
+        err,
     };
-
-    const Self = @This();
-
-    pub const RES_MASK: u8 = 0b0000000_1;
 
     pub const FLAG_OK: u8 = 0b0000000_0;
     pub const FLAG_ERR: u8 = 0b0000000_1;
 
-    pub fn size(self: *const Self) usize {
-        return NET_HEADER_SIZE + if (self.res) |res| switch (res) {
+    pub fn size(self: Self) usize {
+        return FLAGS_SIZE + switch (self) {
             .read => |val| Val.size(val),
             .write => 0,
             .txn_ctrl => 0,
-        } else |_| Error.SIZE;
+            .err => Error.SIZE,
+        };
     }
+
     pub fn serialize(self: *const Self, buf: []u8) void {
-        assert(self.size() == buf.len);
-
+        debug.assert(self.size() == buf.len);
         var cursor: usize = 0;
-
-        TxnId.serialize(self.txn_id, buf[cursor .. cursor + TxnId.SIZE]);
-        cursor += TxnId.SIZE;
-
-        if (self.res) |res| {
-            buf[cursor] = FLAG_OK;
-
-            switch (res) {
-                .read => |val| {
-                    buf[cursor] |= Read.FLAG_TYPE;
-                    cursor += FLAGS_SIZE;
-                    Val.serialize(val, buf[cursor..]);
-                },
-                .write => buf[cursor] |= Write.FLAG_TYPE,
-                .txn_ctrl => buf[cursor] |= TxnCtrl.FLAG_TYPE,
-            }
-        } else |err| {
-            buf[cursor] = FLAG_ERR;
-            cursor += FLAGS_SIZE;
-            const e = Error{ .err = err };
-            e.serialize(buf[cursor..]);
-        }
-    }
-
-    pub fn parse(buf: []const u8) Error.Set!Self {
-        if (buf.len < NET_HEADER_SIZE) {
-            return Error.Set.EOF;
-        }
-
-        var cursor: usize = 0;
-
-        const txn_id = try TxnId.parse(buf[cursor .. cursor + TxnId.SIZE]);
-        cursor += TxnId.SIZE;
-
-        const flgs = buf[cursor];
-        switch (flgs & RES_MASK) {
-            FLAG_OK => {
-                switch (flgs & TYPE_MASK) {
-                    Read.FLAG_TYPE => {
-                        if (buf.len <= cursor + FLAGS_SIZE) {
-                            return Error.Set.EOF;
-                        }
-                        cursor += FLAGS_SIZE;
-
-                        return Self{
-                            .txn_id = txn_id,
-                            .res = .{
-                                .read = try Val.parse(buf[cursor..]),
-                            },
-                        };
-                    },
-                    Write.FLAG_TYPE => return Self{
-                        .txn_id = txn_id,
-                        .res = .write,
-                    },
-                    TxnCtrl.FLAG_TYPE => return Self{
-                        .txn_id = txn_id,
-                        .res = .txn_ctrl,
-                    },
-                    else => return Error.Set.MALFORMED,
-                }
-            },
-            FLAG_ERR => {
-                if (buf.len <= cursor + FLAGS_SIZE) {
-                    return Error.Set.EOF;
-                }
+        switch (self.*) {
+            .read => |val| {
+                buf[cursor] = FLAG_OK;
+                buf[cursor] |= Read.FLAG_TYPE;
                 cursor += FLAGS_SIZE;
-
-                const e = try Error.parse(buf[cursor..]);
-
-                return Self{
-                    .txn_id = txn_id,
-                    .res = e.err,
-                };
+                Val.serialize(val, buf[cursor..]);
             },
-            else => return Error.Set.MALFORMED,
+            .write => {
+                buf[cursor] = FLAG_OK;
+                buf[cursor] |= Write.FLAG_TYPE;
+            },
+            .txn_ctrl => {
+                buf[cursor] = FLAG_OK;
+                buf[cursor] |= TxnCtrl.FLAG_TYPE;
+            },
+            .err => |e| {
+                buf[cursor] = FLAG_ERR;
+                cursor += FLAGS_SIZE;
+                e.serialize(buf[cursor..]);
+            },
         }
     }
 };
@@ -621,97 +583,6 @@ pub fn Iter(comptime T: type, comptime fallible: bool) type {
         };
     }
 }
-
-pub const Page = struct {
-    writes: []const u8,
-    entries: []const u8,
-    left_pid: u64,
-    right_pid: u64,
-
-    pub const ENTRIES_LEN_SIZE = @sizeOf(u64);
-    pub const FOOTER_SIZE = ENTRIES_LEN_SIZE + PageId.SIZE + PageId.SIZE;
-
-    const Self = @This();
-
-    pub fn fromBytes(buf: []const u8) Self {
-        var cursor = buf.len;
-
-        const right_pid = PageId.parse(
-            buf[cursor - PageId.SIZE .. cursor],
-        ) catch unreachable;
-        cursor -= PageId.SIZE;
-
-        const left_pid = PageId.parse(
-            buf[cursor - PageId.SIZE .. cursor],
-        ) catch unreachable;
-        cursor -= PageId.SIZE;
-
-        const entries_len = mem.readInt(
-            u64,
-            buf[cursor - ENTRIES_LEN_SIZE .. cursor][0..ENTRIES_LEN_SIZE],
-            .little,
-        );
-        cursor -= ENTRIES_LEN_SIZE;
-
-        const entries = buf[cursor - entries_len .. cursor];
-        cursor -= entries_len;
-
-        const writes = buf[0..cursor];
-
-        return Self{
-            .writes = writes,
-            .entries = entries,
-            .left_pid = left_pid,
-            .right_pid = right_pid,
-        };
-    }
-
-    pub inline fn isLeaf(self: *const Self) bool {
-        return self.left_pid != std.math.maxInt(u64);
-    }
-
-    pub fn searchLeaf(
-        self: *const Self,
-        target: []const u8,
-        timestamp: u64,
-    ) ?[]const u8 {
-        assert(self.isLeaf());
-
-        var commits = self.iterCommits();
-        while (commits.next()) |commit| {
-            if (timestamp < commit.timestamp) {
-                continue;
-            }
-            if (mem.eql(u8, target, commit.write.key)) {
-                return commit.write.val;
-            }
-        }
-
-        var entries = self.iterEntries();
-        while (entries.next()) |entry| {
-            if (mem.eql(u8, target, entry.key)) {
-                return entry.val;
-            } else if (mem.lessThan(u8, target, entry.key)) {
-                return null;
-            }
-        }
-
-        return null;
-    }
-
-    pub fn iterCommits(self: *const Self) Iter(Commit, false) {
-        assert(self.isLeaf());
-        return Iter(Commit, false).fromBytes(self.writes);
-    }
-    pub fn iterWrites(self: *const Self) Iter(Write, false) {
-        assert(!self.isLeaf());
-        return Iter(Write, false).fromBytes(self.writes);
-    }
-
-    pub fn iterEntries(self: *const Self) Iter(Entry, false) {
-        return Iter(Entry, false).fromBytes(self.entries);
-    }
-};
 
 pub const Timestamp = struct {
     pub const SIZE = @sizeOf(u64);
@@ -817,234 +688,6 @@ pub const Entry = struct {
     }
 };
 
-/// ## TODO
-/// - adjust left/right pid stuff for range scans
-///   (actually treat them as sibling pointers)
-pub const PageBuilder = struct {
-    chunks: std.ArrayListUnmanaged(PageChunk),
-
-    commits: std.ArrayListUnmanaged(Commit),
-    smos: std.ArrayListUnmanaged(Smop),
-    entries: std.ArrayListUnmanaged(Entry),
-
-    left_pid: u64,
-    right_pid: u64,
-
-    arena: heap.ArenaAllocator,
-
-    const Self = @This();
-
-    pub fn init(allocator: mem.Allocator) Self {
-        return Self{
-            .chunks = std.ArrayListUnmanaged(PageChunk).empty,
-
-            .commits = std.ArrayListUnmanaged(Commit).empty,
-            .smos = std.ArrayListUnmanaged(Smop).empty,
-            .entries = std.ArrayListUnmanaged(Entry).empty,
-
-            .left_pid = 0,
-            .right_pid = 0,
-
-            .arena = heap.ArenaAllocator.init(allocator),
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-
-    pub fn appendChunk(self: *Self, chunk: PageChunk) void {
-        self.chunks.append(self.arena.allocator(), chunk) catch unreachable;
-    }
-
-    pub fn clear(self: *Self) void {
-        assert(self.arena.reset(.retain_capacity));
-
-        self.commits = std.ArrayListUnmanaged(Commit).empty;
-        self.entries = std.ArrayListUnmanaged(Entry).empty;
-
-        self.left_pid = 0;
-        self.right_pid = 0;
-    }
-
-    pub fn entriesSize(self: *const Self) usize {
-        var total: usize = 0;
-        for (self.entries.items) |entry| total += entry.size();
-        return total;
-    }
-    pub fn commitsSize(self: *const Self) usize {
-        var total: usize = 0;
-        for (self.commits.items) |commit| total += commit.size();
-        return total;
-    }
-    pub fn size(self: *const Self) usize {
-        return self.commitsSize() + self.entriesSize() + Page.FOOTER_SIZE;
-    }
-
-    pub fn compact(self: *Self, page: Page, timestamp: ?u64) void {
-        self.clear();
-
-        self.left_pid = page.left_pid;
-        self.right_pid = page.right_pid;
-
-        var entries = page.iterEntries();
-        while (entries.next()) |entry| {
-            self.entries.append(
-                self.arena.allocator(),
-                entry,
-            ) catch unreachable;
-        }
-
-        if (page.isLeaf()) {
-            var commits = page.iterCommits();
-            while (commits.next()) |commit| {
-                if (timestamp.? < commit.timestamp) {
-                    // start actual compaction
-                    self.applyWrite(commit.write);
-                    break;
-                } else {
-                    self.commits.append(
-                        self.arena.allocator(),
-                        commit,
-                    ) catch unreachable;
-                }
-            }
-            while (commits.next()) |commit| {
-                self.applyWrite(commit.write);
-            }
-        } else {
-            var writes = page.iterWrites();
-            while (writes.next()) |write| {
-                self.applyWrite(write);
-            }
-        }
-    }
-
-    pub fn applyWrite(self: *Self, write: Write) void {
-        if (write.val) |val| {
-            for (self.entries.items, 0..) |*entry, i| {
-                if (mem.eql(u8, entry.key, write.key)) {
-                    entry.val = val;
-                    return;
-                } else if (mem.lessThan(u8, write.key, entry.key)) {
-                    self.entries.insert(
-                        self.arena.allocator(),
-                        i,
-                        Entry{ .key = write.key, .val = val },
-                    ) catch unreachable;
-                    return;
-                }
-            }
-            self.entries.append(
-                self.arena.allocator(),
-                Entry{ .key = write.key, .val = val },
-            ) catch unreachable;
-        } else {
-            for (self.entries.items, 0..) |entry, i| {
-                if (mem.eql(u8, entry.key, write.key)) {
-                    _ = self.entries.orderedRemove(i);
-                    return;
-                }
-            }
-        }
-    }
-
-    pub fn serialize(self: *const Self, buf: []u8) void {
-        assert(self.size() == buf.len);
-
-        var cursor: usize = 0;
-
-        for (self.commits.items) |commit| {
-            commit.serialize(buf[cursor .. cursor + commit.size()]);
-            cursor += commit.size();
-        }
-
-        for (self.entries.items) |entry| {
-            entry.serialize(buf[cursor .. cursor + entry.size()]);
-            cursor += entry.size();
-        }
-
-        mem.writeInt(
-            u64,
-            buf[cursor .. cursor + Page.ENTRIES_LEN_SIZE][0..Page.ENTRIES_LEN_SIZE],
-            self.entriesSize(),
-            .little,
-        );
-        cursor += Page.ENTRIES_LEN_SIZE;
-
-        PageId.serialize(self.left_pid, buf[cursor .. cursor + PageId.SIZE]);
-        cursor += PageId.SIZE;
-
-        PageId.serialize(self.right_pid, buf[cursor .. cursor + PageId.SIZE]);
-        cursor += PageId.SIZE;
-
-        assert(cursor == buf.len);
-    }
-
-    pub fn splitLeaf(self: *Self, allocator: mem.Allocator) Self {
-        assert(self.left_pid != std.math.maxInt(u64));
-
-        var to = Self.init(allocator);
-        to.left_pid = self.left_pid;
-
-        const middle_i = self.entries.items.len / 2;
-        for (0..middle_i + 1) |i| {
-            to.entries.append(
-                to.arena.allocator(),
-                self.entries.items[i],
-            ) catch unreachable;
-        }
-        for (0..middle_i + 1) |_| {
-            _ = self.entries.orderedRemove(0);
-        }
-
-        const middle_key = to.entries.getLast().key;
-        var to_remove = std.ArrayListUnmanaged(usize).empty;
-        defer to_remove.deinit(self.arena.allocator());
-        for (self.commits.items, 0..) |commit, i| {
-            const goesLeft = mem.order(
-                u8,
-                commit.write.key,
-                middle_key,
-            ) != .gt;
-            if (goesLeft) {
-                to.commits.append(
-                    to.arena.allocator(),
-                    commit,
-                ) catch unreachable;
-                to_remove.append(self.arena.allocator(), i) catch unreachable;
-            }
-        }
-        for (to_remove.items, 0..) |i, j| {
-            _ = self.commits.orderedRemove(i - j);
-        }
-
-        return to;
-    }
-
-    pub fn splitInner(self: *Self, allocator: mem.Allocator) Self {
-        assert(self.left_pid == std.math.maxInt(u64));
-        assert(self.commits.items.len == 0);
-
-        var to = Self.init(allocator);
-        to.left_pid = self.left_pid;
-
-        const middle_i = self.entries.items.len / 2;
-        for (0..middle_i + 1) |i| {
-            to.entries.append(
-                to.arena.allocator(),
-                self.entries.items[i],
-            ) catch unreachable;
-        }
-        for (0..middle_i + 1) |_| {
-            _ = self.entries.orderedRemove(0);
-        }
-
-        return to;
-    }
-};
-
 /// format:
 /// ```
 /// [ HEADER                            ]
@@ -1058,23 +701,28 @@ pub const PageBuilder = struct {
 /// - figure out what to do with next_off when we already have the type
 ///   (for now we're just putting it there every time, 0 for entries chunk)
 pub fn PageChunk(comptime pt: page_type) type {
-    return union(Tag) {
+    return struct {
         const Self = @This();
-        pub const Tag = enum(u8) { commits, smops, entries };
-        pub const HEADER_SIZE = @sizeOf(u8) + (@sizeOf(u64) * 2);
         const Entries = switch (pt) {
             .leaf => LeafEntries,
             .inner => InnerEntries,
         };
 
-        commits: struct { commits: Iter(Commit, false), next: u64 },
-        smops: struct { smops: Iter(Smop, false), next: u64 },
-        entries: Entries,
+        pub const HEADER_SIZE = @sizeOf(u8) + (@sizeOf(u64) * 2);
+
+        pub const Tag = enum(u8) { commits, smops, entries };
+
+        chunk: union(Tag) {
+            commits: Iter(Commit, false),
+            smops: Iter(Smop, false),
+            entries: Entries,
+        },
+        next: ?u64,
 
         pub fn size(self: *const Self) usize {
-            return HEADER_SIZE + switch (self.*) {
-                .commits => |c| c.commits.buf.len,
-                .smops => |s| s.smops.buf.len,
+            return HEADER_SIZE + switch (self.chunk) {
+                .commits => |commits| commits.buf.len,
+                .smops => |smops| smops.buf.len,
                 .entries => |e| e.size(),
             };
         }
@@ -1082,44 +730,44 @@ pub fn PageChunk(comptime pt: page_type) type {
         pub fn serialize(self: *const Self, buf: []u8) void {
             debug.assert(self.size() == buf.len);
             var cursor: usize = 0;
-            switch (self.*) {
-                .commits => |c| {
+            switch (self.chunk) {
+                .commits => |commits| {
                     buf[cursor] = @intFromEnum(Tag.commits);
                     cursor += @sizeOf(u8);
                     mem.writeInt(
                         u64,
                         buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
-                        c.commits.buf.len,
+                        commits.buf.len,
                         .little,
                     );
                     cursor += @sizeOf(u64);
                     mem.writeInt(
                         u64,
                         buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
-                        c.next,
+                        self.next.?,
                         .little,
                     );
                     cursor += @sizeOf(u64);
-                    @memcpy(buf[cursor..], c.commits.buf);
+                    @memcpy(buf[cursor..], commits.buf);
                 },
-                .smops => |s| {
+                .smops => |smops| {
                     buf[cursor] = @intFromEnum(Tag.smops);
                     cursor += @sizeOf(u8);
                     mem.writeInt(
                         u64,
                         buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
-                        s.smops.buf.len,
+                        smops.buf.len,
                         .little,
                     );
                     cursor += @sizeOf(u64);
                     mem.writeInt(
                         u64,
                         buf[cursor .. cursor + @sizeOf(u64)][0..@sizeOf(u64)],
-                        s.next,
+                        self.next.?,
                         .little,
                     );
                     cursor += @sizeOf(u64);
-                    @memcpy(buf[cursor..], s.smops.buf);
+                    @memcpy(buf[cursor..], smops.buf);
                 },
                 .entries => |e| {
                     buf[cursor] = @intFromEnum(Tag.entries);
@@ -1160,35 +808,24 @@ pub fn PageChunk(comptime pt: page_type) type {
             );
             cursor += @sizeOf(u64);
 
-            switch (t) {
-                Tag.commits => {
-                    return Self{
-                        .commits = .{
-                            .commits = Iter(Commit, false).fromBytes(
-                                buf[cursor .. cursor + len],
-                            ),
-                            .next = next_off,
-                        },
-                    };
+            return switch (t) {
+                Tag.commits => Self{
+                    .chunk = .{
+                        .commits = Iter(Commit, false).fromBytes(buf[cursor .. cursor + len]),
+                    },
+                    .next = next_off,
                 },
-                Tag.smops => {
-                    return Self{
-                        .smops = .{
-                            .smops = Iter(Smop, false).fromBytes(
-                                buf[cursor .. cursor + len],
-                            ),
-                            .next = next_off,
-                        },
-                    };
+                Tag.smops => Self{
+                    .chunk = .{
+                        .smops = Iter(Smop, false).fromBytes(buf[cursor .. cursor + len]),
+                    },
+                    .next = next_off,
                 },
-                Tag.entries => {
-                    return Self{
-                        .entries = Entries.fromBytes(
-                            buf[cursor .. cursor + len],
-                        ),
-                    };
+                Tag.entries => Self{
+                    .chunk = .{ .entries = Entries.fromBytes(buf[cursor .. cursor + len]) },
+                    .next = null,
                 },
-            }
+            };
         }
     };
 }
@@ -1382,5 +1019,21 @@ pub const LeafEntries = struct {
             .val_lens = val_lens,
             .entries = entries,
         };
+    }
+
+    pub fn search(self: *const Self, target: []const u8) ?[]const u8 {
+        for (0..self.offs.len) |i| {
+            const off = self.offs[i];
+            const key_len = self.key_lens[i];
+            const val_len = self.val_lens[i];
+            const key = self.entries[off .. off + key_len];
+            const val = self.entries[off + key_len .. off + key_len + val_len];
+            switch (mem.order(u8, target, key)) {
+                .lt => return null,
+                .eq => return val,
+                .gt => {},
+            }
+        }
+        return null;
     }
 };

@@ -18,7 +18,8 @@ const print = debug.print;
 
 const math = std.math;
 
-const format = @import("format.zig");
+const store = @import("store_lib");
+const format = store.format;
 const Shard = @import("Shard.zig");
 
 const Self = @This();
@@ -317,20 +318,20 @@ pub fn PageBuilder(comptime pt: format.page_type) type {
             allocator: mem.Allocator,
             chunk: format.PageChunk(pt),
         ) !?u64 {
-            switch (chunk) {
-                .commits => |c| {
-                    var commits = c.commits;
-                    while (commits.next()) |commit| {
+            switch (chunk.chunk) {
+                .commits => |commits| {
+                    var c = commits;
+                    while (c.next()) |commit| {
                         try self.commits.append(allocator, commit);
                     }
-                    return c.next;
+                    return chunk.next;
                 },
-                .smops => |s| {
-                    var smops = s.smops;
-                    while (smops.next()) |smop| {
+                .smops => |smops| {
+                    var s = smops;
+                    while (s.next()) |smop| {
                         try self.smops.append(allocator, smop);
                     }
-                    return s.next;
+                    return chunk.next;
                 },
                 .entries => |e| {
                     self.entries = .{ .chunk = e };

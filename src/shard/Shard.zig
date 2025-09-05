@@ -1,19 +1,22 @@
 const Self = @This();
 
 const std = @import("std");
+const store = @import("store_lib");
 const mem = std.mem;
 const heap = std.heap;
 const debug = std.debug;
 const print = debug.print;
 
-const format = @import("format.zig");
+const format = store.format;
 const Zipper = @import("Zipper.zig");
-const Mesh = @import("Mesh.zig");
+const Executor = @import("Executor.zig");
+const Mesh = store.Mesh;
 
 root: Root,
 levels: std.ArrayListUnmanaged(LevelMeta),
 block_server: BlockServer,
 zipper: Zipper,
+executor: Executor,
 
 pump_arena: heap.ArenaAllocator,
 
@@ -38,6 +41,7 @@ pub fn init(
         .block_server = block_server,
         .levels = std.ArrayListUnmanaged(LevelMeta).empty,
         .zipper = zipper,
+        .executor = .init(allocator),
     };
 }
 pub fn deinit(self: *Self) void {
@@ -60,6 +64,7 @@ pub fn pump(self: *Self) void {
     ) catch unreachable;
     _ = self.root.flush(block, &self.levels.items[self.levels.items.len - 1]);
     self.zipper.pump(&self.block_server, &self.levels, &self.root, 123) catch unreachable;
+    self.executor.pump(&self.block_server, &self.root, self.levels.items) catch unreachable;
 }
 
 pub const Config = struct {
@@ -436,12 +441,12 @@ pub const Root = struct {
             // this will be an inner page most of the time,
             // but also it doesn't matter since it will be commits only
             const chunk = format.PageChunk(.inner){
-                .commits = .{
+                .chunk = .{
                     .commits = format.Iter(format.Commit, false).fromBytes(
                         buf.buf,
                     ),
-                    .next = off.*,
                 },
+                .next = off.*,
             };
 
             off.* = level_meta.head + cursor;
@@ -453,12 +458,12 @@ pub const Root = struct {
         const off = level_meta.offset_table.getPtr(self.gt_pid).?;
 
         const chunk = format.PageChunk(.inner){
-            .commits = .{
+            .chunk = .{
                 .commits = format.Iter(format.Commit, false).fromBytes(
                     self.gt_buf.buf,
                 ),
-                .next = off.*,
             },
+            .next = off.*,
         };
 
         off.* = level_meta.head + cursor;

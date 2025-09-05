@@ -1,6 +1,4 @@
 pub const format = @import("format.zig");
+pub const shard = @import("shard");
 
 pub const Mesh = @import("Mesh.zig");
-
-pub const Shard = @import("Shard.zig");
-pub const Zipper = @import("Zipper.zig");
