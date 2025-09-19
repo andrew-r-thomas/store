@@ -18,9 +18,8 @@ const print = debug.print;
 
 const math = std.math;
 
-const store = @import("store_lib");
-const format = store.format;
 const Shard = @import("Shard.zig");
+const format = @import("format.zig");
 
 const Self = @This();
 

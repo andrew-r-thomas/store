@@ -27,11 +27,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const shard_mod = b.createModule(.{
-        .root_source_file = b.path("src/shard/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
 
     // We will also create a module for our other entry point, 'main.zig'.
     const exe_mod = b.createModule(.{
@@ -47,8 +42,6 @@ pub fn build(b: *std.Build) void {
     // Modules can depend on one another using the `std.Build.Module.addImport` function.
     // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
     // file path. In this case, we set up `exe_mod` to import `lib_mod`.
-    lib_mod.addImport("shard", shard_mod);
-    shard_mod.addImport("store_lib", lib_mod);
     exe_mod.addImport("store_lib", lib_mod);
 
     // Now, we will create a static library based on the module we created above.
@@ -59,17 +52,11 @@ pub fn build(b: *std.Build) void {
         .name = "store",
         .root_module = lib_mod,
     });
-    const shard_lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "shard",
-        .root_module = shard_mod,
-    });
 
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
     b.installArtifact(lib);
-    b.installArtifact(shard_lib);
 
     // This creates another `std.Build.Step.Compile`, but this one builds an executable
     // rather than a static library.
@@ -115,11 +102,6 @@ pub fn build(b: *std.Build) void {
         .name = "store",
         .root_module = lib_mod,
     });
-    const shard_check = b.addLibrary(.{
-        .linkage = .static,
-        .name = "shard",
-        .root_module = shard_mod,
-    });
 
     const check_step = b.step(
         "check",
@@ -127,5 +109,4 @@ pub fn build(b: *std.Build) void {
     );
     check_step.dependOn(&exe_check.step);
     check_step.dependOn(&lib_check.step);
-    check_step.dependOn(&shard_check.step);
 }

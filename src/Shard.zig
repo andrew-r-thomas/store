@@ -1,21 +1,22 @@
 const Self = @This();
 
 const std = @import("std");
-const store = @import("store_lib");
 const mem = std.mem;
 const heap = std.heap;
 const debug = std.debug;
 const print = debug.print;
 
-const format = store.format;
+const format = @import("format.zig");
 const Zipper = @import("Zipper.zig");
 const Executor = @import("Executor.zig");
-const Mesh = store.Mesh;
+const Mesh = @import("Mesh.zig");
 
 root: Root,
-levels: std.ArrayListUnmanaged(LevelMeta),
+levels: std.ArrayList(LevelMeta),
 block_server: BlockServer,
+conns: std.AutoArrayHashMap(u32, Conn),
 zipper: Zipper,
+mesh: *Mesh,
 executor: Executor,
 
 pump_arena: heap.ArenaAllocator,
@@ -26,6 +27,7 @@ pump_arena: heap.ArenaAllocator,
 pub fn init(
     cfg: Config,
     allocator: mem.Allocator,
+    mesh: *Mesh,
 ) !Self {
     const pump_arena = heap.ArenaAllocator.init(allocator);
     const root = try Root.init(allocator, cfg.block_size);
@@ -39,9 +41,11 @@ pub fn init(
         .pump_arena = pump_arena,
         .root = root,
         .block_server = block_server,
+        .mesh = mesh,
         .levels = std.ArrayListUnmanaged(LevelMeta).empty,
         .zipper = zipper,
         .executor = .init(allocator),
+        .conns = .init(allocator),
     };
 }
 pub fn deinit(self: *Self) void {
@@ -51,20 +55,24 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn pump(self: *Self) void {
-    _ = self.root.commit(
-        format.Commit{
-            .timestamp = 0,
-            .write = format.Write{ .key = &.{0}, .val = null },
+    self.mesh.poll(
+        1,
+        struct {
+            pub fn call(from: usize, first: []const Mesh.Msg, last: []const Mesh.Msg) usize {
+                for (0..first.len + last.len) |i| {
+                    const msg = if (i < first.len) first[i] else last[i - first.len];
+                    switch (msg) {
+                        .newConn => {},
+                        .commitResp => {},
+                        .writeReq => {},
+                        else => unreachable,
+                    }
+                }
+
+                return first.len + last.len;
+            }
         },
-    ) catch unreachable;
-    _ = self.root.read(&.{0}, 0);
-    const block = self.pump_arena.allocator().alloc(
-        u8,
-        1024,
-    ) catch unreachable;
-    _ = self.root.flush(block, &self.levels.items[self.levels.items.len - 1]);
-    self.zipper.pump(&self.block_server, &self.levels, &self.root, 123) catch unreachable;
-    self.executor.pump(&self.block_server, &self.root, self.levels.items) catch unreachable;
+    );
 }
 
 pub const Config = struct {
@@ -72,238 +80,6 @@ pub const Config = struct {
     num_blocks: usize,
     max_page_size: usize,
     zip_cfg: Zipper.Cfg,
-};
-
-pub const PageCache = struct {
-    buf_pool: []Buffer,
-    free_list: std.ArrayListUnmanaged(usize),
-    id_map: std.AutoHashMapUnmanaged(u64, usize),
-
-    hits: [][2]u64,
-    hit: u64,
-    free_cap_target: usize,
-
-    pub fn init(
-        page_size: usize,
-        pool_size: usize,
-        free_cap_target: usize,
-        allocator: mem.Allocator,
-    ) !@This() {
-        const buf = try allocator.alloc(u8, page_size * pool_size);
-        var buf_pool = try allocator.alloc(Buffer, pool_size);
-        var free_list = try std.ArrayListUnmanaged(usize).initCapacity(
-            allocator,
-            pool_size,
-        );
-        var id_map = std.AutoHashMapUnmanaged(u64, usize).empty;
-        try id_map.ensureTotalCapacity(allocator, @intCast(pool_size));
-
-        var hits = try allocator.alloc([2]u64, pool_size);
-
-        for (0..pool_size) |i| {
-            buf_pool[i] = Buffer.init(
-                buf[i * page_size .. (i + 1) * page_size],
-            );
-            free_list.appendAssumeCapacity(i);
-            hits[i] = .{ std.math.maxInt(u64), 0 };
-        }
-
-        return @This(){
-            .buf_pool = buf_pool,
-            .free_list = free_list,
-            .id_map = id_map,
-
-            .hits = hits,
-            .hit = 1,
-            .free_cap_target = free_cap_target,
-        };
-    }
-    pub fn deinit(self: *@This(), allocator: mem.Allocator) void {
-        var og_buf = self.buf_pool[0].buf;
-        og_buf.len = og_buf.len * self.buf_pool.len;
-        allocator.free(og_buf);
-        allocator.free(self.buf_pool);
-
-        self.free_list.deinit(allocator);
-        self.id_map.deinit(allocator);
-
-        allocator.free(self.hits);
-    }
-
-    pub fn get(self: *@This(), pid: u64) ?usize {
-        if (self.id_map.get(pid)) |idx| {
-            self.hits[idx][1] = self.hits[idx][0];
-            self.hits[idx][0] = self.hit;
-            self.hit += 1;
-            return idx;
-        } else {
-            return null;
-        }
-    }
-    pub fn insert(self: *@This(), pid: u64, idx: usize) void {
-        if (self.id_map.fetchPutAssumeCapacity(pid, idx)) {
-            unreachable;
-        }
-        self.hits[idx][0] = self.hit;
-        self.hits[idx][1] = 0;
-        self.hit += 1;
-    }
-
-    pub fn remove(self: *@This(), pid: u64) void {
-        if (!(self.id_map.fetchRemove(pid))) {
-            unreachable;
-        }
-    }
-    pub fn pop_free(self: *@This()) usize {
-        if (self.free_list.pop()) |idx| {
-            return idx;
-        } else {
-            unreachable;
-        }
-    }
-
-    pub const Buffer = struct {
-        buf: []u8,
-        top: usize,
-
-        const Error = error{
-            BufFull,
-        };
-
-        pub fn init(buf: []u8) @This() {
-            return @This(){ .buf = buf, .top = buf.len };
-        }
-
-        pub fn reset(self: *@This()) void {
-            @memset(self.buf, 0);
-            self.top = self.buf.len;
-        }
-
-        pub fn write(
-            self: *@This(),
-            comptime W: type,
-            w: *const W,
-        ) @This().Error!void {
-            const size = w.size();
-            if (size > self.top) {
-                return @This().Error.BufFull;
-            }
-            w.serialize(self.buf[self.top - size .. self.top]);
-            self.top -= size;
-        }
-
-        pub fn read(self: *const @This()) format.Page {
-            return format.Page.fromBytes(self.buf[self.top..]);
-        }
-    };
-};
-
-/// ## TODO
-/// - check memtable first
-fn findLeaf(
-    target: []const u8,
-    block_server: *BlockServer,
-    inner_offsets: *const std.AutoArrayHashMapUnmanaged(u64, u64),
-    root: u64,
-) union(findLeafTag) {
-    needs_io: u64,
-    leaf_id: u64,
-} {
-    var current = root;
-    while (inner_offsets.get(current)) |o| {
-        var offset: ?u64 = o;
-        var best_op: ?format.Write = null;
-        var best_entry: ?format.Entry = null;
-        while (offset) |off| {
-            const block_start = block_server.offsetToBlockStart(off);
-            if (block_server.getBlock(block_start)) |block| {
-                var chunk = chunkFromBlock(false, block, off);
-                while (chunk.commits.next()) |write| {
-                    switch (mem.order(u8, target, write.key)) {
-                        .lt, .eq => {
-                            if (best_op) |bo| {
-                                if (mem.lessThan(u8, write.key, bo.key)) {
-                                    best_op = write;
-                                }
-                            } else {
-                                best_op = write;
-                            }
-                        },
-                        .gt => {},
-                    }
-                }
-                while (chunk.entries.next()) |entry| {
-                    switch (mem.order(u8, target, entry.key)) {
-                        .lt, .eq => {
-                            best_entry = entry;
-                            break;
-                        },
-                        .gt => {},
-                    }
-                }
-                offset = chunk.next;
-            } else {
-                return .{ .needs_io = block_start };
-            }
-        }
-        if (best_op) |bo| {
-            if (best_entry) |be| {
-                if (mem.lessThan(u8, be.key, bo.key)) {
-                    current = format.PageId.fromBytes(be.val);
-                } else {
-                    current = format.PageId.fromBytes(bo.val.?);
-                }
-            } else {
-                current = format.PageId.fromBytes(bo.val.?);
-            }
-        } else if (best_entry) |be| {
-            current = format.PageId.fromBytes(be.val);
-        } else unreachable;
-    }
-
-    return .{ .leaf_id = current };
-}
-const findLeafTag = enum {
-    needs_io,
-    leaf_id,
-};
-
-fn executeRead(
-    target: []const u8,
-    ts: u64,
-    pid: u64,
-    block_server: *BlockServer,
-    leaf_offsets: *const std.AutoArrayHashMapUnmanaged(u64, u64),
-) union(executeReadTag) {
-    needs_io: u64,
-    val: ?[]const u8,
-} {
-    var offset: ?u64 = leaf_offsets.get(pid) orelse unreachable;
-    while (offset) |off| {
-        const block_start = block_server.offsetToBlockStart(off);
-        if (block_server.getBlock(block_start)) |block| {
-            var chunk = chunkFromBlock(true, block, off);
-            while (chunk.commits.next()) |commit| {
-                if (commit.timestamp > ts) continue;
-                if (mem.eql(u8, commit.write.key, target)) {
-                    return .{ .val = commit.write.val };
-                }
-            }
-            while (chunk.entries.next()) |entry| {
-                if (mem.eql(u8, entry.key, target)) {
-                    return .{ .val = entry.val };
-                }
-            }
-            offset = chunk.next;
-        } else {
-            return .{ .needs_io = block_start };
-        }
-    }
-    return .{ .val = null };
-}
-const executeReadTag = enum {
-    needs_io,
-    val,
 };
 
 pub inline fn chunkFromBlock(
@@ -584,6 +360,8 @@ pub const BlockServer = struct {
         unreachable;
     }
 };
+
+pub const Conn = struct {};
 
 pub const Io = struct {
     ptr: *anyopaque,

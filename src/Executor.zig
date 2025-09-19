@@ -5,8 +5,8 @@ const mem = std.mem;
 const heap = std.heap;
 const debug = std.debug;
 
-const format = @import("store_lib").format;
 const Shard = @import("Shard.zig");
+const format = @import("format.zig");
 
 txns: std.AutoArrayHashMap(Txn.Id, Txn),
 pump_arena: heap.ArenaAllocator,

@@ -4,11 +4,12 @@ const print = debug.print;
 const heap = std.heap;
 
 const store = @import("store_lib");
-const Shard = store.shard.Shard;
+const Shard = store.Shard;
 const Mesh = store.Mesh;
 
 pub fn main() !void {
     var gpa = heap.GeneralPurposeAllocator(.{}).init;
+    var mesh = try Mesh.init(2, 1024, gpa.allocator());
     var shard = try Shard.init(
         Shard.Config{
             .block_size = 1024 * 1024,
@@ -24,6 +25,7 @@ pub fn main() !void {
             },
         },
         gpa.allocator(),
+        &mesh,
     );
     defer shard.deinit();
 

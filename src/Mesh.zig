@@ -102,34 +102,29 @@ pub fn poll(self: *const Mesh, to: usize, closure: anytype) void {
         pop.store(pop_off + used, .release);
     }
 }
-///////////////////////////////////////////////////////////////////////////////
 
-// MSG ////////////////////////////////////////////////////////////////////////
-pub const MsgTag = enum {
-    newConn,
-    txnStart,
-    commitReq,
-    commitResp,
-    writeReq,
-    writeResp,
-};
-pub const Msg = union(MsgTag) {
+pub const Msg = union(Tag) {
     newConn: u32,
     txnStart: u64,
     commitReq: struct {},
     commitResp: struct {},
     writeReq: struct {},
     writeResp: struct {},
-};
-///////////////////////////////////////////////////////////////////////////////
 
-// ERROR //////////////////////////////////////////////////////////////////////
+    pub const Tag = enum {
+        newConn,
+        txnStart,
+        commitReq,
+        commitResp,
+        writeReq,
+        writeResp,
+    };
+};
+
 pub const Error = error{
     FULL,
 };
-///////////////////////////////////////////////////////////////////////////////
 
-// TESTS //////////////////////////////////////////////////////////////////////
 test "scratch" {
     const Thread = std.Thread;
     const num_endpoints = 4;
@@ -202,4 +197,3 @@ const counterPoll = struct {
         return first.len + last.len;
     }
 };
-///////////////////////////////////////////////////////////////////////////////
