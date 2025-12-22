@@ -519,69 +519,40 @@ pub const ResponseOp = union(Tag) {
     }
 };
 
-pub fn Iter(comptime T: type, comptime fallible: bool) type {
-    if (fallible) {
-        return struct {
-            buf: []const u8,
-            idx: usize,
+pub fn Iter(comptime T: type) type {
+    return struct {
+        buf: []const u8,
+        idx: usize,
 
-            const Self = @This();
+        const Self = @This();
 
-            pub fn fromBytes(buf: []const u8) Self {
-                return Self{ .buf = buf, .idx = 0 };
+        pub fn fromBytes(buf: []const u8) Self {
+            return Self{ .buf = buf, .idx = 0 };
+        }
+
+        pub fn next(self: *Self) ?T {
+            if (self.idx >= self.buf.len) {
+                return null;
             }
+            const t = T.fromBytes(self.buf[self.idx..]);
+            self.idx += t.size();
+            return t;
+        }
 
-            pub fn next(self: *Self) Error.Set!?T {
-                if (self.idx >= self.buf.len) {
-                    return null;
-                }
-                if (T.parse(self.buf[self.idx..])) |t| {
-                    self.idx += t.size();
-                    return t;
-                } else |err| switch (err) {
-                    Error.Set.EOF => return null,
-                    else => return err,
-                }
+        pub fn nextBytes(self: *Self) ?[]const u8 {
+            if (self.idx >= self.buf.len) {
+                return null;
             }
-            pub fn reset(self: *Self) void {
-                self.idx = 0;
-            }
-        };
-    } else {
-        return struct {
-            buf: []const u8,
-            idx: usize,
+            const size = T.fromBytes(self.buf[self.idx..]).size();
+            const out = self.buf[self.idx .. self.idx + size];
+            self.idx += size;
+            return out;
+        }
 
-            const Self = @This();
-
-            pub fn fromBytes(buf: []const u8) Self {
-                return Self{ .buf = buf, .idx = 0 };
-            }
-
-            pub fn next(self: *Self) ?T {
-                if (self.idx >= self.buf.len) {
-                    return null;
-                }
-                const t = T.fromBytes(self.buf[self.idx..]);
-                self.idx += t.size();
-                return t;
-            }
-
-            pub fn nextBytes(self: *Self) ?[]const u8 {
-                if (self.idx >= self.buf.len) {
-                    return null;
-                }
-                const size = T.fromBytes(self.buf[self.idx..]).size();
-                const out = self.buf[self.idx .. self.idx + size];
-                self.idx += size;
-                return out;
-            }
-
-            pub fn reset(self: *Self) void {
-                self.idx = 0;
-            }
-        };
-    }
+        pub fn reset(self: *Self) void {
+            self.idx = 0;
+        }
+    };
 }
 
 pub const Timestamp = struct {
